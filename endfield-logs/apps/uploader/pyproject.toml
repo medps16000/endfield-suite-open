@@ -14,7 +14,7 @@ dev = [
   "pytest>=8.0.0",
 ]
 build = [
-  "pyinstaller>=6.15.0",
+  "pyinstaller>=6.21.0",
 ]
 
 [tool.pytest.ini_options]

@@ -14,7 +14,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "httpx>=0.28.0",
-  "pytest>=8.0.0",
+  "pytest>=9.1.1",
 ]
 
 [tool.pytest.ini_options]

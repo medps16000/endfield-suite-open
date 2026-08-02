@@ -5,7 +5,7 @@ requires-python = ">=3.12"
 dependencies = [
   "fastapi>=0.115.0",
   "uvicorn[standard]>=0.34.0",
-  "sqlalchemy>=2.0.0",
+  "sqlalchemy>=2.0.51",
   "psycopg[binary]>=3.2.0",
   "pydantic-settings>=2.8.0",
   "email-validator>=2.2.0",

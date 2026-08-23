@@ -1,7 +1,7 @@
 dpkt
 psutil
 pycryptodome
-protobuf==6.33.6
+protobuf==7.36.0
 grpcio-tools==1.80.0
 websockets
 pyinstaller

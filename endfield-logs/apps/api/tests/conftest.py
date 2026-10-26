@@ -8,6 +8,7 @@ import pytest
 DATA_SENTINEL = Path(__file__).resolve().parents[3] / "data" / "akedata" / "character" / "manifest.json"
 
 HEALTH_TESTS_REQUIRING_GAME_DATA = {
+    "test_high_difficulty_plain_stage_slug_does_not_enter_hard_ranking",
     "test_crisis_fragment_aliases_filter_by_official_stage_slug_only",
     "test_war_echo_highest_stages_have_separate_rankings_and_lower_difficulty_is_excluded",
     "test_contract_tags_are_exposed_on_public_records",

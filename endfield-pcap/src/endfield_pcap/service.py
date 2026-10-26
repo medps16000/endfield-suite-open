@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
+import hashlib
 import json
 import logging
 import re
@@ -151,6 +153,8 @@ class SessionPipeline:
         on_debug_message: Callable[[DecodedMessage, int], None] | None,
         on_debug_record: Callable[[dict[str, object]], None] | None,
         metrics: RuntimeMetrics,
+        rotation_clock_trace: bool = True,
+        on_battle_operation: Callable[[dict[str, object]], None] | None = None,
     ) -> None:
         self.flow = flow
         self.session_id = session_id
@@ -161,9 +165,13 @@ class SessionPipeline:
         self.multi_phase_dungeon_map = multi_phase_dungeon_map
         self.merge_multi_phase_enemy_battles = merge_multi_phase_enemy_battles
         self.on_event = on_event
+        self.on_battle_operation = on_battle_operation
+        self._observer_operation_index = 0
+        self._observer_framing_errors = 0
         self.on_debug_message = on_debug_message
         self.on_debug_record = on_debug_record
         self.metrics = metrics
+        self.rotation_clock_trace = bool(rotation_clock_trace)
 
         self.client_reassembler = TcpStreamReassembler()
         self.server_reassembler = TcpStreamReassembler()
@@ -192,6 +200,9 @@ class SessionPipeline:
         self.decoded_class_counts: Counter[str] = Counter()
         self.char_bag_by_objid: dict[int, dict[str, object]] = {}
         self.current_team_char_ids: list[int] = []
+        self.char_team_state_by_scope: dict[int, dict[str, Any]] = {}
+        self.current_team_scope_name: int | None = None
+        self.current_team_selection_known = False
         self.scene_team_char_ids: list[int] = []
         # None means CS_ENTER_DUNGEON did not carry an explicit party override.
         # The packet commonly omits char_team for War Echo even though the
@@ -341,6 +352,8 @@ class SessionPipeline:
         payload: bytes,
         timestamp_ms: int,
     ) -> None:
+        observer_errors_before = (getattr(self, "_observer_framing_errors", 0)
+                                  + getattr(getattr(self, "registry", None), "observer_framing_errors", 0))
         cipher = self.client_cipher if direction == "cs" else self.server_cipher
         if cipher is None:
             return
@@ -362,6 +375,7 @@ class SessionPipeline:
                 }
             )
         if "parse_error" in head:
+            self._observer_framing_errors = getattr(self, "_observer_framing_errors", 0) + 1
             return
         if self.on_debug_record is not None:
             msg_id = int(head.get("msgid", 0) or 0)
@@ -521,9 +535,15 @@ class SessionPipeline:
                     "plain_body_prefix_hex": body[:128].hex(),
                 }
             )
-        for decoded in decoded_messages:
-            self.metrics.messages_decoded += 1
-            self._handle_message(decoded, timestamp_ms)
+        previous_observer_frame_invalid = getattr(self, "_observer_frame_invalid", False)
+        self._observer_frame_invalid = (previous_observer_frame_invalid or
+            getattr(self, "_observer_framing_errors", 0) + getattr(self.registry, "observer_framing_errors", 0) > observer_errors_before)
+        try:
+            for decoded in decoded_messages:
+                self.metrics.messages_decoded += 1
+                self._handle_message(decoded, timestamp_ms)
+        finally:
+            self._observer_frame_invalid = previous_observer_frame_invalid
 
     def _assemble_multi_pack_message(
         self,
@@ -538,7 +558,10 @@ class SessionPipeline:
 
         current_pack_index = int(head.get("current_pack_index", 0) or 0)
         seqid = int(head.get("down_seqid", head.get("up_seqid", 0)) or 0)
+        if current_pack_index < 0 or current_pack_index >= total_pack_count:
+            self._observer_framing_errors = getattr(self, "_observer_framing_errors", 0) + 1
         if seqid <= 0:
+            self._observer_framing_errors = getattr(self, "_observer_framing_errors", 0) + 1
             return None
         base_seqid = seqid - current_pack_index
         key = (direction, int(head.get("msgid", 0) or 0), base_seqid)
@@ -554,7 +577,11 @@ class SessionPipeline:
         )
         parts = state["parts"]
         assert isinstance(parts, dict)
-        parts[current_pack_index] = maybe_decompress_session_body(head, plain_body)
+        part_body = maybe_decompress_session_body(head, plain_body)
+        if (state["total_pack_count"] != total_pack_count or
+                (current_pack_index in parts and parts[current_pack_index] != part_body)):
+            self._observer_framing_errors = getattr(self, "_observer_framing_errors", 0) + 1
+        parts[current_pack_index] = part_body
         state["last_timestamp_ms"] = timestamp_ms
         if len(parts) < total_pack_count:
             if self.on_debug_record is not None:
@@ -583,6 +610,8 @@ class SessionPipeline:
         return full_head, combined, True
 
     def flush_debug_state(self) -> None:
+        if self.pending_multi_frames:
+            self._observer_framing_errors = getattr(self, "_observer_framing_errors", 0) + len(self.pending_multi_frames)
         if self.on_debug_record is None:
             self.pending_multi_frames.clear()
             return
@@ -611,6 +640,20 @@ class SessionPipeline:
         self.decoded_class_counts[decoded.class_name] += 1
         if self.on_debug_message is not None:
             self.on_debug_message(decoded, timestamp_ms)
+        if decoded.class_name in {
+            "CS_PING", "SC_PING", "CS_GAME_TIME_FREEZE_START_REQ", "CS_GAME_TIME_FREEZE_END_REQ",
+            "SC_GAME_TIME_FREEZE_START_RSP", "SC_GAME_TIME_FREEZE_END_RSP",
+        }:
+            # Preserve proto3 false/zero defaults: an explicit response with
+            # in_time_freeze=false must survive as a state transition.
+            payload = self._message_to_payload(decoded.message, include_implicit_defaults=True)
+            self._emit_event(BattleLogEvent(
+                session_id=self.session_id, timestamp_ms=timestamp_ms,
+                event_type=decoded.class_name,
+                payload={**payload, "direction": decoded.direction, "msg_id": decoded.msg_id,
+                         "raw_body_hex": decoded.raw_body.hex()},
+            ))
+            return
         if decoded.class_name == "CS_ENTER_DUNGEON":
             self._emit_proto_passthrough_event(
                 decoded.class_name,
@@ -630,12 +673,44 @@ class SessionPipeline:
             self._handle_leave_dungeon(timestamp_ms)
             return
         if decoded.class_name == "SC_SYNC_CHAR_BAG_INFO":
+            self._emit_proto_passthrough_event(decoded.class_name, decoded.message, timestamp_ms)
             self._update_char_bag_info(decoded.message, timestamp_ms)
+            self._emit_effect_snapshot(decoded.class_name, decoded.message, timestamp_ms)
             return
         if decoded.class_name == "SC_CHAR_BAG_SET_TEAM":
+            self._emit_proto_passthrough_event(decoded.class_name, decoded.message, timestamp_ms)
             self._update_char_team(decoded.message, timestamp_ms)
             return
+        if decoded.class_name in {
+            "SC_CHAR_BAG_SET_CURR_TEAM_INDEX", "SC_CHAR_BAG_SET_CURR_TEAM_TYPE",
+            "SC_CHAR_BAG_SET_MAX_TEAM_MEMBER_COUNT", "SC_CHAR_SKILL_INFOS",
+            "SC_EQUIP_MEDICINE_MODIFY", "SC_EQUIP_PRODUCE",
+        }:
+            self._emit_proto_passthrough_event(decoded.class_name, decoded.message, timestamp_ms)
+            if decoded.class_name.startswith("SC_CHAR_BAG_"):
+                self._update_char_team(decoded.message, timestamp_ms, event_type=decoded.class_name)
+            elif decoded.class_name == "SC_CHAR_SKILL_INFOS":
+                char_id = int(decoded.message.char_obj_id)
+                char_info = self.char_bag_by_objid.get(char_id)
+                levels = [self._message_to_payload(row, include_implicit_defaults=True)
+                          for row in decoded.message.level_infos]
+                if char_info is not None:
+                    char_info["skill_level_infos"] = levels
+                # Character skill_level/enhanced_level are reported fields.
+                # Their equivalence to SERVER_SKILL.level is not established,
+                # so the existing combat calculation cache is left intact.
+                if char_info is not None:
+                    self._emit_loadout_event(decoded.class_name, timestamp_ms)
+            elif decoded.class_name == "SC_EQUIP_MEDICINE_MODIFY":
+                char_info = self.char_bag_by_objid.get(int(decoded.message.char_id))
+                if char_info is not None:
+                    char_info["equip_medicine_id"] = int(decoded.message.equip_medicine_id)
+                    self._emit_loadout_event(decoded.class_name, timestamp_ms)
+            # EQUIP_PRODUCE identifies a formula and instance, not the new
+            # item's complete attributes or its equipped character.
+            return
         if decoded.class_name == "SC_CHAR_BAG_SET_TEAM_LEADER":
+            self._emit_proto_passthrough_event(decoded.class_name, decoded.message, timestamp_ms)
             self._emit_loadout_event("SC_CHAR_BAG_SET_TEAM_LEADER", timestamp_ms)
             return
         if decoded.class_name == "SC_ITEM_BAG_SCOPE_SYNC":
@@ -667,15 +742,17 @@ class SessionPipeline:
             return
         if decoded.class_name == "SC_SELF_SCENE_INFO":
             self._update_squad_index(decoded.message, timestamp_ms)
+            self._emit_effect_snapshot(decoded.class_name, decoded.message, timestamp_ms)
             return
         if decoded.class_name == "SC_OBJECT_ENTER_VIEW":
             self._update_entity_index(decoded.message, timestamp_ms)
+            self._emit_effect_snapshot(decoded.class_name, decoded.message, timestamp_ms)
             return
         if decoded.class_name == "SC_SYNC_ATTR":
             self._sync_entity_attrs(decoded.message, timestamp_ms)
             return
         if decoded.class_name == "SC_OBJECT_LEAVE_VIEW":
-            self._remove_entities(decoded.message)
+            self._remove_entities(decoded.message, timestamp_ms)
             return
         if decoded.class_name in {"SC_ATTACH_SERVER_SKILL", "SC_UPDATE_SERVER_SKILL"}:
             self._update_server_skill_state(decoded.class_name, decoded.message, timestamp_ms)
@@ -697,12 +774,15 @@ class SessionPipeline:
             "SC_ACTIVITY_CONDITIONAL_MULTI_STAGE_BASE_CHANGE",
             "SC_ACTIVITY_CONDITIONAL_STAGE_PROGRESS_CHANGE",
             "SC_ACTIVITY_PROGRESS_CHANGE",
+            "SC_ADD_SERVER_BUFF",
+            "SC_REMOVE_SERVER_BUFF",
             "SC_BATTLE_ADD_GLOBAL_BUFF",
             "SC_BATTLE_DEBUG_INFO",
             "SC_BATTLE_GENERATION_CHANGE",
             "SC_BATTLE_REMOVE_GLOBAL_BUFF",
             "SC_BATTLE_SYNC_GLOBAL_BUFF_INFO",
             "SC_BATTLE_SYNC_SEQ_ID",
+            "SC_CHAR_BAG_SYNC_PERSISTENT_BUFFS",
             "SC_ENTER_DUNGEON",
             "SC_GAME_MECHANICS_MODIFY_INST_TIME_FREEZE",
             "SC_GAME_MECHANICS_SYNC_CHALLENGE_COMPLETE",
@@ -713,11 +793,73 @@ class SessionPipeline:
             "SC_GAME_MECHANICS_SYNC_RESTART_GAME_INST",
             "SC_CONDITIONAL_MULTI_STAGE_ACTIVITY_GAIN_REWARD",
             "SC_RESET_BATTLE_STATUS",
+            "SC_SCENE_RESET_ENTITY",
             "SC_SCENE_SET_BATTLE",
+            "SC_SYNC_RACING_DUNGEON_BUFF_MODIFY",
+            "SC_SYNC_RACING_DUNGEON_RECONNECT",
             "SC_SYNC_FULL_DUNGEON_STATUS",
             "SC_SYNC_WEEK_RAID_SETTLEMENT",
         }:
             self._emit_proto_passthrough_event(decoded.class_name, decoded.message, timestamp_ms)
+            if decoded.class_name in {"SC_RESET_BATTLE_STATUS", "SC_SCENE_RESET_ENTITY"}:
+                self._emit_effect_snapshot(decoded.class_name, decoded.message, timestamp_ms)
+
+    def _emit_effect_snapshot(self, source: str, message: Any, timestamp_ms: int) -> None:
+        """Preserve server Buff snapshots without interpreting timing or layers.
+
+        A server Buff UID belongs to this owner/generation namespace.  It must
+        not be joined to an equal client-operation UID merely by its number.
+        Empty owner lists are observations, not a claim of complete coverage.
+        """
+        owners: list[dict[str, object]] = []
+        detail = getattr(message, "detail", None)
+        if detail is not None:
+            rows = [(int(getattr(common, "id", 0) or 0) or None, battle,
+                     str(getattr(common, "templateid", "") or "") or None,
+                     int(getattr(common, "type", 0)), kind.removesuffix("_list"))
+                    for kind, _, common, battle in self._iter_detail_objects(detail)]
+        elif source == "SC_SYNC_CHAR_BAG_INFO":
+            rows = [(int(getattr(char, "objid", 0) or 0) or None, getattr(char, "battle_mgr_info", None),
+                     str(getattr(char, "templateid", "") or "") or None, None, "char")
+                    for char in getattr(message, "char_info", [])]
+        else:
+            rows = [(None, getattr(message, "battle_info", None), None, None, None)]
+        for obj_id, battle_info, templateid, entity_type, kind in rows:
+            if battle_info is None:
+                continue
+            battle_inst_id = int(getattr(battle_info, "battle_inst_id", 0) or 0)
+            if not battle_inst_id and source == "SC_RESET_BATTLE_STATUS":
+                battle_inst_id = int(getattr(message, "battle_inst_id", 0) or 0)
+            if (not battle_inst_id and not getattr(battle_info, "buff_list", [])
+                    and not getattr(battle_info, "stacking_group_list", [])):
+                continue
+            entity = self.entity_index.get(battle_inst_id)
+            if obj_id is None:
+                obj_id = entity.obj_id if entity is not None else None
+            if templateid is None and entity is not None:
+                templateid = entity.templateid
+            if entity_type is None and entity is not None:
+                entity_type = entity.entity_type
+            owners.append({
+                "owner_obj_id": str(obj_id) if obj_id is not None else None,
+                "owner_battle_inst_id": str(battle_inst_id) if battle_inst_id else None,
+                "owner_templateid": templateid,
+                "owner_display_name": self.name_index.get(templateid) if templateid else None,
+                "owner_entity_type": entity_type,
+                "owner_kind": kind,
+                "generation": int(getattr(battle_info, "msg_generation", 0)),
+                "identity_scope": "server_buff",
+                "buffs": [self._message_to_payload(buff, include_implicit_defaults=True)
+                          for buff in getattr(battle_info, "buff_list", [])],
+                "stacking_groups": [self._message_to_payload(group, include_implicit_defaults=True)
+                                    for group in getattr(battle_info, "stacking_group_list", [])],
+            })
+        self._emit_event(BattleLogEvent(
+            session_id=self.session_id, timestamp_ms=timestamp_ms,
+            event_type="SC_EFFECT_SNAPSHOT",
+            payload={"source": source, "owners": owners,
+                     "serialization": "protobuf_json_implicit_defaults_v1"},
+        ))
 
     def _iter_detail_objects(self, detail: Any):
         for field_desc, value in detail.ListFields():
@@ -1007,34 +1149,65 @@ class SessionPipeline:
                 "level": int(getattr(char_info, "level", 0) or 0),
                 "potential": level,
                 "weapon_id": int(getattr(char_info, "weapon_id", 0) or 0),
+                "equip_medicine_id": int(getattr(char_info, "equip_medicine_id", 0)),
                 "equip_col": equip_col,
+                "equipment_snapshot_complete": hasattr(char_info, 'equip_col'),
                 "equip_suit": equip_suit,
                 "skill_int_ids": self._battle_skill_int_ids(getattr(char_info, "battle_mgr_info", None)),
                 "weapon_source_skills": self._weapon_source_skills(getattr(char_info, "battle_mgr_info", None)),
             }
         LOGGER.info('检测到潜能：%s',self.char_potential_levels)
-        team_infos = list(getattr(message, "team_info", []))
-        curr_team_index = int(getattr(message, "curr_team_index", 0) or 0)
-        if team_infos:
-            if 0 <= curr_team_index < len(team_infos):
-                team_info = team_infos[curr_team_index]
-            else:
-                team_info = team_infos[0]
-            self.current_team_char_ids = [
-                int(char_id)
-                for char_id in getattr(team_info, "char_team", [])
-                if int(char_id)
-            ]
-        if timestamp_ms is not None:
-            self._emit_loadout_event("SC_SYNC_CHAR_BAG_INFO", timestamp_ms)
+        self._update_char_team(message, timestamp_ms, event_type="SC_SYNC_CHAR_BAG_INFO")
 
-    def _update_char_team(self, message: Any, timestamp_ms: int) -> None:
-        self.current_team_char_ids = [
-            int(char_id)
-            for char_id in getattr(message, "char_team", [])
-            if int(char_id)
-        ]
-        self._emit_loadout_event("SC_CHAR_BAG_SET_TEAM", timestamp_ms)
+    def _update_char_team(self, message: Any, timestamp_ms: int | None, *,
+                          event_type: str = "SC_CHAR_BAG_SET_TEAM") -> None:
+        # A current index/type is only a selector. Resolve it against a team
+        # actually received in the same scope, never against roster order or
+        # another scope's cached party.
+        scopes = getattr(self, "char_team_state_by_scope", None)
+        if scopes is None:
+            scopes = self.char_team_state_by_scope = {}
+        scope = int(getattr(message, "scope_name", 0))
+        active_scope = getattr(self, "current_team_scope_name", None)
+        if event_type == "SC_SYNC_CHAR_BAG_INFO" and bool(getattr(message, "is_scope_delete", False)):
+            scopes.pop(scope, None)
+            if active_scope == scope:
+                self.current_team_char_ids = []
+                self.current_team_selection_known = False
+            return
+        state = scopes.setdefault(scope, {"teams": {}, "temp_team": None,
+                                          "curr_team_index": None, "team_type": None})
+        if event_type == "SC_SYNC_CHAR_BAG_INFO":
+            state["teams"] = {index: self._message_to_payload(team, include_implicit_defaults=True)
+                              for index, team in enumerate(getattr(message, "team_info", []))}
+            state["temp_team"] = (self._message_to_payload(message.temp_team_info, include_implicit_defaults=True)
+                                  if message.HasField("temp_team_info") else None)
+            state["curr_team_index"] = int(message.curr_team_index)
+            state["team_type"] = int(message.team_type)
+            state["max_char_team_member_count"] = int(message.max_char_team_member_count)
+            self.current_team_scope_name = active_scope = scope
+        elif event_type == "SC_CHAR_BAG_SET_TEAM":
+            team_type, index = int(message.team_type), int(message.team_index)
+            team = {"char_team": [str(value) for value in message.char_team],
+                    "leaderid": str(message.leader_id)}
+            if team_type == 0:
+                state["teams"][index] = team
+            elif team_type == 1:
+                state["temp_team"] = team
+        elif event_type == "SC_CHAR_BAG_SET_CURR_TEAM_INDEX":
+            state["curr_team_index"] = int(message.curr_team_index)
+        elif event_type == "SC_CHAR_BAG_SET_CURR_TEAM_TYPE":
+            state["team_type"] = int(message.team_type)
+        elif event_type == "SC_CHAR_BAG_SET_MAX_TEAM_MEMBER_COUNT":
+            state["max_char_team_member_count"] = int(message.max_char_team_member_count)
+        if active_scope == scope:
+            selected = (state["teams"].get(state["curr_team_index"]) if state["team_type"] == 0 else
+                        state["temp_team"] if state["team_type"] == 1 else None)
+            self.current_team_selection_known = selected is not None
+            self.current_team_char_ids = ([int(value) for value in selected["char_team"] if int(value)]
+                                          if selected is not None else [])
+            if timestamp_ms is not None:
+                self._emit_loadout_event(event_type, timestamp_ms)
 
     @staticmethod
     def _int_map(message_map: Any) -> dict[int, int]:
@@ -1091,39 +1264,6 @@ class SessionPipeline:
         return counts
 
     @classmethod
-    def _alternate_edc_preserve_slot(
-        cls,
-        *,
-        slot_id: int,
-        previous_equip_id: int,
-        new_equip_id: int,
-        equip_col: dict[int, int],
-        equip_suit: dict[str, int],
-        equip_by_inst_id: dict[int, dict[str, object]],
-    ) -> int | None:
-        if slot_id not in {2, 3} or previous_equip_id == new_equip_id:
-            return None
-        alternate_slot = 3 if slot_id == 2 else 2
-        if alternate_slot in equip_col:
-            return None
-        previous_template = cls._equip_template(equip_by_inst_id.get(previous_equip_id), previous_equip_id)
-        new_template = cls._equip_template(equip_by_inst_id.get(new_equip_id), new_equip_id)
-        if slot_id not in cls._equip_slot_candidates(previous_template):
-            return None
-        previous_suit = cls._equip_suit_id(previous_template)
-        if not previous_suit:
-            return None
-        new_suit = cls._equip_suit_id(new_template)
-        current_counts = cls._equip_suit_counts(equip_col, equip_by_inst_id)
-        after_replace = current_counts.get(previous_suit, 0) - 1
-        if new_suit == previous_suit:
-            after_replace += 1
-        target_count = int(equip_suit.get(previous_suit, 0) or 0)
-        if target_count > after_replace:
-            return alternate_slot
-        return None
-
-    @classmethod
     def _equip_payload(cls, equip: Any, template_string: str | None = None) -> dict[str, object]:
         equip_id = int(getattr(equip, "equipid", 0) or 0)
         return {
@@ -1160,6 +1300,13 @@ class SessionPipeline:
         inst_id = int(payload.get("inst_id") or 0)
         gem_id = int(payload.get("gem_id") or 0)
         weapon_id = int(payload.get("weapon_id") or 0)
+        previous = self.gem_by_inst_id.get(gem_id or inst_id)
+        if previous and (previous.get("terms") != payload.get("terms")
+                         or int(previous.get("weapon_id") or 0) != weapon_id):
+            affected = {weapon_id, int(previous.get("weapon_id") or 0)} - {0}
+            for char_info in self.char_bag_by_objid.values():
+                if int(char_info.get("weapon_id") or 0) in affected:
+                    self._replace_weapon_source_skills(char_info, [])
         if inst_id:
             self.gem_by_inst_id[inst_id] = payload
         if gem_id:
@@ -1253,18 +1400,12 @@ class SessionPipeline:
             equip_col = dict(char_info.get("equip_col") or {})
             equip_suit = self._str_int_map(getattr(message, "suitinfo", {}))
             previous_equip_id = int(equip_col.get(slot_id, 0) or 0)
-            preserve_slot = self._alternate_edc_preserve_slot(
-                slot_id=slot_id,
-                previous_equip_id=previous_equip_id,
-                new_equip_id=equip_id,
-                equip_col=equip_col,
-                equip_suit=equip_suit,
-                equip_by_inst_id=self.equip_by_inst_id,
-            )
-            if preserve_slot is not None:
-                equip_col[preserve_slot] = previous_equip_id
-            elif previous_equip_id and previous_equip_id != equip_id and previous_equip_id in self.equip_by_inst_id:
+            if previous_equip_id and previous_equip_id != equip_id and previous_equip_id in self.equip_by_inst_id:
                 self.equip_by_inst_id[previous_equip_id]["equip_char_id"] = 0
+            # The explicit new slot replaces this instance's old slot even
+            # when the equipment moves within the same character.
+            equip_col = {slot: value for slot, value in equip_col.items()
+                         if int(value or 0) != equip_id or slot == slot_id}
             equip_col[slot_id] = equip_id
             char_info["equip_col"] = equip_col
             char_info["equip_suit"] = equip_suit
@@ -1419,6 +1560,12 @@ class SessionPipeline:
         weapon_id = int(getattr(message, "weaponid", 0) or 0)
         if weapon_id:
             weapon = self.weapon_by_inst_id.setdefault(weapon_id, {"inst_id": weapon_id})
+            if class_name in {"SC_WEAPON_ATTACH_GEM", "SC_WEAPON_DETACH_GEM"}:
+                # Source skill totals from before the gem change cannot be
+                # combined with the new gem. Await an explicit skill refresh.
+                for char_info in self.char_bag_by_objid.values():
+                    if int(char_info.get("weapon_id") or 0) == weapon_id:
+                        self._replace_weapon_source_skills(char_info, [])
             if class_name == "SC_WEAPON_ADD_EXP":
                 weapon["exp"] = int(getattr(message, "new_exp", 0) or 0)
                 weapon["weapon_lv"] = int(getattr(message, "weapon_lv", 0) or 0)
@@ -1468,32 +1615,17 @@ class SessionPipeline:
 
     @staticmethod
     def _equip_slot_candidates(template: str) -> list[int]:
-        lower_template = template.lower()
-        if "_hand_" in lower_template or lower_template.endswith("_hand"):
-            return [0]
-        if "_body_" in lower_template or lower_template.endswith("_body"):
-            return [1]
-        if "_edc_" in lower_template or lower_template.endswith("_edc"):
-            return [2, 3]
-        return []
+        return list(equip_piece_catalog().get(template, {}).get('valid_slots') or [])
 
     @classmethod
     def _infer_equip_slot(cls, template: str, used_slots: set[int]) -> int | None:
         candidates = cls._equip_slot_candidates(template)
-        for slot in candidates:
-            if slot not in used_slots:
-                return slot
-        if candidates:
-            return None
-        slot = 0
-        while slot in used_slots:
-            slot += 1
-        return slot
+        return candidates[0] if len(candidates) == 1 and candidates[0] not in used_slots else None
 
     @classmethod
     def _format_loadout_equip(cls, equip: dict[str, object], equip_id: int) -> str:
         template = str(equip.get("template_string") or equip.get("templateid") or equip_id)
-        enhance = equip.get("enhance") or equip.get("legacy_enhance") or {}
+        enhance = equip.get("enhance") if isinstance(equip.get("enhance"), dict) else {}
         enhance_text = cls._format_enhance_map({int(k): int(v) for k, v in dict(enhance).items()})
         stat_text = format_equip_stats(template, enhance if isinstance(enhance, dict) else {})
         equip_text = f"{template}|lv={enhance_text}" if enhance_text else template
@@ -1559,7 +1691,8 @@ class SessionPipeline:
             equipped_items = [
                 (equip_id, equip)
                 for equip_id, equip in self.equip_by_inst_id.items()
-                if int(equip.get("equip_char_id") or 0) == char_id and int(equip_id) not in used_equip_ids
+                if char_info.get('equipment_snapshot_complete') is not True
+                and int(equip.get("equip_char_id") or 0) == char_id and int(equip_id) not in used_equip_ids
             ]
             for equip_id, equip in sorted(equipped_items, key=lambda item: str(item[1].get("template_string") or item[0])):
                 template = str(equip.get("template_string") or equip.get("templateid") or equip_id)
@@ -1582,8 +1715,12 @@ class SessionPipeline:
             weapon_sync_source = str(weapon.get("sync_source") or "missing")
             raw_weapon_source_skills = char_info.get("weapon_source_skills")
             refine = int(weapon.get("refine_lv") or 0)
+            if weapon_sync_source in {"template_only", "missing"}:
+                refine = None
             inferred_refine = (
-                infer_weapon_refine_from_source_skills(weapon_template, raw_weapon_source_skills)
+                infer_weapon_refine_from_source_skills(weapon_template, raw_weapon_source_skills,
+                    gem_terms=attached_gem.get("terms") if attached_gem
+                    and attached_gem_id > 0 and int(attached_gem.get("weapon_id") or 0) == weapon_id else None)
                 if weapon_sync_source == "template_only"
                 else None
             )
@@ -1591,7 +1728,9 @@ class SessionPipeline:
                 refine = inferred_refine
                 weapon_sync_source = f"{weapon_sync_source}+source_skill_refine"
             weapon_source_skills = self._format_weapon_source_skills(raw_weapon_source_skills)
-            weapon_refine_stats = weapon_source_skills or format_weapon_refine_stats(weapon_template, refine)
+            weapon_refine_stats = weapon_source_skills or (
+                format_weapon_refine_stats(weapon_template, refine) if refine is not None else ""
+            )
             weapon_refine_stats_source = "server_weapon_skill" if weapon_source_skills else "weapon_data_refine"
             rows.append(
                 {
@@ -1600,6 +1739,10 @@ class SessionPipeline:
                     "char_inst_id": char_id,
                     "char_level": int(char_info.get("level") or 0),
                     "potential": int(char_info.get("potential") or 0),
+                    **({"equip_medicine_id": char_info["equip_medicine_id"]}
+                       if "equip_medicine_id" in char_info else {}),
+                    **({"reported_skill_level_infos": copy.deepcopy(char_info["skill_level_infos"])}
+                       if "skill_level_infos" in char_info else {}),
                     "weapon_inst_id": weapon_id,
                     "weapon_template": weapon_template,
                     "weapon_sync_source": weapon_sync_source,
@@ -1617,6 +1760,9 @@ class SessionPipeline:
                     "gem_terms": format_gem_terms(attached_gem),
                     "equip_inst_ids": self._format_int_map(equip_inst_ids),
                     "equips": self._format_int_map(equips),
+                    "equipment_snapshot_complete": char_info.get('equipment_snapshot_complete') is True,
+                    "unresolved_equip_inst_ids": sorted(int(equip_id) for equip_id, _ in equipped_items
+                                                         if int(equip_id) not in used_equip_ids),
                     "equip_suit": self._format_int_map(dict(char_info.get("equip_suit") or {})),
                     "skill_int_ids": self._format_int_list(char_info.get("skill_int_ids")),
                     "weapon_source_skills": weapon_source_skills,
@@ -1664,19 +1810,54 @@ class SessionPipeline:
             self.global_skill_levels[key] = level
         if per_battle:
             self.skill_levels_by_battle_inst[battle_inst_id] = per_battle
+        member = getattr(self, "squad_index", {}).get(battle_inst_id)
+        char_info = getattr(self, "char_bag_by_objid", {}).get(member.obj_id) if member and member.obj_id else None
+        if char_info and char_info.get("templateid") == member.templateid:
+            weapon_id = int(char_info.get("weapon_id") or 0)
+            weapon = self.weapon_by_inst_id.get(weapon_id, {})
+            weapon_template = str(weapon.get("template_string") or "")
+            scene_weapon_skills = self._weapon_source_skills(battle_info)
+            gem_id = int(weapon.get("attach_gem_id") or 0)
+            gem = getattr(self, "gem_by_inst_id", {}).get(gem_id) if gem_id else None
+            if gem is None:
+                gem = getattr(self, "gem_by_weapon_id", {}).get(weapon_id)
+                gem_id = int(gem.get("gem_id") or gem.get("inst_id") or 0) if gem else 0
+            gem_terms = (gem.get("terms") if gem and gem_id > 0
+                         and int(gem.get("weapon_id") or 0) == weapon_id else None)
+            # A scene refresh contains the new weapon's actual source skills.
+            # Bind it through the declared squad owner and equipped instance;
+            # another weapon's main skill cannot establish this refinement.
+            if (weapon_id
+                    and infer_weapon_refine_from_source_skills(weapon_template, char_info.get("weapon_source_skills"), gem_terms=gem_terms) is None
+                    and infer_weapon_refine_from_source_skills(weapon_template, scene_weapon_skills, gem_terms=gem_terms) is not None):
+                self._replace_weapon_source_skills(char_info, scene_weapon_skills)
 
-    def _remove_entities(self, message: Any) -> None:
+    def _remove_entities(self, message: Any, timestamp_ms: int | None = None) -> None:
+        removed_objects: list[dict[str, object | None]] = []
         for item in getattr(message, "obj_list", []):
             obj_id = int(getattr(item, "obj_id", 0))
             if not obj_id:
                 continue
             battle_inst_id = self.obj_to_battle.pop(obj_id, None)
+            entity = self.entity_index.get(battle_inst_id) if battle_inst_id is not None else None
+            removed_objects.append({
+                "obj_id": str(obj_id),
+                "battle_inst_id": str(battle_inst_id) if battle_inst_id is not None else None,
+                "templateid": entity.templateid if entity is not None else None,
+                "entity_type": entity.entity_type if entity is not None else None,
+                "obj_type": int(getattr(item, "obj_type", 0)),
+            })
             if battle_inst_id is not None:
                 self.entity_index.pop(battle_inst_id, None)
                 self.squad_index.pop(battle_inst_id, None)
                 detached = self.server_skill_state_by_owner_inst.pop(battle_inst_id, {})
                 for skill_inst_id in detached:
                     self.server_skill_owner_by_skill_inst.pop(skill_inst_id, None)
+        if timestamp_ms is not None:
+            self._emit_event(BattleLogEvent(
+                session_id=self.session_id, timestamp_ms=timestamp_ms,
+                event_type="SC_OBJECT_LEAVE_VIEW", payload={"objects": removed_objects},
+            ))
 
     def _resolve_display_name(self, templateid: str | None) -> str | None:
         if templateid is None:
@@ -1788,30 +1969,27 @@ class SessionPipeline:
         template_int_id: int | None,
         template_str_id: str | None,
         action: Any,
-    ) -> int:
+    ) -> int | None:
         key = self._template_key(template_type, template_int_id, template_str_id)
         if key is None:
-            return 1
-        candidates: list[int] = []
+            return None
+        owner_ids: list[int] = []
         damage_action = getattr(action, "damage_action", None)
         attacker_id = int(getattr(damage_action, "attacker_id", 0)) if damage_action is not None else 0
         if attacker_id:
-            candidates.append(attacker_id)
+            owner_ids.append(attacker_id)
         trigger_owner = int(getattr(trigger_data, "owner_id", 0) or 0)
         if trigger_owner:
-            candidates.append(trigger_owner)
+            owner_ids.append(trigger_owner)
         op_owner = int(getattr(op, "owner_id", 0) or 0)
         if op_owner:
-            candidates.append(op_owner)
-        seen: set[int] = set()
-        for battle_inst_id in candidates:
-            if battle_inst_id in seen:
-                continue
-            seen.add(battle_inst_id)
-            level = self.skill_levels_by_battle_inst.get(battle_inst_id, {}).get(key)
-            if level is not None:
-                return level
-        return self.global_skill_levels.get(key, 1)
+            owner_ids.append(op_owner)
+        distinct_owner_ids = set(owner_ids)
+        if len(distinct_owner_ids) > 1:
+            return None
+        if not distinct_owner_ids:
+            return None
+        return self.skill_levels_by_battle_inst.get(owner_ids[0], {}).get(key)
 
     @staticmethod
     def _read_float_presence(detail: Any, field_name: str) -> float | None:
@@ -1927,23 +2105,27 @@ class SessionPipeline:
 
     def _server_skill_row(self, owner_inst_id: int, skill: Any) -> dict[str, object | None]:
         template_type, template_int_id, template_str_id = self._template_id_payload(getattr(skill, "skill_id", None))
+        raw_data = self._message_to_payload(skill, include_implicit_defaults=True)
         row: dict[str, object | None] = {
             "owner_inst_id": owner_inst_id,
             "skill_inst_id": int(getattr(skill, "inst_id", 0)) or None,
             "template_type": template_type,
             "template_int_id": template_int_id,
-            "level": int(getattr(skill, "level", 0)) or None,
-            "potential_lv": int(getattr(skill, "potential_lv", 0)) or None,
+            "level": int(getattr(skill, "level", 0)),
+            "potential_lv": int(getattr(skill, "potential_lv", 0)),
             "source": self._field_enum_name(skill, "source"),
             "is_server_init": bool(getattr(skill, "is_server_init", False)),
             "is_enable": bool(getattr(skill, "is_enable", False)),
             "is_passive": bool(getattr(skill, "is_passive", False)),
+            # Keep typed string/float/dynamic fields distinct. An absent
+            # blackboard message is unknown, not an invented empty snapshot.
+            "skill_id": copy.deepcopy(raw_data.get("skill_id")),
+            "blackboard": copy.deepcopy(raw_data.get("blackboard")),
+            "talent_node_ids": [str(node_id) for node_id in getattr(skill, "talent_node_ids", [])],
+            "raw_data": raw_data,
         }
         if template_str_id:
             row["template_str_id"] = template_str_id
-        talent_node_ids = [str(node_id) for node_id in getattr(skill, "talent_node_ids", []) if str(node_id)]
-        if talent_node_ids:
-            row["talent_node_ids"] = talent_node_ids
         return row
 
     def _cache_server_skill_rows(self, owner_inst_id: int, skill_rows: list[dict[str, object | None]]) -> None:
@@ -1997,14 +2179,14 @@ class SessionPipeline:
         self._emit_server_skill_rows_event(
             event_type=event_type,
             owner_inst_id=owner_inst_id,
-            generation=int(getattr(message, "generation", 0)) or None,
+            generation=int(getattr(message, "generation", 0)),
             skill_rows=skill_rows,
             timestamp_ms=timestamp_ms,
         )
 
     def _detach_server_skill_state(self, message: Any, timestamp_ms: int) -> None:
         owner_inst_id = int(getattr(message, "inst_id", 0)) or None
-        generation = int(getattr(message, "generation", 0)) or None
+        generation = int(getattr(message, "generation", 0))
         deleted_skill_inst_ids = [int(inst_id) for inst_id in getattr(message, "del_inst_ids", []) if int(inst_id)]
         removed_rows: list[dict[str, object | None]] = []
         if owner_inst_id is not None:
@@ -2030,13 +2212,14 @@ class SessionPipeline:
         )
 
     @staticmethod
-    def _message_to_payload(message: Any) -> dict[str, object]:
+    def _message_to_payload(message: Any, *, include_implicit_defaults: bool = False) -> dict[str, object]:
         if message is None:
             return {}
         return MessageToDict(
             message,
             preserving_proto_field_name=True,
             use_integers_for_enums=False,
+            always_print_fields_with_no_presence=include_implicit_defaults,
         )
 
     def _emit_contract_tags_event(self, decoded: DecodedMessage, timestamp_ms: int) -> None:
@@ -2078,13 +2261,87 @@ class SessionPipeline:
         client_data = getattr(message, "client_data", None)
         if client_data is None:
             return
+        emitted_clock_ticks: set[int] = set()
         for op in getattr(client_data, "op_list", []):
+            self._observer_operation_index = getattr(self, "_observer_operation_index", 0) + 1
             op_type_name = self._field_enum_name(op, "op_type")
+            # One header for every raw operation, including unknown enum
+            # values. This observer-only stream must not enter the legacy
+            # trace, statistics, uploader batch or disk log. Derived events
+            # can share a seq_id, so they cannot establish raw continuity.
+            operation_callback = getattr(self, "on_battle_operation", None)
+            if operation_callback is not None:
+                try:
+                    try:
+                        operation_sha256 = hashlib.sha256(op.SerializeToString(deterministic=True)).hexdigest()
+                    except (AttributeError, TypeError, ValueError):
+                        operation_sha256 = None
+                    operation_callback({
+                        "type": "CAPTURE_BATTLE_OPERATION", "session_id": self.session_id,
+                        "timestamp_ms": timestamp_ms, "seq_id": int(getattr(op, "seq_id", 0)),
+                        "operation_type": op_type_name or "UnknownBattleOperation",
+                        "op_type": int(getattr(op, "op_type", 0)),
+                        "source_index": self._observer_operation_index,
+                        "operation_sha256": operation_sha256,
+                        "capture_integrity": {
+                            "packetsDroppedQueue": self.metrics.packets_dropped_queue,
+                            "decompressionErrors": self.metrics.decompression_errors,
+                            "protobufDecodeErrors": self.metrics.protobuf_decode_errors,
+                            "framingErrors": (self._observer_framing_errors + getattr(self.registry, "observer_framing_errors", 0)
+                                              + getattr(self.client_reassembler, "observer_overlap_conflicts", 0)
+                                              + getattr(self.server_reassembler, "observer_overlap_conflicts", 0)),
+                            "pendingMultipacks": len(self.pending_multi_frames),
+                            "pendingTransportSegments": sum(
+                                1 for stream in (self.client_reassembler, self.server_reassembler)
+                                for start, pending in stream._segments.items()
+                                if stream._next_seq is None or start + len(pending) > stream._next_seq),
+                            "currentFrameErrors": int(bool(getattr(self, "_observer_frame_invalid", False)
+                                or getattr(self.client_reassembler, "observer_overlap_conflicts", 0)
+                                or getattr(self.server_reassembler, "observer_overlap_conflicts", 0))),
+                        },
+                    })
+                except Exception:
+                    LOGGER.warning("read-only battle operation observer failed", exc_info=True)
             if op_type_name is None:
                 continue
             seq_id = int(getattr(op, "seq_id", 0)) or None
             client_tick_tms = int(getattr(op, "client_tick_tms", 0)) or None
 
+            if (getattr(self, "rotation_clock_trace", False) and client_tick_tms is not None
+                    and client_tick_tms > 0 and client_tick_tms not in emitted_clock_ticks):
+                emitted_clock_ticks.add(client_tick_tms)
+                self._emit_event(BattleLogEvent(
+                    session_id=self.session_id, timestamp_ms=timestamp_ms,
+                    event_type="GAME_CLOCK_TICK",
+                    payload={"source": "CS_BATTLE_OP", "tick_ms": client_tick_tms, "seq_id": seq_id},
+                ))
+
+            if op_type_name in {
+                "BattleOpSwitchMode", "BattleOpResetBattleData",
+                "BattleOpUpdateDataVersion", "BattleOpShieldValueModify",
+            }:
+                expected_case = {
+                    "BattleOpSwitchMode": "skill_switch_mode_op_data",
+                    "BattleOpResetBattleData": "reset_battle_op_data",
+                    "BattleOpUpdateDataVersion": "update_data_version_op_data",
+                    "BattleOpShieldValueModify": "shield_value_modify_op_data",
+                }[op_type_name]
+                if op.WhichOneof("op_data_impl") != expected_case:
+                    continue
+                data = self._message_to_payload(getattr(op, expected_case), include_implicit_defaults=True)
+                self._emit_event(BattleLogEvent(
+                    session_id=self.session_id, timestamp_ms=timestamp_ms, event_type=op_type_name,
+                    payload={**data, "seq_id": int(op.seq_id),
+                             "client_tick_tms": str(op.client_tick_tms),
+                             "owner_id": str(op.owner_id), "operation_owner_id": str(op.owner_id),
+                             "generation": int(op.generation), "op_type": int(op.op_type),
+                             "operation_payload_case": expected_case,
+                             "operation_data_serialization": "protobuf_json_implicit_defaults_v1",
+                             "raw_data": data},
+                ))
+                # These are observations. Reset/mode/shield names alone do
+                # not establish a Buff finish, scene reset or timing rule.
+                continue
             if op_type_name == "BattleOpSkillAttach":
                 attach_data = getattr(op, "skill_attach_op_data", None)
                 if attach_data is None:
@@ -2169,6 +2426,32 @@ class SessionPipeline:
             if op_type_name == "BattleOpTriggerAction":
                 self._emit_trigger_action_event(op, seq_id, client_tick_tms, timestamp_ms)
                 continue
+            if op_type_name == 'BattleOpTriggerKeyword':
+                if op.WhichOneof('op_data_impl') != 'trigger_keyword_op_data':
+                    continue
+                keyword = op.trigger_keyword_op_data
+                self._emit_event(BattleLogEvent(
+                    session_id=self.session_id, timestamp_ms=timestamp_ms, event_type=op_type_name,
+                    payload={'seq_id': int(op.seq_id), 'client_tick_tms': int(op.client_tick_tms),
+                             'owner_id': str(op.owner_id), 'generation': int(op.generation),
+                             'buff_inst_id': str(keyword.buff_inst_id),
+                             'add_buff_num_id': int(keyword.add_buff_num_id),
+                             'modify': [{'config_index': int(row.config_index),
+                                         'modify_value': float(row.modify_value)} for row in keyword.modify],
+                             'operation_payload_case': op.WhichOneof('op_data_impl')},
+                ))
+                continue
+            if op_type_name == "BattleOpSetBuffEnableState":
+                state_data = getattr(op, 'set_buff_enable_state_op_data', None)
+                if state_data is None:
+                    continue
+                self._emit_event(BattleLogEvent(
+                    session_id=self.session_id, timestamp_ms=timestamp_ms, event_type=op_type_name,
+                    payload={'seq_id': int(op.seq_id), 'client_tick_tms': int(op.client_tick_tms),
+                             'owner_id': int(op.owner_id), 'generation': int(op.generation),
+                             'states': {str(uid): enabled for uid, enabled in state_data.buff_inst_id_to_enable_state.items()}},
+                ))
+                continue
             if op_type_name == "BattleOpFinishBuff":
                 finish_data = getattr(op, "finish_buff_op_data", None)
                 if finish_data is None:
@@ -2182,6 +2465,11 @@ class SessionPipeline:
                             "seq_id": seq_id,
                             "client_tick_tms": client_tick_tms,
                             "buff_inst_id": int(getattr(finish_data, "buff_inst_id", 0)) or None,
+                            "operation_owner_id": str(op.owner_id),
+                            "generation": int(op.generation),
+                            "reduce_layer": int(finish_data.reduce_layer),
+                            "force": bool(finish_data.force),
+                            "raw_data": self._message_to_payload(finish_data, include_implicit_defaults=True),
                         },
                     )
                 )
@@ -2194,12 +2482,19 @@ class SessionPipeline:
                 payload: dict[str, object | None] = {
                     "seq_id": seq_id,
                     "client_tick_tms": client_tick_tms,
+                    "operation_owner_id": str(op.owner_id) if hasattr(op, "owner_id") else None,
+                    "generation": int(op.generation) if hasattr(op, "generation") else None,
                     "int_id": template_int_id,
                     "buff_inst_id": int(getattr(add_data, "buff_inst_id", 0)) or None,
                     "src_inst_id": int(getattr(add_data, "src_inst_id", 0)) or None,
                     "target_inst_id": int(getattr(add_data, "target_inst_id", 0)) or None,
                     "assigned_items": self._message_to_payload(getattr(add_data, "assigned_items", None)),
+                    "raw_data": self._message_to_payload(add_data, include_implicit_defaults=True),
                 }
+                buff_template = getattr(add_data, "buff_id", None)
+                if buff_template is not None and hasattr(buff_template, "WhichOneof"):
+                    payload["buff_template_id"] = self._message_to_payload(buff_template, include_implicit_defaults=True)
+                    payload["buff_template_id_case"] = buff_template.WhichOneof("id_impl")
                 if template_str_id:
                     payload["str_id"] = template_str_id
                 self._emit_event(
@@ -2430,12 +2725,35 @@ class SessionPipeline:
             "seq_id": seq_id,
             "client_tick_tms": client_tick_tms,
             "owner_id": int(getattr(trigger_data, "owner_id", 0) or getattr(op, "owner_id", 0)) or None,
+            # Preserve the distinct protocol identities before the legacy
+            # display owner fallback. uint64 values must survive JSON readers.
+            "operation_owner_id": str(op.owner_id) if hasattr(op, "owner_id") else None,
+            "trigger_owner_id": str(trigger_data.owner_id) if hasattr(trigger_data, "owner_id") else None,
+            "trigger_inst_id": str(trigger_data.inst_id) if hasattr(trigger_data, "inst_id") else None,
+            "generation": int(op.generation) if hasattr(op, "generation") else None,
             "owner_type": str(getattr(trigger_data, "owner_type", "")) or None,
             "inst_id": int(getattr(trigger_data, "inst_id", 0)) or None,
+            # This is outside BATTLE_ACTION_INST. CreateBuff also emits an
+            # End-phase payload containing the instances it finishes.
+            "trigger_type": int(trigger_data.trigger_type) if hasattr(trigger_data, "trigger_type") else None,
             "template_type": template_type,
             "template_int_id": template_int_id,
-            "action": self._message_to_payload(action),
+            # Proto3 action/unit index zero is a defined value. The default
+            # JSON serializer omits it, which is indistinguishable from an
+            # incomplete hand-written event once the message is discarded.
+            # Emit non-presence scalar defaults here, at the typed boundary.
+            # Absent message/oneof fields remain absent.
+            "action": self._message_to_payload(action, include_implicit_defaults=True),
+            "action_serialization": "protobuf_json_implicit_defaults_v1",
         }
+        template_id = getattr(trigger_data, "template_id", None)
+        if template_id is not None and hasattr(template_id, "WhichOneof"):
+            payload["template_id"] = self._message_to_payload(template_id, include_implicit_defaults=True)
+            payload["template_id_case"] = template_id.WhichOneof("id_impl")
+        if hasattr(action, "WhichOneof"):
+            payload["action_runtime_case"] = action.WhichOneof("inst_impl")
+        if hasattr(op, "WhichOneof"):
+            payload["operation_payload_case"] = op.WhichOneof("op_data_impl")
         damage_detail_presence = self._damage_detail_presence_payload(action)
         if damage_detail_presence:
             payload["damage_detail_presence"] = damage_detail_presence
@@ -2475,6 +2793,7 @@ class SessionPipeline:
             defender_modifiers = list(getattr(modifier_args, "defender_modifiers", [])) if modifier_args is not None else []
             row = {
                 "detail_index": index,
+                "has_battle_report_info": cls._has_message_field(detail, "battle_report_info"),
                 "has_calculation_check_args": cls._has_message_field(detail, "calculation_check_args"),
                 "has_calculate_damage_check_args": cls._has_message_field(detail, "calculate_damage_check_args"),
                 "processor_debug_args_count": len(processor_debug_args) if processor_debug_args is not None else 0,
@@ -2528,7 +2847,18 @@ class SessionPipeline:
         timestamp_ms: int,
         extra_payload: dict[str, object] | None = None,
     ) -> None:
-        payload = self._message_to_payload(message)
+        effect_messages = {
+            "SC_ADD_SERVER_BUFF", "SC_REMOVE_SERVER_BUFF",
+            "SC_BATTLE_ADD_GLOBAL_BUFF", "SC_BATTLE_REMOVE_GLOBAL_BUFF",
+            "SC_BATTLE_SYNC_GLOBAL_BUFF_INFO", "SC_CHAR_BAG_SYNC_PERSISTENT_BUFFS",
+            "SC_SYNC_RACING_DUNGEON_BUFF_MODIFY", "SC_SYNC_RACING_DUNGEON_RECONNECT",
+            "SC_RESET_BATTLE_STATUS", "SC_SCENE_RESET_ENTITY", "SC_BATTLE_GENERATION_CHANGE",
+            "SC_CHAR_BAG_SET_CURR_TEAM_INDEX", "SC_CHAR_BAG_SET_CURR_TEAM_TYPE",
+            "SC_CHAR_BAG_SET_MAX_TEAM_MEMBER_COUNT", "SC_CHAR_SKILL_INFOS",
+            "SC_EQUIP_MEDICINE_MODIFY", "SC_EQUIP_PRODUCE",
+            "SC_SYNC_CHAR_BAG_INFO", "SC_CHAR_BAG_SET_TEAM", "SC_CHAR_BAG_SET_TEAM_LEADER",
+        }
+        payload = self._message_to_payload(message, include_implicit_defaults=event_type in effect_messages)
         if extra_payload:
             payload.update(extra_payload)
         self._emit_event(
@@ -2706,6 +3036,7 @@ class DamageLogService:
             "type": "status",
             "schema_version": 1,
             "state": self.state.value,
+            "game_exe": self.config.game_exe,
             "session_id": self.active_session.session_id if self.active_session else None,
             "active_flow": active_flow,
             "session": self.active_session.status_snapshot() if self.active_session is not None else None,
@@ -2829,6 +3160,10 @@ class DamageLogService:
                     self._lock_active_flow_capture_if_ready()
                     self._set_state(ServiceState.LIVE)
 
+            # Queue.get() does not yield when a backlog is already available.
+            # Give status/monitor tasks a turn between complete TCP packets.
+            await asyncio.sleep(0)
+
     @staticmethod
     def _normalize_flow(packet: CapturedPacket) -> FlowKey | None:
         if packet.src.port == 30000:
@@ -2897,6 +3232,7 @@ class DamageLogService:
             multi_phase_dungeon_map=self.multi_phase_dungeon_map,
             merge_multi_phase_enemy_battles=self.config.merge_multi_phase_enemy_battles,
             on_event=self._handle_outbound_event,
+            on_battle_operation=getattr(getattr(self, "observer", None), "on_event", None),
             on_debug_message=self._handle_debug_message if self.config.debug_enabled else None,
             on_debug_record=self._handle_debug_record if self.config.debug_enabled else None,
             metrics=self.metrics,
@@ -2909,6 +3245,7 @@ class DamageLogService:
                 default=None,
             )
             self.trace_bridge.begin_capture_session(timestamp_ms=capture_start_ts_ms)
+        self._notify_capture_lifecycle("CAPTURE_SESSION_START")
         self._write_status()
         LOGGER.info("replaying %d buffered packets for active flow", len(pending))
         for packet in pending:
@@ -2948,6 +3285,8 @@ class DamageLogService:
 
     def _reset_session(self) -> None:
         had_capture_session = self.active_flow is not None or self.active_session is not None
+        if had_capture_session:
+            self._notify_capture_lifecycle("CAPTURE_SESSION_END")
         if had_capture_session and self.trace_bridge is not None:
             self.trace_bridge.end_capture_session()
         if self.active_session is not None:
@@ -2963,9 +3302,38 @@ class DamageLogService:
         self.debug_session_dir = None
         self.debug_counters.clear()
 
+    def _notify_capture_lifecycle(self, event_type: str) -> None:
+        """Invalidate live subscriptions even when service state stays LIVE.
+
+        This is a readonly observer side channel, not gameplay evidence.  It
+        deliberately does not enter the legacy trace or alter battle timing.
+        """
+        observer = getattr(self, "observer", None)
+        callback = getattr(observer, "on_event", None)
+        if callback is None:
+            return
+        session = self.active_session
+        callback({
+            "type": event_type,
+            "session_id": getattr(session, "session_id", None),
+            "timestamp_ms": int(datetime.now().timestamp() * 1000),
+        })
+
     def _handle_outbound_event(self, event: OutboundEvent) -> None:
         payload = event.as_dict()
-        if self.trace_bridge is not None:
+        evidence_types = {
+            "SC_CHAR_BAG_SET_CURR_TEAM_INDEX", "SC_CHAR_BAG_SET_CURR_TEAM_TYPE",
+            "SC_CHAR_BAG_SET_MAX_TEAM_MEMBER_COUNT", "SC_CHAR_SKILL_INFOS",
+            "SC_EQUIP_MEDICINE_MODIFY", "SC_EQUIP_PRODUCE",
+            "BattleOpSwitchMode", "BattleOpResetBattleData",
+            "BattleOpUpdateDataVersion", "BattleOpShieldValueModify",
+        }
+        if (self.trace_bridge is not None and payload.get("type") not in evidence_types
+                and payload.get("type") not in {"SC_SYNC_CHAR_BAG_INFO", "SC_CHAR_BAG_SET_TEAM",
+                                               "SC_CHAR_BAG_SET_TEAM_LEADER"}
+                and not (payload.get("type") == "LOADOUT" and payload.get("reason") in evidence_types)):
+            # Newly retained evidence must not advance the legacy last
+            # gameplay timestamp or flush pending Buff/statistics groups.
             self.trace_bridge.handle_event(payload)
         self.batch.append(payload)
         if self.observer is not None and self.observer.on_event is not None:
@@ -2983,6 +3351,14 @@ class DamageLogService:
     def _handle_debug_message(self, decoded: DecodedMessage, timestamp_ms: int) -> None:
         if self.debug_session_dir is None or self.active_session is None:
             return
+        schema_files = {}
+        pending_descriptors = [decoded.message.DESCRIPTOR.file]
+        while pending_descriptors:
+            descriptor = pending_descriptors.pop()
+            if descriptor.name in schema_files:
+                continue
+            schema_files[descriptor.name] = hashlib.sha256(descriptor.serialized_pb).hexdigest()
+            pending_descriptors.extend(descriptor.dependencies)
         payload = {
             "type": "debug_proto",
             "session_id": self.active_session.session_id,
@@ -2991,15 +3367,24 @@ class DamageLogService:
             "class_name": decoded.class_name,
             "msg_id": decoded.msg_id,
             "head": decoded.head,
+            # MessageToDict omits fields unknown to this schema. Preserve the
+            # exact decoded body as well, so a newer schema can replay it.
+            "raw_body_format": "protobuf_body_after_decompression_and_reassembly",
+            "raw_body_size": len(decoded.raw_body),
+            "raw_body_sha256": hashlib.sha256(decoded.raw_body).hexdigest(),
+            "raw_body_base64": base64.b64encode(decoded.raw_body).decode('ascii'),
+            "protobuf_schema_files_sha256": dict(sorted(schema_files.items())),
             "message": MessageToDict(
                 decoded.message,
                 preserving_proto_field_name=True,
                 use_integers_for_enums=False,
+                always_print_fields_with_no_presence=True,
             ),
             "message_enum_ints": MessageToDict(
                 decoded.message,
                 preserving_proto_field_name=True,
                 use_integers_for_enums=True,
+                always_print_fields_with_no_presence=True,
             ),
         }
         self._write_debug_json("proto", decoded.class_name, payload, timestamp_ms, decoded.direction)

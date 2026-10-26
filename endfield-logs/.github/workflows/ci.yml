@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Sync API deps
+        run: uv sync --project apps/api --extra dev
+      - name: Sync uploader deps
+        run: uv sync --project apps/uploader --extra dev
+      - name: Sync parser_core deps
+        run: uv sync --project packages/parser_core --extra dev
+      - name: Sync upload_domain deps
+        run: uv sync --project packages/upload_domain --extra dev
+      - name: Run API tests
+        run: uv run --project apps/api pytest
+      - name: Run parser_core tests
+        run: uv run --project packages/parser_core pytest
+      - name: Run upload_domain tests
+        run: uv run --project packages/upload_domain pytest
+      - name: Run uploader tests
+        run: uv run --project apps/uploader pytest
+
+  web-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install web deps
+        run: pnpm --dir apps/web install
+      - name: Web typecheck
+        run: pnpm --dir apps/web typecheck

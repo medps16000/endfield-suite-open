@@ -42,9 +42,14 @@ jobs:
       - name: Install client
         run: |
           python -m pip install -e ".\endfield-pcap\packages\parser_core"
+          python -m pip install -e ".\endfield-logs\packages\uploader_core"
           python -m pip install -e ".\endfield-pcap[dev]"
       - name: Test client
-        run: python -m pytest endfield-pcap/tests
+        working-directory: endfield-pcap
+        env:
+          QT_QPA_PLATFORM: offscreen
+          QTWEBENGINE_CHROMIUM_FLAGS: --disable-gpu
+        run: python -m pytest tests
 
   uploader-tests:
     runs-on: windows-latest
@@ -57,6 +62,7 @@ jobs:
         run: |
           python -m pip install -e ".\endfield-logs\packages\parser_core"
           python -m pip install -e ".\endfield-logs\packages\uploader_core"
+          python -m pip install -e ".\endfield-pcap[dev]"
           python -m pip install -e ".\endfield-logs\apps\uploader[dev]"
       - name: Test uploader
         env:
@@ -85,3 +91,6 @@ jobs:
       - name: Typecheck web
         working-directory: endfield-logs
         run: pnpm --dir apps/web typecheck
+      - name: Check source-only resource boundaries
+        working-directory: endfield-logs/apps/web
+        run: node --test tests/public-runtime-resources.test.mjs

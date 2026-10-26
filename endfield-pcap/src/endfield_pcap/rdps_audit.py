@@ -17,20 +17,22 @@ from .trace_bridge import default_trace_file
 _LOADOUT_SLOT_RE = re.compile(
     r"\bLOADOUT\s+slot=(?P<slot>\d+)\s+char=(?P<char>\S+).*?"
     r"weaponTemplate=(?P<weapon>\S+)\s+weaponLv=(?P<weapon_lv>-?\d+)\s+"
-    r"refine=(?P<refine>-?\d+)\s+break=(?P<breakthrough>-?\d+)\s+"
+    r"refine=(?P<refine>-?\d+|unknown)\s+break=(?P<breakthrough>-?\d+)\s+"
     r"attachedGem=(?P<attached_gem>-?\d+)\s+equipInsts=(?P<equip_inst>\{.*?\})\s+"
-    r"equips=(?P<equips>\{.*?\})\s+equipSuit=(?P<equip_suit>\{.*\})"
+    r"equips=(?P<equips>\{.*?\})\s+"
+    r"(?:(?:(?:equipsComplete=\S+)|(?:unplacedEquipInstIds=\[[^\]]*\]))\s+)*"
+    r"equipSuit=(?P<equip_suit>\{.*\})"
 )
 _SQUAD_RE = re.compile(r"\bSQUAD\s+size=(?P<size>\d+)\s+members=\[(?P<members>[^\]]*)\]")
 _BUFF_START_RE = re.compile(
-    r'\bBUFF_START\s+#(?P<seq>\d+)\s+id="(?P<buff_id>[^"]*)"\s+uid=(?P<uid>\d+)\s+'
-    r"owner=(?P<owner>\S+)\s+src=(?P<src>\S+)"
+    r'\bBUFF_START\s+#(?P<seq>\d+)\b(?=.*?\bid="(?P<buff_id>[^"]*)")(?=.*?\buid=(?P<uid>\S+))'
+    r"(?=.*?\bowner=(?P<owner>\S+))(?=.*?\bsrc=(?P<src>\S+))"
 )
-_BUFF_END_RE = re.compile(r'\bBUFF_END\s+#(?P<seq>\d+)\s+id="(?P<buff_id>[^"]*)"\s+uid=(?P<uid>\d+)')
-_BB_RE = re.compile(r"\bBB\[(?P<uid>\d+)\]:\s*(?P<body>.*)")
+_BUFF_END_RE = re.compile(r'\bBUFF_END\s+#(?P<seq>\d+)\b(?=.*?\bid="(?P<buff_id>[^"]*)")(?=.*?\buid=(?P<uid>\S+))')
+_BB_RE = re.compile(r"\bBB\[(?P<uid>[^\]]+)\]:\s*(?P<body>.*)")
 _HP_RE = re.compile(
-    r'\bHP_V2\s+#(?P<seq>\d+)\s+hit=(?P<hit>\d+).*?skill="(?P<skill>[^"]*)".*?'
-    r"src=(?P<src>\S+)\s+tgt=(?P<tgt>\S+)\s+atk=(?P<atk>\S+)"
+    r'\bHP_V2\s+#(?P<seq>\d+)\b(?=.*?\bhit=(?P<hit>\d+)\b)(?=.*?\bskill="(?P<skill>[^"]*)")'
+    r"(?=.*?\bsrc=(?P<src>\S+))(?=.*?\btgt=(?P<tgt>\S+))(?=.*?\batk=(?P<atk>\S+))"
 )
 _CHAR_PREFIX_RE = re.compile(r"^(chr_\d{4})_")
 _CHAR_KEY_RE = re.compile(r"chr_\d{4}_[a-z0-9]+")
@@ -470,21 +472,7 @@ def _could_be_external_rdps_buff(seen: BuffSeen) -> bool:
 
 
 def _classify_unresolved_packet_buff(seen: BuffSeen) -> tuple[str, list[str]]:
-    if not any(str(value or "").startswith(("chr_", "eny_")) for value in (seen.owner, seen.src)):
-        return "orphan_actor", []
-    rdps_keys = sorted(key for key in seen.bb_keys if _is_rdps_effect_bb_key(key))
-    if rdps_keys:
-        return "rdps_effect", rdps_keys
-    if seen.bb_keys:
-        known_noise = {key for key in seen.bb_keys if key.lower() in _NON_RDPS_BB_KEYS}
-        if known_noise == seen.bb_keys:
-            return "utility_or_marker", []
-        if _could_be_external_rdps_buff(seen):
-            return "potential_rdps_effect", []
-        return "unknown_blackboard", []
-    if _could_be_external_rdps_buff(seen):
-        return "potential_rdps_effect", []
-    return "no_blackboard", []
+    return ("unverified", [])
 
 
 def _values_equal(left: Any, right: Any) -> bool:
@@ -580,51 +568,7 @@ def _equipment_candidates(
     *,
     limit: int = 5,
 ) -> list[dict[str, Any]]:
-    if not seen.bb_values:
-        return []
-    chars = [value for value in (seen.owner, seen.src) if value in active_suits]
-    if not chars:
-        return []
-    candidates: list[tuple[int, dict[str, Any]]] = []
-    for char in dict.fromkeys(chars):
-        for active in active_suits.get(char, []):
-            suit_id = str(active.get("suit_id") or "")
-            semantic = equipment.get(suit_id)
-            if semantic is None:
-                continue
-            matched = {
-                key
-                for key, value in seen.bb_values.items()
-                if key in semantic.values and _values_equal(value, semantic.values[key])
-            }
-            if not matched:
-                continue
-            relevant = matched & _RDPS_EQUIP_KEYS
-            if not relevant:
-                continue
-            missing_from_static = set(seen.bb_values) - set(semantic.values)
-            score = len(matched) * 10 + len(relevant) * 20 - len(missing_from_static) * 5
-            if not missing_from_static:
-                score += 10
-            candidates.append(
-                (
-                    score,
-                    {
-                        "id": f"equip:{suit_id}",
-                        "suit_id": suit_id,
-                        "passive_skill_id": semantic.passive_skill_id,
-                        "char": char,
-                        "score": score,
-                        "matched_keys": sorted(matched),
-                        "rdps_keys": sorted(relevant),
-                        "missing_packet_keys": sorted(set(semantic.values) - set(seen.bb_values)),
-                        "unknown_packet_keys": sorted(missing_from_static),
-                        "confidence": "loadout_bb_exact" if not missing_from_static else "loadout_bb_partial",
-                    },
-                )
-            )
-    candidates.sort(key=lambda item: (-item[0], item[1]["id"]))
-    return [item for _, item in candidates[:limit]]
+    return []
 
 
 def _candidate_semantics(
@@ -633,38 +577,7 @@ def _candidate_semantics(
     *,
     limit: int = 5,
 ) -> list[dict[str, Any]]:
-    if not seen.bb_keys:
-        return []
-    prefixes = {_char_prefix(seen.owner), _char_prefix(seen.src)}
-    prefixes.discard(None)
-    candidates: list[tuple[int, str, dict[str, Any], set[str]]] = []
-    for buff_id, entry in buff_semantics.items():
-        if not isinstance(entry, dict):
-            continue
-        bb_keys = _semantic_bb_keys(entry)
-        if not bb_keys:
-            continue
-        overlap = seen.bb_keys & bb_keys
-        if not overlap:
-            continue
-        score = len(overlap) * 10
-        missing = seen.bb_keys - bb_keys
-        score -= len(missing) * 2
-        if any(str(buff_id).startswith(prefix or "") for prefix in prefixes):
-            score += 6
-        if _has_rdps_semantics(entry):
-            score += 3
-        candidates.append((score, buff_id, entry, overlap))
-    candidates.sort(key=lambda item: (-item[0], item[1]))
-    return [
-        {
-            "id": buff_id,
-            "score": score,
-            "overlap_keys": sorted(overlap),
-            "rdps_semantics": _has_rdps_semantics(entry),
-        }
-        for score, buff_id, entry, overlap in candidates[:limit]
-    ]
+    return []
 
 
 def _line_payload(line: str) -> str:
@@ -985,7 +898,7 @@ def _build_rdps_trust_audit(report: dict[str, Any], *, root: Path, proof: dict[s
         if isinstance(row, dict)
     ]
     return {
-        "ok": bool(preflight.get("ok")) and bool(proof.get("external_credit_evidence_ok", True)),
+        "ok": preflight.get("ok") is True and basis.get("rdps_strict_ok") is True and proof.get("external_credit_evidence_ok") is True,
         "preflight_ok": bool(preflight.get("ok")),
         "checked_external_buff_count": int(preflight.get("checked_external_buff_count") or 0),
         "accepted_effect_buff_count": int(preflight.get("accepted_effect_buff_count") or 0),
@@ -1062,9 +975,9 @@ def _per_hit_rdps_audit(text: str, *, root: Path, expected_hit_count: int) -> di
     preflight = report.get("rdps_preflight") or basis.get("rdps_preflight") or {}
     packet_grounded_hit_count = int(basis.get("packet_grounded_hit_count") or 0) if basis else 0
     packet_final_value_count = int(basis.get("packet_final_value_count") or 0) if basis else 0
-    packet_grounded_ok = not basis or packet_grounded_hit_count == len(hits)
-    conservation_ok = bool(basis.get("rdps_conservation_ok")) if basis else True
-    preflight_ok = bool(preflight.get("ok")) if preflight else True
+    packet_grounded_ok = bool(hits) and bool(basis) and packet_grounded_hit_count == len(hits)
+    conservation_ok = basis.get("rdps_conservation_ok") is True
+    preflight_ok = preflight.get("ok") is True and basis.get("rdps_strict_ok") is True
     sample_hits: list[dict[str, Any]] = []
     for index, hit in enumerate(hits, start=1):
         contributions = hit.get("rdps_contributions") or []
@@ -1176,7 +1089,7 @@ def _per_hit_rdps_audit(text: str, *, root: Path, expected_hit_count: int) -> di
                     )
                     continue
                 external_credit_by_buff[(source_key, event_key, zone_key)] += credit
-    external_credit_evidence_ok = not external_evidence_missing
+    external_credit_evidence_ok = bool(hits) and len(debug_hits) == len(hits) and not external_evidence_missing
     rdps_proof = {
         "definition": "packet HP-loss conserved attribution",
         "preflight_ok": preflight_ok,
@@ -1294,10 +1207,11 @@ def audit_trace(trace_file: Path | None = None, *, root: Path | None = None) -> 
     packet_bundle_buff_ids = _load_packet_bundle_buff_ids(root)
     known_non_rdps_registry = _load_rdps_known_non_rdps_registry(root)
     runtime_truth_jsonl_path = _default_truth_jsonl_file()
-    runtime_truth_buff_uid_map = _load_runtime_truth_buff_uid_map(runtime_truth_jsonl_path)
+    # A global sidecar and nearby modification time do not bind it to this trace.
+    runtime_truth_buff_uid_map = {}
     runtime_truth_db_path = _default_runtime_truth_db_file()
-    runtime_truth_db = _load_runtime_truth_db(runtime_truth_db_path)
-    runtime_truth_known_buff_ids = _runtime_truth_known_buff_ids(runtime_truth_db)
+    runtime_truth_db = {}
+    runtime_truth_known_buff_ids = set()
     runtime_truth_session_delta_sec: float | None = None
     runtime_truth_session_mismatch = False
 
@@ -1341,7 +1255,7 @@ def audit_trace(trace_file: Path | None = None, *, root: Path | None = None) -> 
                         "char": groups["char"],
                         "weapon_template": groups["weapon"],
                         "weapon_lv": int(groups["weapon_lv"]),
-                        "refine": int(groups["refine"]),
+                        "refine": int(groups["refine"]) if groups["refine"] != "unknown" else None,
                         "breakthrough": int(groups["breakthrough"]),
                         "attached_gem": int(groups["attached_gem"]),
                         "equip_count": groups["equip_inst"].count("["),
@@ -1423,8 +1337,7 @@ def audit_trace(trace_file: Path | None = None, *, root: Path | None = None) -> 
             is_player_enemy_damage = (
                 _CHAR_KEY_RE.search(data["src"])
                 or _CHAR_KEY_RE.search(data["atk"])
-                or _CHAR_KEY_RE.search(data["skill"])
-            ) and (_ENEMY_KEY_RE.search(data["tgt"]) or _ENEMY_KEY_RE.search(data["skill"]))
+            ) and _ENEMY_KEY_RE.search(data["tgt"])
             if is_player_enemy_damage:
                 player_enemy_damage_count += 1
                 for field in ("src", "tgt", "atk"):
@@ -1557,6 +1470,8 @@ def audit_trace(trace_file: Path | None = None, *, root: Path | None = None) -> 
         hard_blockers.append("incomplete_loadout")
     if unresolved_damage_refs:
         hard_blockers.append("unresolved_damage_actor")
+    if unresolved_buff_ids:
+        hard_blockers.append("unresolved_buff_id")
     rdps_relevant_unresolved = dict(unresolved_rdps_effect_ids)
     rdps_potential_unresolved = dict(unresolved_potential_rdps_effect_ids)
     rdps_relevant_after_equipment = {
@@ -1583,7 +1498,7 @@ def audit_trace(trace_file: Path | None = None, *, root: Path | None = None) -> 
         event_end_idx=event_end_idx,
     )
     per_hit = _per_hit_rdps_audit(parser_context_text, root=root, expected_hit_count=player_enemy_damage_count)
-    if per_hit.get("available") and not per_hit.get("ok"):
+    if per_hit.get("ok") is not True:
         hard_blockers.append("per_hit_rdps_parse")
 
     return {

@@ -1,8 +1,12 @@
-from fastapi import APIRouter, Request
+import hashlib
+import json
+
+from fastapi import APIRouter, Query, Request, Response
 
 from app.schemas.public import (
     BattleDetailResponse,
     DeleteBattleResponse,
+    PublicAccountSearchResponse,
     PublicUserRankingsResponse,
     ShareSummaryResponse,
     UserBattlesResponse,
@@ -28,6 +32,35 @@ def get_my_battles(request: Request) -> UserBattlesResponse:
     viewer = auth_service.get_user_from_session(session_token)
     viewer_user_id = viewer.id if viewer else None
     return public_data_service.list_user_battles(viewer_user_id)
+
+
+@router.get("/users/search", response_model=PublicAccountSearchResponse)
+def search_public_accounts(
+    request: Request,
+    query: str = Query(min_length=2, max_length=128),
+    limit: int = Query(default=10, ge=1, le=20),
+) -> PublicAccountSearchResponse:
+    payload = public_data_service.search_public_accounts(query=query, limit=limit)
+    content = json.dumps(
+        payload.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    content_hash = hashlib.sha256(content).hexdigest()
+    etag = f'W/"{content_hash}"'
+    headers = {
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "public, max-age=30",
+        "ETag": etag,
+    }
+    if request.headers.get("if-none-match") == etag:
+        return Response(status_code=304, headers=headers)  # type: ignore[return-value]
+    return Response(  # type: ignore[return-value]
+        content=content,
+        media_type="application/json; charset=utf-8",
+        headers=headers,
+    )
 
 
 @router.get("/users/{account_id}/rankings", response_model=PublicUserRankingsResponse)

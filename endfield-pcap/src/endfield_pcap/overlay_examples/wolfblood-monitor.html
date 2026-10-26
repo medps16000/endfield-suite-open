@@ -1,0 +1,538 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>狼之绯 · 狼血</title>
+<script>
+// 仅手工修改准确目标 ID；空数组显示所有已准确关联的目标。
+const CONFIG = {targetIds: [], targetNames: {}};
+</script>
+<style>
+:root{color-scheme:dark;font:12px/1.45 "Microsoft YaHei",sans-serif;color:#f2e8df}*{box-sizing:border-box}
+body{margin:0;padding:8px;background:rgba(23,16,20,.92)}#status{font-size:11px;color:#cfb6ad;padding:2px 3px 7px;overflow-wrap:anywhere}
+#cards{display:grid;gap:7px}.card{border:1px solid #74424a;border-radius:7px;padding:9px;background:#291d24}
+.head{display:flex;align-items:center;gap:8px}.icon{width:32px;height:32px;object-fit:contain}.name{font-weight:700}.target{font-size:10px;color:#bda7a8;overflow-wrap:anywhere}
+.number{margin-left:auto;white-space:nowrap;color:#f1b7ab}.number b{font-size:27px;font-weight:700;line-height:1}.number span{font-size:12px;color:#bda7a8}
+.cells{display:grid;grid-template-columns:repeat(16,minmax(3px,1fr));gap:3px;margin-top:8px}.cell{height:7px;border:1px solid #805460;border-radius:1px;background:#35232b}.cell.on{background:#d77e86;border-color:#ecb1ac}
+.card[data-count="unknown"] .cell{background:#30262c;border-color:#52434b}.why{font-size:10px;color:#bda7a8;margin-top:5px;min-height:14px}
+</style>
+<div id="status" role="status">正在校验同版资料与只读接口…</div><div id="cards"></div>
+<script>
+(() => {
+  'use strict';
+  const api = window.endfieldOverlay, status = document.getElementById('status'), cards = document.getElementById('cards');
+  const LAYER = 'buff_wpn_sword_0022_layer', FINAL = 'buff_wpn_sword_0022_final', SKILL = 'sk_wpn_sword_0022';
+  const PIN = {
+    [LAYER]: 'bb4aade1ea3bccadd0b8266b09de2ae9eced688f447d74392673994e022dcdb7',
+    [FINAL]: '16994ca1f85a61199dedaeac5f4abf6c8aac63db9bad281bd23f72c0fe936660',
+    [SKILL]: 'f2e420bf7929c38d05bdf8dbeaf9015e69d841e844a5419c00be237be86563f2'
+  };
+  const MAX = 16, MAX_UIDS = 20000;
+  const NATIVE_PIN = {gameAssemblySha256: 'ab00f1c41e13edf9816f142b166e3c2536d5bc7707992c39e5ed52d1cc888e2c',
+    metadataSha256: '461321d9dca6a832bce3bd2390402efc7c83c145554e97a8058bb68fbec1c8ca'};
+  const GRAPH_PIN = {typedRootsSha256: '318fdc4b6a04f3dc7f24abb956646e22ed46c5ce3a2ad21817d25ba911eab82e',
+    skillManifestSha256: '8f0baea67112af46ca1735cc115bd1a1b5ab9637bee2aa3e7bd043455467f1b6'};
+  const INDEXED_BASIS = 'source-index-and-capture-integrity';
+  const HEALTH_KEYS = ['packetsDroppedQueue', 'decompressionErrors', 'protobufDecodeErrors', 'framingErrors', 'pendingMultipacks', 'pendingTransportSegments', 'currentFrameErrors'];
+  let live = true, proofReady = false, gate = null, stream = null, cursor = null, previousSeq = null;
+  let previousSourceIndex = null, integrityRevision = null, integrityFingerprint = null, basisDomain = null, indexedLocked = false;
+  let contextSeen = null;
+  let targetRevisions = {}, targetOverflow = null;
+  let targetLabels = new Map(), labelContext = null;
+  let pendingSeen = null, seenLastIndex = 0;
+  let exhausted = false;
+  let contentRevision = -1, gapRevision = null, omissionCount = null, floor = 0, latest = null, paused = '';
+  let message = '待首次完整清层后计数', icon = null;
+  const actors = new Map(), uids = new Map(), parents = new Map(), processed = new Map(), stops = [];
+  const id = value => {
+    if (typeof value !== 'string' || !/^[0-9]{1,20}$/.test(value)) return null;
+    const number = BigInt(value); return number > 0n && number < (1n << 64n) ? number.toString() : null;
+  };
+  const buffUid = value => { const key = id(value); return key && (BigInt(key) & (1n << 61n)) !== 0n ? key : null; };
+  const integer = value => Number.isSafeInteger(value);
+  const wanted = new Set();
+  const contextKey = value => value && typeof value.captureSessionId === 'string' && value.captureSessionId && integer(value.generation)
+    ? JSON.stringify([value.captureSessionId, value.generation]) : null;
+  const enumIs = (value, number, text) => value === number || value === String(number) || value === text;
+  const actionIs = (value, number, text) => value === number || value === text;
+  const nativeMatches = value => value && Object.entries(NATIVE_PIN).every(([key, hash]) => value[key] === hash);
+  const validHealth = value => value && HEALTH_KEYS.every(key => integer(value[key]) && value[key] >= 0);
+  const healthFingerprint = value => JSON.stringify(HEALTH_KEYS.map(key => value[key]));
+  const inline = value => typeof value === 'string' && value.length <= 100000 && /^data:image\/(?:webp|png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(value);
+  const belongs = target => target && (!wanted.size || wanted.has(target));
+
+  function actor(target) {
+    if (!belongs(target)) return null;
+    if (!actors.has(target)) {
+      const revision = targetRevisions[target];
+      actors.set(target, {target, known: false, layers: new Set(), reason: '待首次完整清层后计数', anchor: null,
+        targetRevision: revision?.revision ?? null, afterIndex: revision?.afterIndex || 0});
+    }
+    return actors.get(target);
+  }
+  function invalidateActor(row, reason, index, requireFreshSource = false) {
+    row.known = false; row.layers.clear(); row.reason = reason; row.anchor = null;
+    row.afterIndex = Math.max(row.afterIndex, index || 0);
+    if (requireFreshSource) row.sourceAfter = Math.max(row.sourceAfter || 0, index || 0);
+    for (const [uid, value] of uids) if (value.target === row.target) uids.delete(uid);
+  }
+  function invalidate(reason, index = cursor || 0) {
+    floor = Math.max(floor, integer(index) ? index : 0); message = reason; uids.clear();
+    for (const row of actors.values()) { row.known = false; row.layers.clear(); row.reason = reason; row.anchor = null; }
+  }
+  function reset(reason) {
+    stream = null; cursor = null; previousSeq = null; contentRevision = -1; gapRevision = null; omissionCount = null;
+    floor = 0; paused = ''; processed.clear(); uids.clear(); parents.clear(); actors.clear(); message = reason;
+    targetRevisions = {}; targetOverflow = null;
+    pendingSeen = null; seenLastIndex = 0;
+    exhausted = false;
+    previousSourceIndex = null; integrityRevision = null; integrityFingerprint = null; basisDomain = null; indexedLocked = false;
+    for (const target of wanted) actor(target);
+  }
+  function render() {
+    cards.replaceChildren(); status.textContent = !proofReady ? message : paused || message;
+    const displayRows = actors.size ? [...actors.values()] : [{target: null, known: false, layers: new Set(), reason: message}];
+    for (const row of displayRows) {
+      const known = proofReady && gate && row.known && !paused;
+      const count = known ? Math.min(MAX, row.layers.size) : null;
+      const card = document.createElement('article'); card.className = 'card';
+      card.dataset.targetId = row.target || ''; card.dataset.count = count === null ? 'unknown' : String(count);
+      card.title = row.target ? '准确目标 ID：' + row.target : '等待准确目标身份';
+      const head = document.createElement('div'); head.className = 'head';
+      if (icon) { const img = document.createElement('img'); img.className = 'icon'; img.src = icon; img.alt = '狼之绯游戏效果图标'; head.append(img); }
+      const text = document.createElement('div'), name = document.createElement('div'), target = document.createElement('div');
+      name.className = 'name'; name.textContent = '狼之绯 · 狼血'; target.className = 'target';
+      target.textContent = row.target ? ((labelContext === gate && targetLabels.get(row.target)) || CONFIG.targetNames[row.target] || '目标未命名') : '等待目标观测';
+      text.append(name, target); head.append(text);
+      const number = document.createElement('div'), big = document.createElement('b'), max = document.createElement('span');
+      number.className = 'number'; big.textContent = count === null ? '—' : String(count); max.textContent = ' / 16'; number.append(big, max); head.append(number);
+      const cells = document.createElement('div'); cells.className = 'cells';
+      for (let i = 0; i < MAX; i++) { const cell = document.createElement('span'); cell.className = 'cell' + (count !== null && i < count ? ' on' : ''); cells.append(cell); }
+      const why = document.createElement('div'); why.className = 'why';
+      why.textContent = known ? '完整清层后连续观测 · 不提供倒计时' : paused || row.reason;
+      card.append(head, cells, why); cards.append(card);
+    }
+  }
+
+  function template(payload, kind, number, text) {
+    const nested = payload.template_id;
+    if (!enumIs(payload.template_type ?? nested?.type, kind === 'Buff' ? 1 : 2, kind)) return false;
+    if (payload.template_type !== undefined && nested?.type !== undefined &&
+        !enumIs(nested.type, kind === 'Buff' ? 1 : 2, kind)) return false;
+    if (payload.template_id_case === 'int_id') return payload.template_int_id === number && (!nested || nested.int_id === number);
+    if (payload.template_id_case === 'str_id') return payload.template_str_id === text && (!nested || nested.str_id === text);
+    return false;
+  }
+  function numericBuff(detail, number, text) {
+    if (detail.buff_id) return detail.buff_id === text && (!detail.buff_num_id || detail.buff_num_id === number);
+    return detail.buff_num_id === number;
+  }
+  function remember(uid, target, kind, open, parent = null, createdAt = null) {
+    const before = uids.get(uid);
+    if (before && (before.target !== target || before.kind !== kind || (parent && before.parent && parent !== before.parent))) { invalidate('实例身份或目标发生冲突'); return false; }
+    if (!before && uids.size >= MAX_UIDS) { exhausted = true; invalidate('实例历史超出本示例上限，等待新上下文'); return false; }
+    if (!before) uids.set(uid, {target, kind, open, parent, createdAt});
+    else if (parent && !before.parent) { before.parent = parent; before.createdAt = createdAt; }
+    return true;
+  }
+  function remove(uid, target) {
+    const before = uids.get(uid);
+    if (!before) return;
+    if (before.target !== target) { invalidate('结束事件的实例目标冲突'); return; }
+    before.open = false;
+    if (before.kind === LAYER) actor(target)?.layers.delete(uid);
+  }
+  function uncertainFinishes(body, index) {
+    for (const detail of body?.finish_buffs || []) {
+      const known = uids.get(buffUid(detail.buff_inst_id));
+      if (known?.kind === LAYER) invalidateActor(actor(known.target), '层实例结束条件未获确认', index);
+    }
+  }
+  function apply(operation) {
+    const payload = operation.payload;
+    if (operation.type === 'BattleOpTriggerAction') {
+      if (!payload || !payload.action || payload.action.action_type === undefined) { invalidate('操作内容不完整', operation.index); return; }
+      const action = payload.action;
+      const create = actionIs(action.action_type, 2, 'BattleActionCreateBuff');
+      const finish = actionIs(action.action_type, 3, 'BattleActionFinishBuff');
+      if (create) {
+        if (payload.trigger_type === 2) return; // Create action end is not a finish.
+        if (payload.action_runtime_case !== 'create_buff_action' || !Array.isArray(action.create_buff_action?.details)) {
+          invalidate('创建操作缺少准确内容', operation.index); return;
+        }
+        for (const detail of action.create_buff_action.details) {
+          const isLayer = numericBuff(detail, 2394, LAYER), isFinal = numericBuff(detail, 2393, FINAL);
+          if (!isLayer && !isFinal) continue;
+          const target = id(detail.target_id), uid = buffUid(detail.buff_inst_id), row = actor(target);
+          if (!target || !uid) { invalidate('狼血实例或目标身份未知', operation.index); return; }
+          if (!row) continue;
+          const correct = payload.trigger_type === 0 && enumIs(payload.owner_type, 2, 'Skill') &&
+            template(payload, 'Skill', 2665, SKILL) && action.action_id === (isLayer ? 1 : 4) && detail.buff_input_index === 0 &&
+            id(payload.operation_owner_id) === target && id(payload.owner_id) === target && id(detail.source_id) === target &&
+            (payload.trigger_owner_id === undefined || id(payload.trigger_owner_id) === target) &&
+            id(payload.inst_id) && id(payload.inst_id) === id(payload.trigger_inst_id);
+          const assignments = Array.isArray(detail.assigned_items) ? detail.assigned_items : [];
+          const max = assignments.filter(item => item.target_key === 'max_stack');
+          if (!correct || (isLayer && (max.length !== 1 || max[0].use_direct_value !== true || max[0].numeric_value !== 16))) {
+            row.known = false; row.layers.clear(); row.reason = '创建路径或最大层数未获确认'; continue;
+          }
+          const parent = id(payload.inst_id), knownParent = parents.get(parent);
+          if (knownParent && (knownParent.target !== target || !knownParent.active)) {
+            invalidateActor(row, '父技能已失效或目标冲突；待新父技能周期', operation.index, true); continue;
+          }
+          if (!knownParent) parents.set(parent, {target, active: true});
+          const before = uids.get(uid);
+          if (before && !before.open) { row.known = false; row.layers.clear(); row.reason = '已结束实例出现重复创建'; continue; }
+          if (!remember(uid, target, isLayer ? LAYER : FINAL, true, parent, operation.index)) return;
+          if (isLayer && row.known) row.layers.add(uid);
+        }
+      } else if (finish) {
+        if (payload.trigger_type !== 0) { uncertainFinishes(action.finish_buff_action, operation.index); return; }
+        const body = action.finish_buff_action;
+        if (payload.action_runtime_case !== 'finish_buff_action' || !Array.isArray(body?.finish_buffs)) {
+          invalidate('结束操作缺少准确内容', operation.index); return;
+        }
+        const owner = id(payload.owner_id), operationOwner = id(payload.operation_owner_id);
+        const finalUid = buffUid(payload.trigger_inst_id), inst = buffUid(payload.inst_id);
+        const mappedClear = enumIs(payload.owner_type, 1, 'Buff') && template(payload, 'Buff', 2393, FINAL) &&
+          action.action_id === 1 && body.finish_layer_cnt === 0 && owner && operationOwner === owner && finalUid && inst === finalUid &&
+          id(payload.trigger_owner_id) === owner;
+        const targets = body.finish_buffs.map(item => id(item.target_id));
+        const validEntries = body.finish_buffs.every((item, i) => targets[i] && buffUid(item.buff_inst_id));
+        if (!validEntries) { invalidate('结束列表身份不完整', operation.index); return; }
+        if (mappedClear) {
+          const priorFinal = uids.get(finalUid);
+          const conflicts = body.finish_buffs.some(detail => {
+            const known = uids.get(buffUid(detail.buff_inst_id)); return known && (known.target !== owner || known.kind !== LAYER);
+          });
+          const listedUids = body.finish_buffs.map(detail => buffUid(detail.buff_inst_id));
+          if ((priorFinal && (priorFinal.target !== owner || priorFinal.kind !== FINAL)) || targets.some(target => target !== owner) || conflicts ||
+              new Set(listedUids).size !== listedUids.length || listedUids.includes(finalUid)) {
+            invalidate('完整清层目标与最终效果冲突', operation.index); return;
+          }
+          const row = actor(owner);
+          if (row && !body.finish_buffs.length) {
+            row.known = false; row.layers.clear(); row.reason = '完整清层缺少明确目标明细；待后续完整清层';
+          } else if (row && row.sourceAfter && (!priorFinal?.parent || !(priorFinal.createdAt > row.sourceAfter) ||
+              !parents.get(priorFinal.parent)?.active || parents.get(priorFinal.parent).target !== owner)) {
+            row.known = false; row.layers.clear(); row.reason = '父技能或目标已变化；待新父技能完整清层';
+          } else if (row && operation.index > Math.max(floor, row.afterIndex)) {
+            if (!remember(finalUid, owner, FINAL, true)) return;
+            for (const uid of listedUids) if (!remember(uid, owner, LAYER, false)) return;
+            for (const known of uids.values()) if (known.target === owner && known.kind === LAYER) known.open = false;
+            row.layers.clear(); row.known = true; row.anchor = operation.index; row.reason = '';
+            message = '已按完整清层动作校准';
+          }
+        }
+        for (const detail of body.finish_buffs) remove(buffUid(detail.buff_inst_id), id(detail.target_id));
+      } else {
+        uncertainFinishes(action.finish_buff_action, operation.index);
+        for (const detail of action.create_buff_action?.details || []) {
+          if (numericBuff(detail, 2394, LAYER)) {
+            const row = actor(id(detail.target_id));
+            if (row) invalidateActor(row, '层实例创建类型未获确认', operation.index);
+          }
+        }
+      }
+    } else if (operation.type === 'BattleOpSkillDetach') {
+      const parent = id(payload?.skill_inst_id);
+      if (!parent) { invalidate('技能卸载缺少准确实例身份', operation.index); return; }
+      const known = parents.get(parent);
+      if (known) {
+        known.active = false;
+        const row = actors.get(known.target);
+        if (row) invalidateActor(row, '狼血父技能已卸载；待新父技能周期', operation.index, true);
+      }
+    } else if (operation.type === 'BattleOpSkillAttach') {
+      const parent = id(payload?.skill_inst_id), target = id(payload?.src_inst_id);
+      if (!parent) { invalidate('技能挂载缺少准确实例身份', operation.index); return; }
+      const wolf = enumIs(payload.template_type, 2, 'Skill') && (payload.template_int_id === 2665 || payload.template_str_id === SKILL);
+      if (wolf && target && belongs(target)) {
+        const before = parents.get(parent);
+        if (before && before.target !== target) { invalidate('父技能挂载目标冲突', operation.index); return; }
+        if (!before) parents.set(parent, {target, active: true});
+      }
+    } else if (operation.type === 'BattleOpFinishBuff') {
+      if (!payload || !id(payload.buff_inst_id)) { invalidate('单实例结束身份不完整', operation.index); return; }
+      const uid = buffUid(payload.buff_inst_id);
+      if (!uid || !uids.has(uid)) return;
+      const target = id(payload.operation_owner_id);
+      if (!target || payload.reduce_layer !== 1 || payload.force !== true) { invalidate('单实例结束条件不完整', operation.index); return; }
+      remove(uid, target);
+    } else if (operation.type === 'BattleOpAddBuff') {
+      const nested = payload?.buff_template_id;
+      if (nested && !enumIs(nested.type, 1, 'Buff')) {
+        const known = uids.get(buffUid(payload.buff_inst_id));
+        if (known?.kind === LAYER) invalidateActor(actor(known.target), '实例模板命名空间冲突', operation.index);
+        return;
+      }
+      const value = nested?.str_id || nested?.int_id || payload?.str_id || payload?.int_id;
+      const kind = value === LAYER || value === 2394 ? LAYER : value === FINAL || value === 2393 ? FINAL : null;
+      if (!kind) return;
+      const target = id(payload.target_inst_id), uid = buffUid(payload.buff_inst_id), row = actor(target);
+      if (!target || !uid) { invalidate('初始化实例身份未知', operation.index); return; }
+      if (!row) return;
+      const before = uids.get(uid);
+      if (before && before.target === target && before.kind === kind) return;
+      remember(uid, target, kind, true);
+      if (kind === LAYER) { row.known = false; row.layers.clear(); row.reason = '初始化实例不是已确认的逐层创建'; }
+    }
+  }
+
+  function onOperations(envelope) {
+    if (!live) return;
+    latest = envelope;
+    if (!proofReady || !gate) { render(); return; }
+    const data = envelope.data;
+    if (envelope.state !== 'ready' || !data) { invalidate('操作流不可用：' + (envelope.reason || '等待新数据')); paused = ''; render(); return; }
+    if (contextKey(data.context) !== gate) { invalidate('操作与采集上下文不一致'); render(); return; }
+    if (!integer(data.streamRevision) || data.streamRevision < 1 || !['raw-operation-header', 'normalized-only'].includes(data.sourceMode) ||
+        !nativeMatches(data.nativeBinding) ||
+        data.lifecycleEvidence?.clientOperationSequenceExact?.state !== 'ready') {
+      invalidate('当前操作序号证明不可用', data.lastObservedIndex); render(); return;
+    }
+    const indexed = data.continuity?.basis === INDEXED_BASIS;
+    const domain = JSON.stringify([gate, data.streamRevision, data.sourceMode]);
+    if (basisDomain !== domain) { basisDomain = domain; indexedLocked = false; }
+    if (indexedLocked && !indexed) { invalidate('接收顺序资料已中断，不能退回旧规则', data.lastObservedIndex); render(); return; }
+    const locked = indexedLocked || indexed;
+    const key = JSON.stringify([domain, indexed ? INDEXED_BASIS : 'legacy-dense-game-sequence']);
+    if (stream !== key) { reset('待此观察流的首次完整清层'); stream = key; basisDomain = domain; }
+    indexedLocked = locked;
+    if (indexed) {
+      const health = data.captureIntegrity;
+      if (!health || !validHealth(health.baseline) || !validHealth(health.current) || !integer(health.revision) || health.revision < 0 ||
+          (health.revision > 0 && !integer(health.afterIndex)) ||
+          (health.afterIndex !== null && (!integer(health.afterIndex) || health.afterIndex < 0 || health.afterIndex > data.lastObservedIndex))) {
+        invalidate('缺少完整采集健康资料，计数待确认', data.lastObservedIndex); render(); return;
+      }
+      if (health.state !== 'stable' || health.current.pendingMultipacks !== 0 || health.current.pendingTransportSegments !== 0 || health.current.currentFrameErrors !== 0) {
+        const why = health.current.currentFrameErrors !== 0 ? '当前数据帧存在质量异常，等待重新确认' :
+          health.state === 'pending' ? '采集仍有未完成的数据，等待重新确认' :
+          health.state === 'changed' ? '采集健康计数已变化，等待重新确认' : '采集健康状态未获确认';
+        invalidate(why, Math.max(cursor || 0, health.afterIndex ?? data.lastObservedIndex)); render(); return;
+      }
+      const signature = healthFingerprint(health.current);
+      if (integrityRevision !== null && health.revision < integrityRevision) {
+        invalidate('采集健康版本回退，计数待确认', data.lastObservedIndex); render(); return;
+      }
+      if (integrityRevision === health.revision && integrityFingerprint !== null && integrityFingerprint !== signature) {
+        invalidate('采集健康资料与版本不一致，计数待确认', data.lastObservedIndex); render(); return;
+      }
+      if (integrityRevision !== null && health.revision !== integrityRevision) {
+        invalidate('采集状态已变化，等待后续完整清层', Math.max(cursor || 0, health.afterIndex ?? data.lastObservedIndex));
+      }
+      integrityRevision = health.revision; integrityFingerprint = signature;
+      floor = Math.max(floor, health.afterIndex || 0);
+    } else if (data.continuity?.state === 'unavailable') {
+      invalidate('缺少接收连续性证明，计数待确认', data.lastObservedIndex); render(); return;
+    }
+    if (exhausted) { invalidate('实例历史容量已超限，等待新上下文', data.lastObservedIndex); render(); return; }
+    if (!integer(data.lastObservedIndex) || data.lastObservedIndex < seenLastIndex) {
+      invalidate('观察流索引回退', seenLastIndex); render(); return;
+    }
+    seenLastIndex = data.lastObservedIndex;
+    if (!data.targetContextRevisions || typeof data.targetContextRevisions !== 'object' || Array.isArray(data.targetContextRevisions) ||
+        data.targetContextRevisionScope !== 'current-operation-stream' || !integer(data.targetContextRevisionOverflow) ||
+        typeof data.targetContextRevisionMapComplete !== 'boolean' ||
+        (!data.targetContextRevisionMapComplete && !data.targetContextRevisionOverflow)) {
+      invalidate('目标上下文证明缺失', data.lastObservedIndex); render(); return;
+    }
+    const nextTargets = data.targetContextRevisions;
+    if (Object.values(nextTargets).some(value => !value || !integer(value.revision) || value.revision < 1 || !integer(value.afterIndex) ||
+        value.afterIndex < 0 || value.afterIndex > data.lastObservedIndex || value.streamRevision !== data.streamRevision)) {
+      invalidate('目标上下文版本冲突', data.lastObservedIndex); render(); return;
+    }
+    if (targetOverflow !== null && data.targetContextRevisionOverflow < targetOverflow) {
+      invalidate('目标历史版本回退', data.lastObservedIndex); render(); return;
+    }
+    if (data.targetContextRevisionOverflow && (targetOverflow === null || targetOverflow !== data.targetContextRevisionOverflow)) {
+      const at = data.targetContextRevisionOverflowAfterIndex;
+      if (!integer(at) || at < 0 || at > data.lastObservedIndex || data.targetContextRevisionOverflowStreamRevision !== data.streamRevision) {
+        invalidate('目标历史已省略且边界未知', data.lastObservedIndex); render(); return;
+      }
+      invalidate('目标历史已省略，待重新完整清层', Math.max(cursor || 0, at));
+    }
+    targetOverflow = data.targetContextRevisionOverflow;
+    for (const row of actors.values()) {
+      const before = row.targetRevision, next = nextTargets[row.target];
+      if (next && (before !== next.revision || next.afterIndex > row.afterIndex)) {
+        invalidateActor(row, '目标上下文已失效，待重新完整清层', before !== null && next.revision < before ? data.lastObservedIndex : next.afterIndex, true);
+        row.targetRevision = next.revision;
+      } else if (!next && before !== null) {
+        invalidateActor(row, '目标历史记录缺失，待重新完整清层', data.lastObservedIndex, true); row.targetRevision = null;
+      }
+    }
+    targetRevisions = nextTargets;
+    const operations = data.operations;
+    if (!Array.isArray(operations) || !integer(data.contentRevision) || !integer(data.lastObservedIndex) || !integer(data.gapRevision)) {
+      invalidate('操作流元数据不完整'); render(); return;
+    }
+    if (data.contentRevision < contentRevision) { invalidate('观察内容版本回退', data.lastObservedIndex); render(); return; }
+    contentRevision = data.contentRevision;
+    if (gapRevision !== null && data.gapRevision !== gapRevision) invalidate('操作接收依据已变化，等待重新确认', data.continuity?.lastGapIndex || data.lastObservedIndex);
+    gapRevision = data.gapRevision;
+    if (data.gapRevision) {
+      if (!integer(data.continuity?.lastGapIndex)) { invalidate('序列缺口位置未知', data.lastObservedIndex); render(); return; }
+      floor = Math.max(floor, data.continuity.lastGapIndex);
+    }
+    if (data.payloadOmittedCount && (omissionCount === null || omissionCount !== data.payloadOmittedCount)) {
+      invalidate('操作内容被省略，需重新完整清层', Math.max(cursor || 0, data.lastPayloadOmissionIndex || data.lastObservedIndex));
+    }
+    omissionCount = data.payloadOmittedCount;
+    if (!operations.length) { paused = '没有足够的操作内容，计数未知'; render(); return; }
+    const first = operations[0].index;
+    if (!integer(first) || data.firstIndex !== first || data.lastIndex !== operations[operations.length - 1].index ||
+        data.lastIndex > data.lastObservedIndex || data.bufferFirstIndex > first || data.bufferLastIndex < data.lastIndex ||
+        operations.some((op, i) => !integer(op.index) || (i && op.index !== operations[i - 1].index + 1))) {
+      invalidate('观察窗口索引不连续', data.lastObservedIndex); render(); return;
+    }
+    if (cursor === null) cursor = first - 1;
+    if (first > cursor + 1) { invalidate('页面没有收到完整操作窗口，待重新清层', first - 1); cursor = first - 1; previousSeq = null; previousSourceIndex = null; pendingSeen = null; processed.clear(); }
+    paused = '';
+    for (const operation of operations) {
+      const fingerprint = JSON.stringify([operation.seqId, operation.sourceIndex, operation.operationSha256, operation.captureSequenceRelation,
+        operation.captureIntegrity, operation.captureIntegrityState, operation.captureIntegrityRevision,
+        operation.type, operation.payloadState, operation.payloadRevision, operation.payload]);
+      if (operation.index <= cursor) {
+        if (processed.has(operation.index) && processed.get(operation.index) !== fingerprint) invalidate('已处理的操作内容发生冲突或回退');
+        processed.set(operation.index, fingerprint); continue;
+      }
+      if (operation.index !== cursor + 1 || !integer(operation.seqId) || operation.seqId < -(2 ** 31) || operation.seqId >= 2 ** 31 ||
+          !integer(operation.payloadRevision) || operation.payloadRevision < 0) {
+        invalidate('操作身份或顺序不完整', operation.index); cursor = operation.index; previousSeq = null; continue;
+      }
+      if (pendingSeen?.index === operation.index && (operation.payloadRevision < pendingSeen.revision ||
+          (operation.payloadRevision === pendingSeen.revision && fingerprint !== pendingSeen.fingerprint))) {
+        invalidate('待补全操作的内容版本冲突', operation.index); cursor = operation.index; previousSeq = operation.seqId; pendingSeen = null; continue;
+      }
+      if (operation.payloadState === 'pending') {
+        pendingSeen = {index: operation.index, revision: operation.payloadRevision, fingerprint};
+        paused = '等待当前操作内容补全；计数暂未知'; break;
+      }
+      pendingSeen = null;
+      let sequenceFailure = '';
+      if (indexed) {
+        const sourceValid = integer(operation.sourceIndex) && operation.sourceIndex > 0 &&
+          typeof operation.operationSha256 === 'string' && /^[a-f0-9]{64}$/.test(operation.operationSha256);
+        if (!sourceValid) sequenceFailure = '接收操作缺少准确序号或校验资料';
+        else if (previousSourceIndex !== null && operation.sourceIndex !== previousSourceIndex + 1) {
+          sequenceFailure = operation.sourceIndex === previousSourceIndex ? '接收操作序号重复，等待重新确认' :
+            operation.sourceIndex < previousSourceIndex ? '接收操作序号回退，等待重新确认' : '接收操作窗口不连续，等待重新确认';
+        }
+        if (!['first_observation', 'next'].includes(operation.captureSequenceRelation) ||
+            (previousSourceIndex !== null && operation.captureSequenceRelation !== 'next')) {
+          sequenceFailure ||= operation.captureSequenceRelation === 'integrity_changed' ? '该操作的采集健康计数已变化' :
+            operation.captureSequenceRelation === 'pending' ? (operation.captureIntegrity?.currentFrameErrors ? '该操作所在数据帧存在质量异常' :
+              '该操作仍有未完成数据，计数待确认') : '该操作的接收顺序资料不完整';
+        }
+        if (!validHealth(operation.captureIntegrity) || operation.captureIntegrityState !== 'stable' ||
+            operation.captureIntegrity.pendingMultipacks !== 0 || operation.captureIntegrity.pendingTransportSegments !== 0 ||
+            operation.captureIntegrity.currentFrameErrors !== 0 ||
+            !integer(operation.captureIntegrityRevision) ||
+            (operation.index > floor && (operation.captureIntegrityRevision !== integrityRevision ||
+              healthFingerprint(operation.captureIntegrity) !== integrityFingerprint))) {
+          sequenceFailure ||= '该操作的采集健康依据未获确认';
+        }
+        previousSourceIndex = sourceValid ? operation.sourceIndex : null;
+        if (previousSeq !== null && operation.seqId <= previousSeq) sequenceFailure ||= operation.seqId === previousSeq ?
+          '游戏操作编号重复，等待重新确认' : '游戏操作编号回退，等待重新确认';
+        if (!['first_observation', 'next', 'forward_skip'].includes(operation.sequenceRelation) ||
+            (previousSeq !== null && operation.seqId > previousSeq &&
+              (operation.seqId === previousSeq + 1 ? operation.sequenceRelation !== 'next' : operation.sequenceRelation !== 'forward_skip'))) {
+          sequenceFailure ||= '游戏编号信息与接收依据不一致，等待重新确认';
+        }
+      } else {
+        if (previousSeq !== null && operation.seqId !== previousSeq + 1) sequenceFailure = operation.seqId === previousSeq ?
+          '游戏操作编号重复，等待重新确认' : operation.seqId < previousSeq ? '游戏操作编号回退，等待重新确认' :
+          '旧记录缺少接收序号，暂不能确认跳号期间的操作';
+        if (!['first_observation', 'next'].includes(operation.sequenceRelation)) sequenceFailure ||= '旧记录的连续性依据不足，等待重新确认';
+      }
+      if (sequenceFailure) invalidate(sequenceFailure, operation.index);
+      cursor = operation.index; previousSeq = operation.seqId; processed.set(cursor, fingerprint);
+      if (operation.payloadState === 'header-only' && ['BattleOpTriggerAction', 'BattleOpAddBuff', 'BattleOpFinishBuff',
+          'BattleOpSetBuffEnableState', 'BattleOpTriggerKeyword', 'BattleOpSkillAttach', 'BattleOpSkillDetach'].includes(operation.type)) {
+        invalidate('效果操作只有头部，缺少必要内容', operation.index); continue;
+      }
+      if (operation.payloadState === 'omitted' ||
+          (operation.payloadState !== 'header-only' && (operation.payloadState !== 'whitelisted-fields' || !operation.payload))) {
+        invalidate('缺少操作内容，待重新完整清层', operation.index); continue;
+      }
+      if (operation.index > floor && operation.payloadState === 'whitelisted-fields') apply(operation);
+    }
+    for (const index of processed.keys()) if (index < first) processed.delete(index);
+    render();
+  }
+  function onContext(envelope) {
+    const key = envelope.state === 'ready' ? contextKey(envelope.data?.context) : null;
+    const evidence = envelope.lifecycleEvidence || {};
+    const ready = key && nativeMatches(envelope.data.nativeBinding) &&
+      ['clientOperationSequenceExact', 'clientFinishExact', 'clientActionFinishExact'].every(name => evidence[name]?.state === 'ready');
+    if (!ready) { gate = null; latest = null; invalidate('当前版本或采集关系未获确认'); paused = ''; render(); return; }
+    if (contextSeen !== key) {
+      if (contextSeen !== null) latest = null;
+      contextSeen = key; reset('待此上下文首次完整清层后计数');
+    }
+    gate = key;
+    if (latest) onOperations(latest); else render();
+  }
+  function onTargets(envelope) {
+    targetLabels = new Map(); labelContext = null;
+    if (envelope.state === 'ready' && contextKey(envelope.data?.context)) {
+      labelContext = contextKey(envelope.data.context);
+      for (const row of envelope.data.targets || []) if (id(row.id) && typeof row.label === 'string' && row.label) targetLabels.set(id(row.id), row.label);
+    }
+    render();
+  }
+  function verifyDefinition(row, identity, actionIndex) {
+    if (!row || row.canonicalId !== identity || row.details?.buffSourceSha256 !== PIN[identity]) return false;
+    const resources = row.details.sourceResourcesSha256 || {};
+    if (resources['BuffData/' + identity] !== PIN[identity] || resources['SkillData/' + SKILL] !== PIN[SKILL]) return false;
+    if (!Object.entries(GRAPH_PIN).every(([key, hash]) => row.details.definitionGraphBinding?.[key] === hash)) return false;
+    return row.details.sourcePaths?.some(path => path.skillId === SKILL && path.steps?.length === 1 &&
+      path.steps[0].fromKind === 'SkillData' && path.steps[0].fromId === SKILL && path.steps[0].toId === identity &&
+      path.steps[0].toKind === 'BuffData' && path.steps[0].field === 'buffId' && path.steps[0].asChildBuff === true &&
+      path.steps[0].serverActionIndex === actionIndex && path.steps[0].assignBlackboard === true &&
+      path.steps[0].path === '$.actionGroupData.passiveEventActions[0].actions[0].actionData[' + actionIndex + '].buffs[0].buffId');
+  }
+  function loadDefinition(identity, actionIndex) {
+    return new Promise((resolve, reject) => {
+      let stop = null, done = false;
+      const callback = envelope => {
+        if (done || !live) return;
+        if (envelope.state !== 'ready') {
+          if (envelope.reason === 'definitions_loading') return;
+          done = true; reject(new Error(envelope.reason || '官方定义不可用')); return;
+        }
+        const row = envelope.data?.definitions?.find(item => item.canonicalId === identity);
+        done = true;
+        if (!verifyDefinition(row, identity, actionIndex)) { reject(new Error('Wolf 同版静态资料校验不通过')); return; }
+        const candidate = envelope.data.icons?.[row.iconKey]; if (inline(candidate)) icon = candidate;
+        resolve(); queueMicrotask(() => { if (stop) stop(); });
+      };
+      stop = api.subscribe({topic: 'effects.definitions.v1', filter: {effectIds: [identity], limit: 1}}, callback); stops.push(stop);
+    });
+  }
+  async function start() {
+    if (!api) { message = '请通过客户端只读 HTML 宿主打开'; render(); return; }
+    if (!Array.isArray(CONFIG.targetIds) || CONFIG.targetIds.length > 64 || CONFIG.targetIds.some(value => !id(value)) ||
+        !CONFIG.targetNames || typeof CONFIG.targetNames !== 'object' || Array.isArray(CONFIG.targetNames) ||
+        Object.entries(CONFIG.targetNames).some(([key, value]) => !id(key) || typeof value !== 'string' || value.length > 80)) {
+      message = 'CONFIG.targetIds 必须是准确 ID 字符串数组'; render(); return;
+    }
+    CONFIG.targetIds.forEach(value => wanted.add(id(value))); reset(message); render();
+    try {
+      const topics = await api.getTopics();
+      for (const topic of ['effects.operations.v1', 'capture.context.v1', 'effects.definitions.v1', 'targets.current.v1']) if (!topics.some(item => item.topic === topic)) throw new Error('宿主缺少 ' + topic);
+      await Promise.all([loadDefinition(LAYER, 1), loadDefinition(FINAL, 4)]);
+      if (!live) return;
+      proofReady = true; message = '资料已确认，待首次完整清层后计数';
+      stops.push(api.subscribe({topic: 'capture.context.v1'}, onContext));
+      stops.push(api.subscribe({topic: 'targets.current.v1'}, onTargets));
+      stops.push(api.subscribe({topic: 'effects.operations.v1', filter: {limit: 256}}, onOperations)); render();
+    } catch (error) { proofReady = false; message = '计数未知：' + String(error.message || error); render(); }
+  }
+  window.addEventListener('pagehide', () => { live = false; stops.forEach(stop => stop()); });
+  start();
+})();
+</script>
+</html>

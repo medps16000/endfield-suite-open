@@ -54,3 +54,14 @@ endfield-logs/apps/web/public/images/*
 !endfield-logs/apps/web/public/images/README.md
 endfield-logs/apps/web/public/endaxis/*
 !endfield-logs/apps/web/public/endaxis/README.md
+
+# Local test/build metadata and captured evidence are never source exports.
+**/.mypy_cache/
+**/.ruff_cache/
+**/*.egg-info/
+**/docs/evidence/
+**/tests/fixtures/*.log
+**/tests/fixtures/*.jsonl
+**/*-components.json
+**/component-*.zip
+**/build_meta/

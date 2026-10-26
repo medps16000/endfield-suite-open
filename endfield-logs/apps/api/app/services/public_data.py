@@ -4,6 +4,7 @@ import json
 import logging
 import re
 import threading
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -11,12 +12,14 @@ from pathlib import Path
 from re import sub
 from time import monotonic
 from typing import Any, Literal
+from unicodedata import normalize
 from urllib.parse import urlsplit
 from uuid import uuid4
 
 from sqlalchemy import or_, select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import load_only
+from parser_core.timer_evidence import validate_timer_evidence
 
 from app.core.errors import AppError
 from app.db.models import UploadedBattleRecord
@@ -39,9 +42,13 @@ from app.schemas.public import (
     BossRankingResponse,
     BossRankingRosterEntry,
     BossRankingRow,
+    CharacterBossStatisticsResponse,
+    CharacterBossStatisticsRow,
     ContractTagResponse,
     HotBossCard,
     HotBossRun,
+    PublicAccountSearchEntryResponse,
+    PublicAccountSearchResponse,
     PublicUserRankingsResponse,
     RoleSkillStatResponse,
     ShareSummaryResponse,
@@ -54,12 +61,14 @@ from app.schemas.public import (
 from app.schemas.uploader import UploadBattleRequest
 from app.services.integrity import build_battle_integrity
 from parser_core.battle_log_parser import (
+    _CURRENT_TYPED_RESOURCE_BINDING,
     _canonical_num_table_buff_number,
     _canonical_num_table_skill_id,
     _extract_character_key,
     _humanize_buff_damage_name,
     _infer_skill_damage_element,
     _infer_skill_damage_school,
+    _infer_verified_weapon_refine_from_levels,
     _resolve_skill_name,
     _runtime_skill_number,
 )
@@ -78,11 +87,18 @@ HOT_BOSSES_CACHE_TTL_SECONDS = 30.0
 # TTL backstop for the uploaded-battle list cache: writers are expected to call
 # _invalidate_public_caches(), the TTL only covers writers outside this service.
 BATTLE_LIST_CACHE_TTL_SECONDS = 30.0
+CHARACTER_STATISTICS_CACHE_TTL_SECONDS = 300.0
+CHARACTER_BOSS_STATISTICS_CACHE_TTL_SECONDS = 60.0
+PUBLIC_ACCOUNT_DIRECTORY_CACHE_TTL_SECONDS = 60.0
 PHYSICAL_CRUSH_TRIGGER_DAMAGE_BUFF = "buff_common_cryst_triggered_physical_break"
 
 # 榜单准入的最低解析器版本：v25 起 rDPS 过白名单，数值才可信（docs/rdps_correctness_plan.md）。
 # 更早版本的记录保留可查，但不参与排名。
 RANKING_MIN_PARSER_VERSION = 25
+# These versions were accepted against effect text, packet identities and the
+# whitelist algorithm suite. They do not assert complete native reconstruction.
+RDPS_ALGORITHM_MIN_PARSER_VERSION = 51
+RDPS_ALGORITHM_MIN_RULES_VERSION = 44
 _PARSER_VERSION_RE = re.compile(r"v(\d+)\s*$", re.IGNORECASE)
 
 # Boss 实际击杀校验（第三道榜单准入）。clear_flag（boss HP 归零）与 official_timer_end_seen
@@ -110,6 +126,19 @@ ADMIN_STATISTICS_CHARACTER_KEY = "chr_9000_endmin"
 def _parser_version_number(parser_version: str | None) -> int:
     match = _PARSER_VERSION_RE.search(str(parser_version or ""))
     return int(match.group(1)) if match else 0
+
+
+def _rdps_ranking_eligible(
+    parser_version: str | None, rules_version: str | None, strict_ok: bool | None,
+) -> bool:
+    """rDPS algorithm eligibility; normal battle ranking gates still apply."""
+    parser_number = _parser_version_number(parser_version)
+    if parser_number < RANKING_MIN_PARSER_VERSION:
+        return False
+    return strict_ok is True or (
+        parser_number >= RDPS_ALGORITHM_MIN_PARSER_VERSION
+        and _parser_version_number(rules_version) >= RDPS_ALGORITHM_MIN_RULES_VERSION
+    )
 
 
 def _linear_percentile(sorted_values: list[float], q: float) -> float:
@@ -150,7 +179,19 @@ def _normalize_skill_display_name(skill_name: str, skill_key: str | None = None)
     if skill_key == PHYSICAL_CRUSH_TRIGGER_DAMAGE_BUFF:
         return "猛击"
     candidate = skill_name or skill_key or ""
+    # Repair missing labels at read time, without replacing an existing specific
+    # display name or inferring a skill family from an internal ID's spelling.
+    generic_labels = {"普攻", "普通攻击", "战技", "连携", "连携技", "终结技", "技能"}
+    if candidate.strip() not in generic_labels and not candidate.startswith(
+        ("buff_", "chr_", "eny_", "skill_", "common_", "abilityentity_")
+    ):
+        return candidate
     if candidate.startswith("buff_"):
+        # Some damage events are BuffData roots with an explicitly reviewed
+        # creation path to a named skill. Resolve that exact display identity.
+        resolved = _resolve_skill_name(candidate)
+        if resolved and resolved != candidate:
+            return resolved
         return _humanize_buff_damage_name(candidate) or candidate
     if candidate.startswith(("chr_", "eny_", "skill_")):
         resolved = _resolve_skill_name(candidate)
@@ -167,9 +208,10 @@ def _normalize_skill_display_name(skill_name: str, skill_key: str | None = None)
             resolved_canonical = _resolve_skill_name(canonical_skill)
             if resolved_canonical and resolved_canonical != canonical_skill:
                 return resolved_canonical
-            return canonical_skill
     if skill_key:
-        return _resolve_skill_name(skill_key) or candidate
+        resolved_key = _resolve_skill_name(skill_key)
+        if resolved_key and resolved_key != skill_key:
+            return resolved_key
     return candidate
 
 
@@ -361,6 +403,7 @@ def _enrich_timeline_event_damage_identity(event: TimelineEventResponse) -> Time
                 "damageSchool": event.damageSchool or "physical",
             }
         )
+    event_name = _normalize_skill_display_name(event.eventName, event.eventKey)
     damage_element = (
         event.damageElement
         or _first_string_value(hit_context, ("damage_element", "damageElement", "element"))
@@ -372,9 +415,15 @@ def _enrich_timeline_event_damage_identity(event: TimelineEventResponse) -> Time
         or _infer_skill_damage_school(event.eventKey, inferred_character_key)
     )
 
-    if damage_element == event.damageElement and damage_school == event.damageSchool:
+    if (
+        event_name == event.eventName
+        and damage_element == event.damageElement
+        and damage_school == event.damageSchool
+    ):
         return event
-    return event.model_copy(update={"damageElement": damage_element, "damageSchool": damage_school})
+    return event.model_copy(
+        update={"eventName": event_name, "damageElement": damage_element, "damageSchool": damage_school}
+    )
 
 
 def _enrich_timeline_event_damage_identities(
@@ -547,20 +596,30 @@ def _normalize_character_element(value: str | None) -> str | None:
 
 
 def _load_character_catalog() -> tuple[dict[str, CharacterCatalogEntry], dict[str, CharacterCatalogEntry]]:
-    manifest = (
-        json.loads(CHARACTER_MANIFEST_PATH.read_text(encoding="utf-8"))
-        if CHARACTER_MANIFEST_PATH.is_file()
-        else []
-    )
+    # The public source tree does not redistribute generated game resources.
+    # An empty catalog keeps authentication and synthetic API workflows usable;
+    # when the resource is supplied its ordinary parsing/validation still runs.
+    manifest = json.loads(CHARACTER_MANIFEST_PATH.read_text(encoding="utf-8")) if CHARACTER_MANIFEST_PATH.is_file() else []
+    avatar_manifest_path = WEB_PUBLIC_ROOT / "images/character/game-avatars/manifest.json"
+    avatars: dict = {}
+    try:
+        avatar_manifest = json.loads(avatar_manifest_path.read_text("utf-8"))
+        if isinstance(avatar_manifest, dict) and isinstance(avatar_manifest.get("avatars"), dict):
+            avatars = avatar_manifest["avatars"]
+    except (OSError, ValueError):
+        pass
     by_id: dict[str, CharacterCatalogEntry] = {}
     by_name: dict[str, CharacterCatalogEntry] = {}
     for item in manifest:
+        char_id = str(item.get("charId"))
+        avatar_key = ADMIN_STATISTICS_CHARACTER_KEY if char_id in ADMIN_CHARACTER_KEYS else char_id
+        official_avatar = avatars.get(avatar_key) or {}
         entry = CharacterCatalogEntry(
-            char_id=str(item.get("charId")),
+            char_id=char_id,
             name=str(item.get("name")),
             profession=_normalize_profession_name(item.get("profession")),
             element=_normalize_character_element(item.get("charType")),
-            avatar_url=_normalize_public_asset_url(item.get("icon")),
+            avatar_url=_normalize_public_asset_url(official_avatar.get("url")) or _normalize_public_asset_url(item.get("icon")),
             rarity=int(item["rarity"]) if item.get("rarity") is not None else None,
         )
         by_id[entry.char_id] = entry
@@ -576,6 +635,8 @@ def _load_character_catalog() -> tuple[dict[str, CharacterCatalogEntry], dict[st
             if not char_id or not name:
                 continue
             old_entry = by_id.get(char_id)
+            avatar_key = ADMIN_STATISTICS_CHARACTER_KEY if char_id in ADMIN_CHARACTER_KEYS else char_id
+            official_avatar = avatars.get(avatar_key) or {}
             entry = CharacterCatalogEntry(
                 char_id=char_id,
                 name=name,
@@ -583,7 +644,7 @@ def _load_character_catalog() -> tuple[dict[str, CharacterCatalogEntry], dict[st
                 or (old_entry.profession if old_entry else None),
                 element=_normalize_character_element(item.get("charTypeName") or item.get("charTypeId"))
                 or (old_entry.element if old_entry else None),
-                avatar_url=_normalize_public_asset_url(item.get("icon"))
+                avatar_url=_normalize_public_asset_url(official_avatar.get("url")) or _normalize_public_asset_url(item.get("icon"))
                 or (old_entry.avatar_url if old_entry else None),
                 rarity=(
                     int(item["rarity"])
@@ -780,9 +841,15 @@ def _normalize_roster_weapon_refine(
         if entry.weapon is None:
             normalized.append(entry)
             continue
-        weapon = entry.weapon.model_copy(
-            update={"weaponRefine": _display_weapon_refine(entry.weapon.weaponRefine)}
-        )
+        raw_refine = entry.weapon.weaponRefine
+        if raw_refine in (None, 0):
+            verified = _infer_verified_weapon_refine_from_levels(
+                entry.weapon.weaponTemplate or '',
+                [skill.model_dump() for skill in entry.weapon.skills],
+            )
+            if verified is not None:
+                raw_refine = verified
+        weapon = entry.weapon.model_copy(update={"weaponRefine": _display_weapon_refine(raw_refine)})
         normalized.append(entry.model_copy(update={"weapon": weapon}))
     return normalized
 
@@ -942,6 +1009,11 @@ class DemoBattle:
     timer_end_seen: bool | None = None
     official_timer_start_seen: bool | None = None
     official_timer_end_seen: bool | None = None
+    official_timer_observed_elapsed_ms: int | None = None
+    packet_timer_elapsed_ms: int | None = None
+    timer_integrity_ok: bool | None = None
+    timer_integrity_reasons: list[str] = field(default_factory=list)
+    timer_evidence: dict[str, Any] | None = None
     timer_start_inferred: bool | None = None
     timer_window_valid: bool | None = None
     rdps_preflight_ok: bool | None = None
@@ -959,6 +1031,21 @@ class DemoBattle:
     # v33+：完整施法序列（排轴导出 API 专用，原样 dict 存取，不做响应建模）；
     # None = 老 payload 不支持导出
     casts: list[dict] | None = None
+
+
+@dataclass(frozen=True)
+class CharacterStatisticsBattleRow:
+    battle_id: str
+    boss_slug: str
+    battle_end_at: datetime
+    duration_ms: int
+    total_damage: int
+    parser_version: str
+    rdps_strict_ok: bool | None
+    rules_version: str | None = None
+    timer_integrity_ok: bool | None = None
+    roster_json: str | None = None
+    participants_json: str | None = None
 
 
 BOSS_SEEDS: tuple[BossSeed, ...] = (
@@ -1046,6 +1133,17 @@ BOSS_SEEDS: tuple[BossSeed, ...] = (
         dungeon_name="危境碎片",
         roster=("chr_0032_lizhiyan", "chr_0030_zhuangfy", "chr_0026_lastrite", "chr_0019_karin"),
         uploader_names=("噪雷碎片", "蚀影回响", "碎片边界"),
+        base_duration_ms=296000,
+        base_dps=193500,
+        base_rdps=207400,
+    ),
+    BossSeed(
+        key="eny_0127_bigents",
+        slug="dung02_group_minibossrush03",
+        name="幽林之怒",
+        dungeon_name="危境碎片",
+        roster=("chr_0034_typhoea", "chr_0032_lizhiyan", "chr_0033_camille", "chr_0026_lastrite"),
+        uploader_names=("幽林碎片", "林怒回响", "碎片边界"),
         base_duration_ms=296000,
         base_dps=193500,
         base_rdps=207400,
@@ -1424,6 +1522,72 @@ BOSS_SEEDS: tuple[BossSeed, ...] = (
         base_dps=190000,
         base_rdps=203000,
     ),
+    BossSeed(
+        key="indie_battletower009_ex",
+        slug="indie_battletower009_ex",
+        name="掩埋阵线·残酷",
+        dungeon_name="战争回响",
+        roster=("chr_0034_typhoea", "chr_0032_lizhiyan", "chr_0033_camille", "chr_0026_lastrite"),
+        uploader_names=("掩埋阵线", "追忆记录", "回响档案"),
+        base_duration_ms=300000,
+        base_dps=190000,
+        base_rdps=203000,
+    ),
+    BossSeed(
+        key="indie_battletower010_ex",
+        slug="indie_battletower010_ex",
+        name="方阵庇护·残酷",
+        dungeon_name="战争回响",
+        roster=("chr_0034_typhoea", "chr_0032_lizhiyan", "chr_0033_camille", "chr_0026_lastrite"),
+        uploader_names=("方阵庇护", "追忆记录", "回响档案"),
+        base_duration_ms=300000,
+        base_dps=190000,
+        base_rdps=203000,
+    ),
+    BossSeed(
+        key="indie_battletower011_ex",
+        slug="indie_battletower011_ex",
+        name="重伤之围·残酷",
+        dungeon_name="战争回响",
+        roster=("chr_0034_typhoea", "chr_0032_lizhiyan", "chr_0033_camille", "chr_0026_lastrite"),
+        uploader_names=("重伤之围", "追忆记录", "回响档案"),
+        base_duration_ms=300000,
+        base_dps=190000,
+        base_rdps=203000,
+    ),
+    BossSeed(
+        key="indie_battletower012_ex",
+        slug="indie_battletower012_ex",
+        name="无机狂热·残酷",
+        dungeon_name="战争回响",
+        roster=("chr_0034_typhoea", "chr_0032_lizhiyan", "chr_0033_camille", "chr_0026_lastrite"),
+        uploader_names=("无机狂热", "追忆记录", "回响档案"),
+        base_duration_ms=300000,
+        base_dps=190000,
+        base_rdps=203000,
+    ),
+    BossSeed(
+        key="indie_battletower013_ex",
+        slug="indie_battletower013_ex",
+        name="斩首蓄势·残酷",
+        dungeon_name="战争回响",
+        roster=("chr_0034_typhoea", "chr_0032_lizhiyan", "chr_0033_camille", "chr_0026_lastrite"),
+        uploader_names=("斩首蓄势", "追忆记录", "回响档案"),
+        base_duration_ms=300000,
+        base_dps=190000,
+        base_rdps=203000,
+    ),
+    BossSeed(
+        key="indie_battletower014_ex",
+        slug="indie_battletower014_ex",
+        name="野兽诡计·残酷",
+        dungeon_name="战争回响",
+        roster=("chr_0034_typhoea", "chr_0032_lizhiyan", "chr_0033_camille", "chr_0026_lastrite"),
+        uploader_names=("野兽诡计", "追忆记录", "回响档案"),
+        base_duration_ms=300000,
+        base_dps=190000,
+        base_rdps=203000,
+    ),
 )
 
 HIGH_DIFFICULTY_STAGE_SLUG_ALIASES: dict[str, str] = {}
@@ -1543,6 +1707,7 @@ CRISIS_FRAGMENT_BOSS_KEY_SLUG_ALIASES: dict[str, str] = {
 ACTIVITY_STAGE_SLUG_ALIASES: dict[str, str] = {}
 ACTIVITY_GROUP_BOSS_KEY_SLUG_ALIASES: dict[str, dict[str, str]] = {}
 LEGACY_ACTIVITY_GROUP_SLUGS = frozenset({"indie_group_twdg"})
+REVIEWED_NON_RANKING_DUNGEON_SLUGS: frozenset[str] = frozenset()
 
 
 def _apply_dungeon_catalog_overrides() -> None:
@@ -1551,6 +1716,7 @@ def _apply_dungeon_catalog_overrides() -> None:
     Same single-source catalog consumed by parser_core and the web frontend.
     File entries win over the built-in tables; built-ins remain as fallback.
     """
+    global BOSS_SEEDS, REVIEWED_NON_RANKING_DUNGEON_SLUGS
     catalog_path = REPO_ROOT / "data" / "local_tables" / "dungeon_catalog.json"
     if not catalog_path.exists():
         return
@@ -1558,6 +1724,44 @@ def _apply_dungeon_catalog_overrides() -> None:
         catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return
+    non_ranking: set[str] = set()
+    for series_id, decision in ((catalog.get("discovery") or {}).get("manual_series_decisions") or {}).items():
+        if decision.get("decision") != "reviewed_not_ranked":
+            continue
+        detail = json.loads((REPO_ROOT / "data/local_tables/dungeon/items" / f"{series_id}.json").read_text("utf-8"))
+        signature_fields = {
+            "templateId": detail.get("templateId") or detail.get("id") or "",
+            "name": detail.get("name") or "", "gameCategory": detail.get("gameCategory") or "",
+            "includeDungeonIds": list(detail.get("includeDungeonIds") or []),
+            "dungeonPicPaths": list(detail.get("dungeonPicPaths") or []),
+            "dungeonRoleImg": detail.get("dungeonRoleImg") or "",
+        }
+        signature = sha256(json.dumps(signature_fields, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        if signature_fields["templateId"] != series_id or signature != decision.get("resource_signature"):
+            raise ValueError(f"Manual dungeon decision differs from the official resources: {series_id}")
+        for identity in (series_id, *signature_fields["includeDungeonIds"]):
+            non_ranking.add(identity)
+            # Include only the existing URL spelling of these exact IDs for
+            # historical uploads; no category/name/prefix inference is used.
+            non_ranking.add(sub(r"[^a-z0-9]+", "-", identity.lower()).strip("-"))
+    REVIEWED_NON_RANKING_DUNGEON_SLUGS = frozenset(non_ranking)
+    BOSS_SEEDS = tuple(boss for boss in BOSS_SEEDS if boss.slug not in non_ranking)
+    # New rankings come from the same official catalog as parser and web.
+    # Empty boards need metadata only; no fabricated participants or results.
+    seed_slugs = {boss.slug for boss in BOSS_SEEDS}
+    for group in (catalog.get("web") or {}).get("ranking_groups") or []:
+        for boss in group.get("bosses") or []:
+            slug = str(boss["slug"])
+            if slug in non_ranking:
+                raise ValueError(f"A manually excluded dungeon cannot have a ranking seed: {slug}")
+            if slug not in seed_slugs:
+                BOSS_SEEDS += (BossSeed(
+                    key=slug, slug=slug, name=str(boss["name"]),
+                    dungeon_name=str(boss["dungeonName"]),
+                    roster=("unknown",) * 4, uploader_names=("",) * 3,
+                    base_duration_ms=0, base_dps=0, base_rdps=0,
+                ),)
+                seed_slugs.add(slug)
     api_tables = catalog.get("api") or {}
     for key, value in (api_tables.get("high_difficulty_stage_slug_aliases") or {}).items():
         HIGH_DIFFICULTY_STAGE_SLUG_ALIASES[str(key)] = str(value)
@@ -1608,6 +1812,27 @@ class DemoPublicDataService:
         self._hot_bosses_cache: tuple[float, list[HotBossCard]] | None = None
         self._battle_list_cache: dict[tuple[str | None, bool], tuple[float, list[DemoBattle]]] = {}
         self._battle_list_cache_lock = threading.Lock()
+        self._public_ranked_cache: dict[
+            tuple[str | None, Metric], tuple[float, list[DemoBattle]]
+        ] = {}
+        self._public_ranked_cache_lock = threading.Lock()
+        self._public_account_directory_cache: tuple[
+            float, tuple[PublicAccountSearchEntryResponse, ...]
+        ] | None = None
+        # 账号索引冷构建复用轻量榜单元数据；锁覆盖构建过程，避免匿名并发搜索
+        # 重复扫描历史记录。
+        self._public_account_directory_cache_lock = threading.Lock()
+        self._character_statistics_cache: dict[
+            tuple[str, str, str, str], tuple[float, BossCharacterStatisticsResponse]
+        ] = {}
+        # FastAPI 的同步 handler 会在线程池并发运行。统计冷缓存必须单航班，
+        # 否则多个请求会同时扫描/解码全部历史样本，成倍放大 CPU 与内存。
+        self._character_statistics_cache_lock = threading.Lock()
+        self._character_boss_statistics_cache: dict[
+            tuple[str, str, str],
+            tuple[float, dict[str, CharacterBossStatisticsResponse]],
+        ] = {}
+        self._character_boss_statistics_cache_lock = threading.Lock()
         self._sync_uploaded_boss_catalog()
 
     def list_hot_bosses(self) -> list[HotBossCard]:
@@ -1625,39 +1850,67 @@ class DemoPublicDataService:
                 key=self._public_battle_sort_key,
             )
             boss_battles = ranked_boss_battles[:3]
+            top_runs: list[HotBossRun] = []
+            for index, battle in enumerate(boss_battles):
+                lead = self._get_lead_participant(battle, "dps")
+                lead_entries = [entry for entry in battle.roster if lead.characterKey and entry.characterKey == lead.characterKey]
+                lead_entry = lead_entries[0] if len(lead_entries) == 1 else None
+                top_runs.append(HotBossRun(
+                    battleId=battle.battle_id,
+                    durationMs=battle.duration_ms,
+                    uploaderNickname=battle.uploader_nickname,
+                    characterKey=lead.characterKey,
+                    characterName=lead.characterName,
+                    characterProfession=lead.characterProfession,
+                    characterAvatarUrl=lead.characterAvatarUrl,
+                    characterPotential=lead_entry.characterPotential if lead_entry else None,
+                    weaponRefine=lead_entry.weapon.weaponRefine if lead_entry and lead_entry.weapon else None,
+                    scorePercent=self._rank_score_percent(index + 1, len(ranked_boss_battles)),
+                    contractTagScore=_visible_contract_tag_score(battle),
+                    contractTags=_visible_contract_tags(battle),
+                ))
             cards.append(
                 HotBossCard(
                     bossSlug=boss.slug,
                     bossKey=boss.key,
                     bossName=boss.name,
                     dungeonName=boss.dungeon_name,
-                    topSpeedRuns=[
-                        HotBossRun(
-                            battleId=battle.battle_id,
-                            durationMs=battle.duration_ms,
-                            uploaderNickname=battle.uploader_nickname,
-                            characterKey=self._get_lead_participant(battle, "dps").characterKey,
-                            characterName=self._get_lead_participant(battle, "dps").characterName,
-                            characterProfession=self._get_lead_participant(battle, "dps").characterProfession,
-                            characterAvatarUrl=self._get_lead_participant(battle, "dps").characterAvatarUrl,
-                            scorePercent=self._rank_score_percent(index + 1, len(ranked_boss_battles)),
-                            contractTagScore=_visible_contract_tag_score(battle),
-                            contractTags=_visible_contract_tags(battle),
-                        )
-                        for index, battle in enumerate(boss_battles)
-                    ],
+                    topSpeedRuns=top_runs,
                 )
             )
         self._hot_bosses_cache = (now + HOT_BOSSES_CACHE_TTL_SECONDS, cards)
         return cards
 
     def _invalidate_public_caches(self) -> None:
+        # Import lazily: profile aggregation depends on this service's catalog.
+        from app.services.character_profile import character_profile_service
+        character_profile_service.invalidate()
         self._hot_bosses_cache = None
         with self._battle_list_cache_lock:
             self._battle_list_cache.clear()
+        ranked_cache_lock = getattr(self, "_public_ranked_cache_lock", None)
+        if ranked_cache_lock is not None:
+            with ranked_cache_lock:
+                self._public_ranked_cache.clear()
+        directory_cache_lock = getattr(self, "_public_account_directory_cache_lock", None)
+        if directory_cache_lock is not None:
+            with directory_cache_lock:
+                self._public_account_directory_cache = None
+        cache_lock = getattr(self, "_character_statistics_cache_lock", None)
+        if cache_lock is not None:
+            with cache_lock:
+                self._character_statistics_cache.clear()
+        character_boss_cache_lock = getattr(
+            self,
+            "_character_boss_statistics_cache_lock",
+            None,
+        )
+        if character_boss_cache_lock is not None:
+            with character_boss_cache_lock:
+                self._character_boss_statistics_cache.clear()
 
     def get_boss_rankings(self, boss_slug: str, metric: Metric) -> BossRankingResponse:
-        if _is_inactive_season_tower_stage(boss_slug):
+        if boss_slug in REVIEWED_NON_RANKING_DUNGEON_SLUGS or _is_inactive_season_tower_stage(boss_slug):
             raise AppError(status_code=404, code="boss_not_found", message="未找到对应首领。")
         boss = self.bosses_by_slug.get(boss_slug)
         if boss is None:
@@ -1678,6 +1931,10 @@ class DemoPublicDataService:
 
         for index, battle in enumerate(ranked_battles, start=1):
             lead = self._get_lead_participant(battle, metric)
+            # The roster is already normalized to the battle-detail display
+            # scale (refinement 1..6). Bind by exact character identity only.
+            lead_entries = [entry for entry in battle.roster if lead.characterKey and entry.characterKey == lead.characterKey]
+            lead_entry = lead_entries[0] if len(lead_entries) == 1 else None
             rows.append(
                 BossRankingRow(
                     rank=index,
@@ -1688,6 +1945,8 @@ class DemoPublicDataService:
                     characterName=lead.characterName,
                     characterProfession=lead.characterProfession or _get_character_profession(lead.characterName),
                     characterAvatarUrl=lead.characterAvatarUrl,
+                    characterPotential=lead_entry.characterPotential if lead_entry else None,
+                    weaponRefine=lead_entry.weapon.weaponRefine if lead_entry and lead_entry.weapon else None,
                     accountId=battle.uploader_user_id,
                     accountDisplayName=lead.accountDisplayName,
                     dps=battle.total_dps,
@@ -1700,6 +1959,8 @@ class DemoPublicDataService:
                             characterName=entry.characterName,
                             profession=entry.characterProfession or _get_character_profession(entry.characterName),
                             avatarUrl=entry.characterAvatarUrl,
+                            characterPotential=entry.characterPotential,
+                            weaponRefine=entry.weapon.weaponRefine if entry.weapon else None,
                         )
                         for entry in battle.roster
                     ],
@@ -1730,7 +1991,7 @@ class DemoPublicDataService:
                 code="character_statistics_not_available",
                 message="危机合约不提供角色统计。",
             )
-        if _is_inactive_season_tower_stage(boss_slug):
+        if boss_slug in REVIEWED_NON_RANKING_DUNGEON_SLUGS or _is_inactive_season_tower_stage(boss_slug):
             raise AppError(status_code=404, code="boss_not_found", message="未找到对应首领。")
         boss = self.bosses_by_slug.get(boss_slug)
         if boss is None:
@@ -1739,16 +2000,7 @@ class DemoPublicDataService:
         if boss is None:
             raise AppError(status_code=404, code="boss_not_found", message="未找到对应首领。")
 
-        completed_battles = [
-            battle
-            for battle in self._list_uploaded_battle_summaries(boss_slug=boss_slug)
-            if battle.status == "valid"
-            and battle.visibility == "public"
-            and battle.clear_flag
-            and battle.official_timer_end_seen is True
-            and battle.time_source == "game_timer"
-        ]
-        return self._build_character_statistics_response(
+        return self._get_character_statistics_response(
             scope="boss",
             boss_slug=boss.slug,
             boss_name=boss.name,
@@ -1756,8 +2008,6 @@ class DemoPublicDataService:
             metric=metric,
             time_range=time_range,
             potential_range=potential_range,
-            completed_battles=completed_battles,
-            included_boss_count=1,
         )
 
     def get_all_character_statistics(
@@ -1766,22 +2016,7 @@ class DemoPublicDataService:
         time_range: CharacterStatisticsRange,
         potential_range: CharacterStatisticsPotential = "all",
     ) -> BossCharacterStatisticsResponse:
-        included_slugs = {
-            boss.slug
-            for boss in BOSS_SEEDS
-            if boss.slug != CRISIS_CONTRACT_BOSS_SLUG and not _is_inactive_season_tower_stage(boss.slug)
-        }
-        completed_battles = [
-            battle
-            for battle in self._list_uploaded_battle_summaries()
-            if battle.boss_slug in included_slugs
-            and battle.status == "valid"
-            and battle.visibility == "public"
-            and battle.clear_flag
-            and battle.official_timer_end_seen is True
-            and battle.time_source == "game_timer"
-        ]
-        return self._build_character_statistics_response(
+        return self._get_character_statistics_response(
             scope="all",
             boss_slug="all",
             boss_name="全部副本",
@@ -1789,8 +2024,441 @@ class DemoPublicDataService:
             metric=metric,
             time_range=time_range,
             potential_range=potential_range,
-            completed_battles=completed_battles,
-            included_boss_count=len({battle.boss_slug for battle in completed_battles}),
+        )
+
+    @staticmethod
+    def _character_statistics_bosses() -> tuple[BossSeed, ...]:
+        return tuple(
+            boss
+            for boss in BOSS_SEEDS
+            if boss.slug != CRISIS_CONTRACT_BOSS_SLUG
+            and not _is_inactive_season_tower_stage(boss.slug)
+        )
+
+    def _ensure_character_boss_statistics_cache(self) -> None:
+        if not hasattr(self, "_character_boss_statistics_cache"):
+            self._character_boss_statistics_cache = {}
+        if not hasattr(self, "_character_boss_statistics_cache_lock"):
+            self._character_boss_statistics_cache_lock = threading.Lock()
+
+    def get_character_boss_statistics(
+        self,
+        character_key: str,
+        metric: Metric,
+        time_range: CharacterStatisticsRange,
+        potential_range: CharacterStatisticsPotential = "all",
+    ) -> CharacterBossStatisticsResponse:
+        catalog_entry = next(
+            (
+                entry
+                for entry in SIX_STAR_STATISTICS_CATALOG
+                if entry.char_id == character_key
+            ),
+            None,
+        )
+        if catalog_entry is None:
+            raise AppError(
+                status_code=404,
+                code="character_not_found",
+                message="未找到对应的六星角色。",
+            )
+
+        self._ensure_character_boss_statistics_cache()
+        cache_key = (metric, time_range, potential_range)
+        now = monotonic()
+        with self._character_boss_statistics_cache_lock:
+            cached = self._character_boss_statistics_cache.get(cache_key)
+            if cached is not None and cached[0] > now:
+                return cached[1][character_key]
+            responses = self._compute_all_character_boss_statistics(
+                metric=metric,
+                time_range=time_range,
+                potential_range=potential_range,
+            )
+            self._character_boss_statistics_cache[cache_key] = (
+                monotonic() + CHARACTER_BOSS_STATISTICS_CACHE_TTL_SECONDS,
+                responses,
+            )
+            return responses[character_key]
+
+    def _compute_all_character_boss_statistics(
+        self,
+        *,
+        metric: Metric,
+        time_range: CharacterStatisticsRange,
+        potential_range: CharacterStatisticsPotential,
+    ) -> dict[str, CharacterBossStatisticsResponse]:
+        bosses = self._character_statistics_bosses()
+        samples_by_boss, _ = self._collect_character_statistics_samples_by_boss(
+            boss_slug=None,
+            metric=metric,
+            time_range=time_range,
+            potential_range=potential_range,
+        )
+        rows_by_character: dict[str, list[CharacterBossStatisticsRow]] = {
+            entry.char_id: [] for entry in SIX_STAR_STATISTICS_CATALOG
+        }
+        for boss in bosses:
+            boss_samples = samples_by_boss.get(boss.slug) or {
+                entry.char_id: [] for entry in SIX_STAR_STATISTICS_CATALOG
+            }
+            character_rows = self._build_character_statistics_rows(boss_samples)
+            ranked_character_count = sum(
+                row.rank is not None for row in character_rows
+            )
+            for row in character_rows:
+                rows_by_character[row.characterKey].append(
+                    CharacterBossStatisticsRow(
+                        bossSlug=boss.slug,
+                        bossName=boss.name,
+                        dungeonName=boss.dungeon_name,
+                        rank=row.rank,
+                        rankedCharacterCount=ranked_character_count,
+                        sampleCount=row.sampleCount,
+                        normalSampleCount=row.normalSampleCount,
+                        outlierCount=row.outlierCount,
+                        insufficientSamples=row.insufficientSamples,
+                        lowerWhisker=row.lowerWhisker,
+                        p10=row.p10,
+                        p25=row.p25,
+                        median=row.median,
+                        p75=row.p75,
+                        p90=row.p90,
+                        upperWhisker=row.upperWhisker,
+                        maximum=row.maximum,
+                        outliers=row.outliers,
+                    )
+                )
+
+        return {
+            entry.char_id: CharacterBossStatisticsResponse(
+                characterKey=entry.char_id,
+                characterName=entry.name,
+                characterProfession=entry.profession,
+                characterAvatarUrl=entry.avatar_url,
+                metric=metric,
+                range=time_range,
+                potential=potential_range,
+                minimumSampleCount=CHARACTER_STATISTICS_MIN_SAMPLES,
+                includedBossCount=len(bosses),
+                totalSampleCount=sum(
+                    row.sampleCount for row in rows_by_character[entry.char_id]
+                ),
+                totalOutlierCount=sum(
+                    row.outlierCount for row in rows_by_character[entry.char_id]
+                ),
+                rows=rows_by_character[entry.char_id],
+            )
+            for entry in SIX_STAR_STATISTICS_CATALOG
+        }
+
+    def _ensure_character_statistics_cache(self) -> None:
+        # 一些单元测试用 __new__ 构造轻量 service；运行时正常走 __init__。
+        if not hasattr(self, "_character_statistics_cache"):
+            self._character_statistics_cache = {}
+        if not hasattr(self, "_character_statistics_cache_lock"):
+            self._character_statistics_cache_lock = threading.Lock()
+
+    def _get_character_statistics_response(
+        self,
+        *,
+        scope: Literal["boss", "all"],
+        boss_slug: str,
+        boss_name: str,
+        dungeon_name: str,
+        metric: Metric,
+        time_range: CharacterStatisticsRange,
+        potential_range: CharacterStatisticsPotential,
+    ) -> BossCharacterStatisticsResponse:
+        self._ensure_character_statistics_cache()
+        cache_key = (scope, boss_slug, metric, f"{time_range}:{potential_range}")
+        now = monotonic()
+        with self._character_statistics_cache_lock:
+            cached = self._character_statistics_cache.get(cache_key)
+            if cached is not None and cached[0] > now:
+                return cached[1]
+            # 锁覆盖整个冷缓存构建：同一进程内其它统计请求等待本次结果，
+            # 不会并发扫描/解析 5k+ 场记录形成内存雪崩。
+            response = self._compute_character_statistics_response(
+                scope=scope,
+                boss_slug=boss_slug,
+                boss_name=boss_name,
+                dungeon_name=dungeon_name,
+                metric=metric,
+                time_range=time_range,
+                potential_range=potential_range,
+            )
+            self._character_statistics_cache[cache_key] = (
+                monotonic() + CHARACTER_STATISTICS_CACHE_TTL_SECONDS,
+                response,
+            )
+            return response
+
+    def _query_character_statistics_metadata(
+        self,
+        *,
+        boss_slug: str | None,
+    ) -> list[CharacterStatisticsBattleRow]:
+        statement = select(
+            UploadedBattleRecord.id,
+            UploadedBattleRecord.boss_key,
+            UploadedBattleRecord.boss_slug,
+            UploadedBattleRecord.battle_end_at,
+            UploadedBattleRecord.duration_ms,
+            UploadedBattleRecord.total_damage,
+            UploadedBattleRecord.parser_version,
+            UploadedBattleRecord.rules_version,
+            UploadedBattleRecord.rdps_strict_ok,
+            UploadedBattleRecord.timer_integrity_ok,
+        ).where(
+            UploadedBattleRecord.status == "valid",
+            UploadedBattleRecord.visibility == "public",
+            UploadedBattleRecord.clear_flag.is_(True),
+            UploadedBattleRecord.official_timer_end_seen.is_(True),
+            UploadedBattleRecord.time_source == "game_timer",
+            UploadedBattleRecord.loadout_fallback_used.is_not(True),
+        )
+        if boss_slug is not None:
+            statement = statement.where(or_(*self._uploaded_battle_boss_filter_conditions(boss_slug)))
+        try:
+            with SessionLocal() as session:
+                rows = session.execute(statement).all()
+        except OperationalError:
+            return []
+        result: list[CharacterStatisticsBattleRow] = []
+        for row in rows:
+            try:
+                battle_end_at = datetime.fromisoformat(row.battle_end_at)
+            except (TypeError, ValueError):
+                continue
+            result.append(
+                CharacterStatisticsBattleRow(
+                    battle_id=row.id,
+                    boss_slug=self._canonical_uploaded_boss_slug(row.boss_slug, row.boss_key),
+                    battle_end_at=battle_end_at,
+                    duration_ms=row.duration_ms,
+                    total_damage=row.total_damage,
+                    parser_version=row.parser_version,
+                    rules_version=row.rules_version,
+                    rdps_strict_ok=row.rdps_strict_ok,
+                    timer_integrity_ok=row.timer_integrity_ok,
+                )
+            )
+        return result
+
+    def _iter_character_statistics_payloads(
+        self,
+        battle_ids: set[str],
+    ) -> Iterator[tuple[str, str, str]]:
+        if not battle_ids:
+            return
+        statement = (
+            select(
+                UploadedBattleRecord.id,
+                UploadedBattleRecord.roster_json,
+                UploadedBattleRecord.participants_json,
+            )
+            .where(UploadedBattleRecord.id.in_(battle_ids))
+            .execution_options(stream_results=True, yield_per=250)
+        )
+        try:
+            with SessionLocal() as session:
+                for row in session.execute(statement):
+                    yield row.id, row.roster_json, row.participants_json
+        except OperationalError:
+            return
+
+    def _collect_character_statistics_samples_by_boss(
+        self,
+        *,
+        boss_slug: str | None,
+        metric: Metric,
+        time_range: CharacterStatisticsRange,
+        potential_range: CharacterStatisticsPotential,
+    ) -> tuple[
+        dict[str, dict[str, list[float]]],
+        dict[str, set[str]],
+    ]:
+        included_slugs = {
+            boss.slug
+            for boss in BOSS_SEEDS
+            if boss.slug != CRISIS_CONTRACT_BOSS_SLUG
+            and not _is_inactive_season_tower_stage(boss.slug)
+        }
+        metadata = self._query_character_statistics_metadata(boss_slug=boss_slug)
+        range_days = CHARACTER_STATISTICS_RANGE_DAYS.get(time_range)
+        cutoff = datetime.now(UTC) - timedelta(days=range_days) if range_days is not None else None
+        candidates: list[CharacterStatisticsBattleRow] = []
+        for battle in metadata:
+            battle_end_at = battle.battle_end_at
+            if battle_end_at.tzinfo is None:
+                battle_end_at = battle_end_at.replace(tzinfo=UTC)
+            if boss_slug is None and battle.boss_slug not in included_slugs:
+                continue
+            if cutoff is not None and battle_end_at < cutoff:
+                continue
+            if metric == "rdps" and not _rdps_ranking_eligible(
+                battle.parser_version, battle.rules_version, battle.rdps_strict_ok,
+            ):
+                continue
+            if _parser_version_number(battle.parser_version) >= 47 and battle.timer_integrity_ok is not True:
+                continue
+            candidates.append(battle)
+
+        incomplete_ids = self._incomplete_clear_battle_ids(candidates)
+        eligible_ids = {
+            battle.battle_id for battle in candidates if battle.battle_id not in incomplete_ids
+        }
+        boss_slug_by_id = {
+            battle.battle_id: battle.boss_slug
+            for battle in candidates
+            if battle.battle_id in eligible_ids
+        }
+        samples_by_boss: dict[str, dict[str, list[float]]] = {}
+        sampled_battle_ids_by_boss: dict[str, set[str]] = {}
+
+        for battle_id, roster_json, participants_json in self._iter_character_statistics_payloads(eligible_ids):
+            resolved_boss_slug = boss_slug_by_id.get(battle_id)
+            if resolved_boss_slug is None:
+                continue
+            try:
+                roster_items = json.loads(roster_json)
+                participant_items = json.loads(participants_json)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(roster_items, list) or not isinstance(participant_items, list):
+                continue
+            potential_by_character: dict[str, int | None] = {}
+            for item in roster_items:
+                if not isinstance(item, dict):
+                    continue
+                entry = _get_character_entry(item.get("characterName"), item.get("characterKey"))
+                if entry is None:
+                    continue
+                character_key = _statistics_character_key(entry)
+                potential = item.get("characterPotential")
+                if not isinstance(potential, int) or isinstance(potential, bool):
+                    potential = None
+                if (
+                    character_key not in potential_by_character
+                    or potential_by_character[character_key] is None
+                ):
+                    potential_by_character[character_key] = potential
+            for item in participant_items:
+                if not isinstance(item, dict):
+                    continue
+                entry = _get_character_entry(item.get("characterName"), item.get("characterKey"))
+                if entry is None or entry.rarity != 6:
+                    continue
+                try:
+                    dps = float(item.get("dps") or 0)
+                    rdps = float(item.get("rdps") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if dps <= 0 and rdps <= 0:
+                    continue
+                character_key = _statistics_character_key(entry)
+                potential = potential_by_character.get(character_key)
+                if potential is None or not 0 <= potential <= 5:
+                    continue
+                if potential_range == "0" and potential != 0:
+                    continue
+                if potential_range == "1-5" and not 1 <= potential <= 5:
+                    continue
+                samples_by_character = samples_by_boss.setdefault(
+                    resolved_boss_slug,
+                    {catalog_entry.char_id: [] for catalog_entry in SIX_STAR_STATISTICS_CATALOG},
+                )
+                if character_key not in samples_by_character:
+                    continue
+                samples_by_character[character_key].append(dps if metric == "dps" else rdps)
+                sampled_battle_ids_by_boss.setdefault(resolved_boss_slug, set()).add(battle_id)
+
+        return samples_by_boss, sampled_battle_ids_by_boss
+
+    def _compute_character_statistics_response(
+        self,
+        *,
+        scope: Literal["boss", "all"],
+        boss_slug: str,
+        boss_name: str,
+        dungeon_name: str,
+        metric: Metric,
+        time_range: CharacterStatisticsRange,
+        potential_range: CharacterStatisticsPotential,
+    ) -> BossCharacterStatisticsResponse:
+        # 保留轻量内存 service 的测试/调用兼容；生产实例不在 __dict__ 覆盖该方法。
+        if "_list_uploaded_battle_summaries" in self.__dict__:
+            included_slugs = {
+                boss.slug
+                for boss in BOSS_SEEDS
+                if boss.slug != CRISIS_CONTRACT_BOSS_SLUG
+                and not _is_inactive_season_tower_stage(boss.slug)
+            }
+            completed_battles = [
+                battle
+                for battle in self._list_uploaded_battle_summaries(
+                    boss_slug=boss_slug if scope == "boss" else None
+                )
+                if (scope == "boss" or battle.boss_slug in included_slugs)
+                and battle.status == "valid"
+                and battle.visibility == "public"
+                and battle.clear_flag
+                and battle.official_timer_end_seen is True
+                and battle.time_source == "game_timer"
+            ]
+            return self._build_character_statistics_response(
+                scope=scope,
+                boss_slug=boss_slug,
+                boss_name=boss_name,
+                dungeon_name=dungeon_name,
+                metric=metric,
+                time_range=time_range,
+                potential_range=potential_range,
+                completed_battles=completed_battles,
+                included_boss_count=(
+                    1 if scope == "boss" else len({battle.boss_slug for battle in completed_battles})
+                ),
+            )
+        samples_by_boss, sampled_battle_ids_by_boss = (
+            self._collect_character_statistics_samples_by_boss(
+                boss_slug=boss_slug if scope == "boss" else None,
+                metric=metric,
+                time_range=time_range,
+                potential_range=potential_range,
+            )
+        )
+        samples_by_character: dict[str, list[float]] = {
+            entry.char_id: [] for entry in SIX_STAR_STATISTICS_CATALOG
+        }
+        if scope == "boss":
+            selected_samples = samples_by_boss.get(boss_slug)
+            if selected_samples is not None:
+                samples_by_character = selected_samples
+            sampled_battle_ids = set(sampled_battle_ids_by_boss.get(boss_slug) or set())
+            sampled_boss_slugs = {boss_slug} if sampled_battle_ids else set()
+        else:
+            sampled_battle_ids = set()
+            sampled_boss_slugs = set(samples_by_boss)
+            for sampled_boss_slug, boss_samples in samples_by_boss.items():
+                sampled_battle_ids.update(
+                    sampled_battle_ids_by_boss.get(sampled_boss_slug) or set()
+                )
+                for character_key, values in boss_samples.items():
+                    samples_by_character[character_key].extend(values)
+
+        return self._build_character_statistics_rows_response(
+            scope=scope,
+            boss_slug=boss_slug,
+            boss_name=boss_name,
+            dungeon_name=dungeon_name,
+            metric=metric,
+            time_range=time_range,
+            potential_range=potential_range,
+            samples_by_character=samples_by_character,
+            sampled_battle_ids=sampled_battle_ids,
+            sampled_boss_slugs=sampled_boss_slugs,
+            included_boss_count=1 if scope == "boss" else 0,
         )
 
     def _build_character_statistics_response(
@@ -1818,11 +2486,16 @@ class DemoPublicDataService:
                 continue
             if cutoff is not None and battle_end_at < cutoff:
                 continue
-            if metric == "rdps" and _parser_version_number(battle.parser_version) < RANKING_MIN_PARSER_VERSION:
-                continue
-            if metric == "rdps" and battle.rdps_strict_ok is not True:
+            if metric == "rdps" and not _rdps_ranking_eligible(
+                battle.parser_version, battle.rules_version, battle.rdps_strict_ok,
+            ):
                 continue
             if battle.loadout_fallback_used is True:
+                continue
+            if (
+                _parser_version_number(battle.parser_version) >= 47
+                and battle.timer_integrity_ok is not True
+            ):
                 continue
             eligible_battles.append(battle)
 
@@ -1841,7 +2514,10 @@ class DemoPublicDataService:
                 if roster_catalog_entry is None:
                     continue
                 roster_character_key = _statistics_character_key(roster_catalog_entry)
-                if roster_character_key not in potential_by_character or potential_by_character[roster_character_key] is None:
+                if (
+                    roster_character_key not in potential_by_character
+                    or potential_by_character[roster_character_key] is None
+                ):
                     potential_by_character[roster_character_key] = roster_entry.characterPotential
             for participant in battle.participants:
                 entry = _get_character_entry(participant.characterName, participant.characterKey)
@@ -1864,6 +2540,60 @@ class DemoPublicDataService:
                 sampled_battle_ids.add(battle.battle_id)
                 sampled_boss_slugs.add(battle.boss_slug)
 
+        return self._build_character_statistics_rows_response(
+            scope=scope,
+            boss_slug=boss_slug,
+            boss_name=boss_name,
+            dungeon_name=dungeon_name,
+            metric=metric,
+            time_range=time_range,
+            potential_range=potential_range,
+            samples_by_character=samples_by_character,
+            sampled_battle_ids=sampled_battle_ids,
+            sampled_boss_slugs=sampled_boss_slugs,
+            included_boss_count=included_boss_count,
+        )
+
+    def _build_character_statistics_rows_response(
+        self,
+        *,
+        scope: Literal["boss", "all"],
+        boss_slug: str,
+        boss_name: str,
+        dungeon_name: str,
+        metric: Metric,
+        time_range: CharacterStatisticsRange,
+        potential_range: CharacterStatisticsPotential,
+        samples_by_character: dict[str, list[float]],
+        sampled_battle_ids: set[str],
+        sampled_boss_slugs: set[str],
+        included_boss_count: int,
+    ) -> BossCharacterStatisticsResponse:
+        ranked_rows = self._build_character_statistics_rows(samples_by_character)
+        return BossCharacterStatisticsResponse(
+            scope=scope,
+            bossSlug=boss_slug,
+            bossName=boss_name,
+            dungeonName=dungeon_name,
+            metric=metric,
+            range=time_range,
+            potential=potential_range,
+            includedBossCount=(
+                len(sampled_boss_slugs)
+                if scope == "all"
+                else included_boss_count
+            ),
+            minimumSampleCount=CHARACTER_STATISTICS_MIN_SAMPLES,
+            eligibleBattleCount=len(sampled_battle_ids),
+            totalSampleCount=sum(len(values) for values in samples_by_character.values()),
+            totalOutlierCount=sum(row.outlierCount for row in ranked_rows),
+            rows=ranked_rows,
+        )
+
+    def _build_character_statistics_rows(
+        self,
+        samples_by_character: dict[str, list[float]],
+    ) -> list[BossCharacterStatisticsRow]:
         pooled_values = sorted(value for values in samples_by_character.values() for value in values)
         global_outlier_bounds = _iqr_bounds(
             pooled_values,
@@ -1942,26 +2672,7 @@ class DemoPublicDataService:
                 rank += 1
                 row = row.model_copy(update={"rank": rank})
             ranked_rows.append(row)
-
-        return BossCharacterStatisticsResponse(
-            scope=scope,
-            bossSlug=boss_slug,
-            bossName=boss_name,
-            dungeonName=dungeon_name,
-            metric=metric,
-            range=time_range,
-            potential=potential_range,
-            includedBossCount=(
-                len(sampled_boss_slugs)
-                if scope == "all"
-                else included_boss_count
-            ),
-            minimumSampleCount=CHARACTER_STATISTICS_MIN_SAMPLES,
-            eligibleBattleCount=len(sampled_battle_ids),
-            totalSampleCount=sum(len(values) for values in samples_by_character.values()),
-            totalOutlierCount=sum(row.outlierCount for row in ranked_rows),
-            rows=ranked_rows,
-        )
+        return ranked_rows
 
     def get_battle_detail(
         self,
@@ -1991,6 +2702,99 @@ class DemoPublicDataService:
             for stat in battle.role_skill_stats
         ]
         timeline_events = _enrich_timeline_event_damage_identities(battle.timeline_events)
+        # Read-time display metadata only. Official ownership paths define groups;
+        # equal translated names do not establish that two skills belong together.
+        skill_display_entries: dict[str, Any] = {}
+        skill_display_conflicts: dict[str, Any] = {}
+        try:
+            skill_display_catalog = json.loads(
+                (REPO_ROOT / "data" / "local_static" / "skill" / "display_name_catalog.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            decoder = skill_display_catalog.get("decoder") if isinstance(skill_display_catalog, dict) else None
+            if (
+                isinstance(skill_display_catalog, dict)
+                and skill_display_catalog.get("schemaVersion") == 1
+                and skill_display_catalog.get("source") == "official_CharGrowth_I18n_typed_skill_display"
+                and isinstance(decoder, dict)
+                and all(decoder.get(key) == value for key, value in _CURRENT_TYPED_RESOURCE_BINDING.items())
+                and isinstance(skill_display_catalog.get("entries"), dict)
+                and isinstance(skill_display_catalog.get("conflicts"), dict)
+            ):
+                skill_display_entries = skill_display_catalog["entries"]
+                skill_display_conflicts = skill_display_catalog["conflicts"]
+        except (OSError, ValueError):
+            pass
+
+        roster_keys_by_name: dict[str, set[str]] = {}
+        roster_names_by_key: dict[str, set[str]] = {}
+        for entry in battle.roster:
+            if entry.characterKey and entry.characterName:
+                roster_keys_by_name.setdefault(entry.characterName, set()).add(entry.characterKey)
+                roster_names_by_key.setdefault(entry.characterKey, set()).add(entry.characterName)
+        stat_identity_counts: dict[tuple[str, str | None], int] = {}
+        for stat in normalized_role_skill_stats:
+            identity = (stat.characterName, stat.skillKey)
+            stat_identity_counts[identity] = stat_identity_counts.get(identity, 0) + 1
+
+        hit_values_by_identity: dict[tuple[str, str], list[int]] = {}
+        conflicting_hit_identities: set[tuple[str, str]] = set()
+        for event in battle.timeline_events:
+            if event.laneType != "skill" or not event.eventKey or not event.value or event.value <= 0:
+                continue
+            source_name = event.sourceCharacterName
+            source_key = event.sourceCharacterKey
+            key_names = roster_names_by_key.get(source_key, set()) if source_key else set()
+            if source_name:
+                name_keys = roster_keys_by_name.get(source_name, set())
+                if len(name_keys) != 1 or (source_key and name_keys != {source_key}):
+                    conflicting_hit_identities.add((source_name, event.eventKey))
+                    for key_name in key_names:
+                        conflicting_hit_identities.add((key_name, event.eventKey))
+                    continue
+            elif len(key_names) == 1:
+                source_name = next(iter(key_names))
+            else:
+                continue
+            hit_values_by_identity.setdefault((source_name, event.eventKey), []).append(event.value)
+
+        for stat in normalized_role_skill_stats:
+            character_keys = roster_keys_by_name.get(stat.characterName, set())
+            character_key = next(iter(character_keys)) if len(character_keys) == 1 else None
+            entry = skill_display_entries.get(stat.skillKey) if stat.skillKey else None
+            if (
+                character_key
+                and isinstance(entry, dict)
+                and stat.skillKey not in skill_display_conflicts
+                and entry.get("proofKind") in {"official_char_growth_skill_list", "typed_enabled_creation_path"}
+                and isinstance(entry.get("paths"), list)
+                and isinstance(entry.get("displayName"), str)
+                and entry["displayName"].strip()
+            ):
+                group_ids = {
+                    path["skillGroupId"]
+                    for path in entry["paths"]
+                    if isinstance(path, dict)
+                    and path.get("characterId") == character_key
+                    and isinstance(path.get("skillGroupId"), str)
+                    and path["skillGroupId"]
+                }
+                if len(group_ids) == 1:
+                    stat.displayGroupKey = f"official:{character_key}:{next(iter(group_ids))}"
+                    stat.displayGroupName = entry["displayName"]
+            identity = (stat.characterName, stat.skillKey)
+            hit_values = hit_values_by_identity.get(identity, [])
+            if (
+                character_key
+                and stat_identity_counts[identity] == 1
+                and identity not in conflicting_hit_identities
+                and hit_values
+                and sum(hit_values) == stat.totalDamage
+            ):
+                # These are individual positive damage events, never inferred casts.
+                stat.hitCount = len(hit_values)
+                stat.maxHit = max(hit_values)
         battle_response = BattleResponse(
             id=battle.battle_id,
             uploaderUserId=battle.uploader_user_id,
@@ -2015,10 +2819,17 @@ class DemoPublicDataService:
             timerEndSeen=battle.timer_end_seen,
             officialTimerStartSeen=battle.official_timer_start_seen,
             officialTimerEndSeen=battle.official_timer_end_seen,
+            officialTimerObservedElapsedMs=battle.official_timer_observed_elapsed_ms,
+            packetTimerElapsedMs=battle.packet_timer_elapsed_ms,
+            timerIntegrityOk=battle.timer_integrity_ok,
+            timerIntegrityReasons=battle.timer_integrity_reasons,
             timerStartInferred=battle.timer_start_inferred,
             timerWindowValid=battle.timer_window_valid,
             rdpsPreflightOk=battle.rdps_preflight_ok,
             rdpsStrictOk=battle.rdps_strict_ok,
+            rdpsRankingEligible=battle.boss_slug not in REVIEWED_NON_RANKING_DUNGEON_SLUGS and _rdps_ranking_eligible(
+                battle.parser_version, battle.rules_version, battle.rdps_strict_ok,
+            ),
             rdpsPreflightBlockerCount=battle.rdps_preflight_blocker_count,
             bossIdentitySource=battle.boss_identity_source,
             dungeonContextId=battle.dungeon_context_id,
@@ -2135,6 +2946,113 @@ class DemoPublicDataService:
             rankings=self._list_user_boss_rankings(viewer_user_id),
         )
 
+    @staticmethod
+    def _normalize_public_account_search_text(value: str) -> str:
+        return normalize("NFKC", value).strip()
+
+    def _ensure_public_account_directory_cache(self) -> None:
+        # 兼容用 __new__ 构造的轻量测试 service。
+        if not hasattr(self, "_public_account_directory_cache"):
+            self._public_account_directory_cache = None
+        if not hasattr(self, "_public_account_directory_cache_lock"):
+            self._public_account_directory_cache_lock = threading.Lock()
+
+    def _get_public_account_directory(self) -> tuple[PublicAccountSearchEntryResponse, ...]:
+        self._ensure_public_account_directory_cache()
+        now = monotonic()
+        with self._public_account_directory_cache_lock:
+            cached = self._public_account_directory_cache
+            if cached is not None and cached[0] > now:
+                return cached[1]
+            directory = self._build_public_account_directory()
+            self._public_account_directory_cache = (
+                monotonic() + PUBLIC_ACCOUNT_DIRECTORY_CACHE_TTL_SECONDS,
+                directory,
+            )
+            return directory
+
+    def _build_public_account_directory(self) -> tuple[PublicAccountSearchEntryResponse, ...]:
+        """从正式公开榜单的轻量元数据生成可搜索账号索引。
+
+        不读取 auth_users，也不加载 roster/participants JSON；昵称只来自最终可在
+        公开榜单出现的上传记录，因此不会泄露私有记录或尚未公开的新昵称。
+        """
+        metadata_by_boss: dict[str, list[DemoBattle]] = {}
+        for battle in self._query_public_ranking_metadata(boss_slug=None):
+            if not battle.uploader_user_id.strip():
+                continue
+            if _is_inactive_season_tower_stage(battle.boss_slug):
+                continue
+            if battle.boss_slug not in self.bosses_by_slug:
+                continue
+            metadata_by_boss.setdefault(battle.boss_slug, []).append(battle)
+
+        latest_ranked_by_account: dict[str, DemoBattle] = {}
+        for group in metadata_by_boss.values():
+            for battle in self._best_public_battles_by_account(group):
+                account_id = battle.uploader_user_id.strip()
+                display_name = battle.uploader_nickname.strip()
+                if not account_id or not display_name:
+                    continue
+                current = latest_ranked_by_account.get(account_id)
+                if current is None or battle.battle_end_at > current.battle_end_at:
+                    latest_ranked_by_account[account_id] = battle
+
+        entries = [
+            PublicAccountSearchEntryResponse(
+                accountId=account_id,
+                accountDisplayName=battle.uploader_nickname.strip(),
+            )
+            for account_id, battle in latest_ranked_by_account.items()
+        ]
+        return tuple(
+            sorted(
+                entries,
+                key=lambda entry: (
+                    self._normalize_public_account_search_text(entry.accountDisplayName).casefold(),
+                    entry.accountId,
+                ),
+            )
+        )
+
+    def search_public_accounts(self, *, query: str, limit: int = 10) -> PublicAccountSearchResponse:
+        display_query = self._normalize_public_account_search_text(query)
+        if not 2 <= len(display_query) <= 64:
+            raise AppError(
+                status_code=422,
+                code="invalid_account_search_query",
+                message="账号搜索关键词去除首尾空格后长度必须为 2 到 64 个字符。",
+            )
+        if not 1 <= limit <= 20:
+            raise AppError(
+                status_code=422,
+                code="invalid_account_search_limit",
+                message="账号搜索结果数量必须为 1 到 20。",
+            )
+
+        folded_query = display_query.casefold()
+        matches: list[tuple[int, str, PublicAccountSearchEntryResponse]] = []
+        for entry in self._get_public_account_directory():
+            normalized_name = self._normalize_public_account_search_text(entry.accountDisplayName)
+            folded_name = normalized_name.casefold()
+            if folded_query not in folded_name:
+                continue
+            if folded_name == folded_query:
+                match_rank = 0
+            elif folded_name.startswith(folded_query):
+                match_rank = 1
+            else:
+                match_rank = 2
+            matches.append((match_rank, folded_name, entry))
+        matches.sort(key=lambda item: (item[0], item[1], item[2].accountId))
+
+        accounts = [item[2] for item in matches]
+        return PublicAccountSearchResponse(
+            query=display_query,
+            hasMore=len(accounts) > limit,
+            accounts=accounts[:limit],
+        )
+
     def get_public_user_rankings(self, account_id: str) -> PublicUserRankingsResponse:
         normalized_account_id = account_id.strip()
         if not normalized_account_id:
@@ -2152,18 +3070,14 @@ class DemoPublicDataService:
         )
 
     def _get_public_user_display_name(self, account_id: str) -> str | None:
-        try:
-            with SessionLocal() as session:
-                return session.execute(
-                    select(UploadedBattleRecord.uploader_nickname)
-                    .where(
-                        UploadedBattleRecord.uploader_user_id == account_id,
-                        UploadedBattleRecord.status == "valid",
-                    )
-                    .order_by(UploadedBattleRecord.battle_end_at.desc(), UploadedBattleRecord.created_at.desc())
-                ).scalars().first()
-        except OperationalError:
-            return None
+        return next(
+            (
+                entry.accountDisplayName
+                for entry in self._get_public_account_directory()
+                if entry.accountId == account_id
+            ),
+            None,
+        )
 
     def _list_user_boss_rankings(self, viewer_user_id: str) -> list[UserBossRankingResponse]:
         self._sync_uploaded_boss_catalog()
@@ -2189,6 +3103,17 @@ class DemoPublicDataService:
                         totalDps=battle.total_dps,
                         battleEndAt=battle.battle_end_at.isoformat(),
                         rosterSummary=[entry.characterName for entry in battle.roster],
+                        rosterEntries=[
+                            BossRankingRosterEntry(
+                                characterKey=entry.characterKey,
+                                characterName=entry.characterName,
+                                profession=entry.characterProfession or _get_character_profession(entry.characterName),
+                                avatarUrl=entry.characterAvatarUrl,
+                                characterPotential=entry.characterPotential,
+                                weaponRefine=entry.weapon.weaponRefine if entry.weapon else None,
+                            )
+                            for entry in battle.roster
+                        ],
                         contractTagScore=_visible_contract_tag_score(battle),
                         contractTags=_visible_contract_tags(battle),
                     )
@@ -2408,6 +3333,18 @@ class DemoPublicDataService:
             time_source=payload.battle.timeSource,
             timer_window_valid=payload.battle.timerWindowValid,
         )
+        self._validate_upload_timer_integrity(
+            boss_slug=boss_slug,
+            parser_version=payload.battle.parserVersion,
+            clear_flag=clear_flag,
+            duration_ms=payload.battle.durationMs,
+            official_observed_elapsed_ms=payload.battle.officialTimerObservedElapsedMs,
+            packet_elapsed_ms=payload.battle.packetTimerElapsedMs,
+            timer_integrity_ok=payload.battle.timerIntegrityOk,
+            timer_integrity_reasons=payload.battle.timerIntegrityReasons,
+            timer_evidence=payload.battle.timerEvidence,
+            dungeon_context_id=payload.battle.dungeonContextId,
+        )
         contract_tags = _normalize_contract_tags(payload.battle.contractTags)
         contract_tag_score = _contract_tag_score(payload.battle.contractTagScore, contract_tags)
         contract_tag_score, contract_tags = _contract_fields_for_boss(boss_slug, contract_tag_score, contract_tags)
@@ -2437,6 +3374,11 @@ class DemoPublicDataService:
             timer_end_seen=payload.battle.timerEndSeen,
             official_timer_start_seen=payload.battle.officialTimerStartSeen,
             official_timer_end_seen=payload.battle.officialTimerEndSeen,
+            official_timer_observed_elapsed_ms=payload.battle.officialTimerObservedElapsedMs,
+            packet_timer_elapsed_ms=payload.battle.packetTimerElapsedMs,
+            timer_integrity_ok=payload.battle.timerIntegrityOk,
+            timer_integrity_reasons=list(payload.battle.timerIntegrityReasons),
+            timer_evidence=payload.battle.timerEvidence,
             timer_start_inferred=payload.battle.timerStartInferred,
             timer_window_valid=payload.battle.timerWindowValid,
             rdps_preflight_ok=payload.battle.rdpsPreflightOk,
@@ -2507,6 +3449,41 @@ class DemoPublicDataService:
         ):
             return False
         return True
+
+    def _validate_upload_timer_integrity(
+        self,
+        *,
+        boss_slug: str,
+        parser_version: str,
+        clear_flag: bool,
+        duration_ms: int,
+        official_observed_elapsed_ms: int | None,
+        packet_elapsed_ms: int | None,
+        timer_integrity_ok: bool | None,
+        timer_integrity_reasons: list[str],
+        timer_evidence: dict[str, Any] | None = None,
+        dungeon_context_id: str | None = None,
+    ) -> None:
+        if not clear_flag:
+            return
+        competitive_slugs = {
+            boss.slug
+            for boss in BOSS_SEEDS
+            if boss.slug != CRISIS_CONTRACT_BOSS_SLUG
+        }
+        if boss_slug not in competitive_slugs:
+            return
+        reasons = list(timer_integrity_reasons)
+        reasons.extend(validate_timer_evidence(
+            timer_evidence, duration_ms=duration_ms, game_id=dungeon_context_id))
+        if timer_integrity_ok is not True:
+            reasons.append("timer_integrity_not_confirmed")
+        if reasons:
+            raise AppError(
+                status_code=422,
+                code="timer_integrity_failed",
+                message="官方挑战计时证据缺失或存在冲突，请更新客户端后重新解析并上传。",
+            )
 
     @staticmethod
     def _has_clear_completion_signal(
@@ -2764,6 +3741,8 @@ class DemoPublicDataService:
         # Leaderboard routing is intentionally stage-only. boss_key/boss_name
         # remain optional compatibility parameters for callers and are used
         # nowhere in this decision.
+        if dungeon_key in REVIEWED_NON_RANKING_DUNGEON_SLUGS:
+            return dungeon_key
         if dungeon_key in HIGH_DIFFICULTY_STAGE_SLUG_ALIASES:
             return HIGH_DIFFICULTY_STAGE_SLUG_ALIASES[dungeon_key]
         if dungeon_key in ACTIVITY_STAGE_SLUG_ALIASES:
@@ -2834,7 +3813,7 @@ class DemoPublicDataService:
         lead_dps: float,
         lead_rdps: float,
     ) -> None:
-        if _is_inactive_season_tower_stage(boss_slug):
+        if boss_slug in REVIEWED_NON_RANKING_DUNGEON_SLUGS or _is_inactive_season_tower_stage(boss_slug):
             return
         if boss_slug in self.bosses_by_slug:
             return
@@ -2863,8 +3842,48 @@ class DemoPublicDataService:
         )
 
     def _sync_uploaded_boss_catalog(self) -> None:
-        for battle in self._list_uploaded_battle_summaries():
-            self._register_boss_from_battle(battle)
+        # 启动时只同步目录元数据。旧实现为了找动态场地，会读取并反序列化全部
+        # roster/participants，导致空闲 API 进程也常驻数百 MB 战斗对象。
+        statement = select(
+            UploadedBattleRecord.boss_key,
+            UploadedBattleRecord.boss_slug,
+            UploadedBattleRecord.boss_name,
+            UploadedBattleRecord.dungeon_name,
+            UploadedBattleRecord.uploader_nickname,
+            UploadedBattleRecord.duration_ms,
+            UploadedBattleRecord.total_dps,
+        ).where(
+            UploadedBattleRecord.status == "valid",
+            UploadedBattleRecord.clear_flag.is_(True),
+        )
+        try:
+            with SessionLocal() as session:
+                rows = session.execute(statement).all()
+        except OperationalError:
+            return
+
+        registered: set[str] = set()
+        for row in rows:
+            boss_slug = self._canonical_uploaded_boss_slug(row.boss_slug, row.boss_key)
+            if boss_slug in registered or boss_slug in self.bosses_by_slug:
+                continue
+            registered.add(boss_slug)
+            self._ensure_boss_catalog_entry(
+                boss_key=row.boss_key,
+                boss_slug=boss_slug,
+                boss_name=self._display_boss_name(
+                    boss_slug=boss_slug,
+                    boss_key=row.boss_key,
+                    boss_name=row.boss_name,
+                    dungeon_name=row.dungeon_name,
+                ),
+                dungeon_name=row.dungeon_name,
+                roster_keys=[],
+                uploader_nickname=row.uploader_nickname,
+                duration_ms=row.duration_ms,
+                lead_dps=row.total_dps,
+                lead_rdps=0.0,
+            )
 
     def _register_boss_from_battle(self, battle: DemoBattle) -> None:
         self._ensure_boss_catalog_entry(
@@ -2894,10 +3913,12 @@ class DemoPublicDataService:
             cached = self._battle_list_cache.get(cache_key)
             if cached is not None and cached[0] > now:
                 return cached[1]
-        battles = self._query_uploaded_battles(boss_slug=boss_slug, summary_only=summary_only)
-        with self._battle_list_cache_lock:
+            self._battle_list_cache.pop(cache_key, None)
+            # 缓存锁同时作为单航班锁。旧实现会在冷缓存并发时让每个请求都构建
+            # 一份全量 DemoBattle/Pydantic 图，短时间把 RSS 推到 MemoryMax。
+            battles = self._query_uploaded_battles(boss_slug=boss_slug, summary_only=summary_only)
             self._battle_list_cache[cache_key] = (now + BATTLE_LIST_CACHE_TTL_SECONDS, battles)
-        return battles
+            return battles
 
     def _query_uploaded_battles(self, boss_slug: str | None = None, *, summary_only: bool = False) -> list[DemoBattle]:
         try:
@@ -2933,6 +3954,10 @@ class DemoPublicDataService:
                             UploadedBattleRecord.timer_end_seen,
                             UploadedBattleRecord.official_timer_start_seen,
                             UploadedBattleRecord.official_timer_end_seen,
+                            UploadedBattleRecord.official_timer_observed_elapsed_ms,
+                            UploadedBattleRecord.packet_timer_elapsed_ms,
+                            UploadedBattleRecord.timer_integrity_ok,
+                            UploadedBattleRecord.timer_integrity_reasons_json,
                             UploadedBattleRecord.timer_start_inferred,
                             UploadedBattleRecord.timer_window_valid,
                             UploadedBattleRecord.rdps_preflight_ok,
@@ -2961,12 +3986,227 @@ class DemoPublicDataService:
         *,
         metric: Metric = "dps",
     ) -> list[DemoBattle]:
-        battles = self._list_uploaded_battle_summaries(boss_slug=boss_slug)
+        # 轻量测试 service 会覆盖底层列表方法，继续走原有内存口径。
+        if "_list_uploaded_battles" in self.__dict__:
+            battles = self._list_uploaded_battle_summaries(boss_slug=boss_slug)
+            if metric == "rdps":
+                battles = [battle for battle in battles if _rdps_ranking_eligible(
+                    battle.parser_version, battle.rules_version, battle.rdps_strict_ok,
+                )]
+            return self._best_public_battles_by_account(battles)
+
+        if not hasattr(self, "_public_ranked_cache"):
+            self._public_ranked_cache = {}
+        if not hasattr(self, "_public_ranked_cache_lock"):
+            self._public_ranked_cache_lock = threading.Lock()
+        cache_key = (boss_slug, metric)
+        now = monotonic()
+        with self._public_ranked_cache_lock:
+            cached = self._public_ranked_cache.get(cache_key)
+            if cached is not None and cached[0] > now:
+                return cached[1]
+            ranked = self._compute_public_ranked_battles(boss_slug=boss_slug, metric=metric)
+            self._public_ranked_cache[cache_key] = (
+                monotonic() + BATTLE_LIST_CACHE_TTL_SECONDS,
+                ranked,
+            )
+            return ranked
+
+    def _compute_public_ranked_battles(
+        self,
+        *,
+        boss_slug: str | None,
+        metric: Metric,
+    ) -> list[DemoBattle]:
+        battles = self._query_public_ranking_metadata(boss_slug=boss_slug)
         if metric == "rdps":
-            battles = [battle for battle in battles if battle.rdps_strict_ok is True]
-        return self._best_public_battles_by_account(battles)
+            battles = [battle for battle in battles if _rdps_ranking_eligible(
+                battle.parser_version, battle.rules_version, battle.rdps_strict_ok,
+            )]
+        if boss_slug is not None:
+            ranked_metadata = self._best_public_battles_by_account(battles)
+        else:
+            metadata_by_boss: dict[str, list[DemoBattle]] = {}
+            for battle in battles:
+                metadata_by_boss.setdefault(battle.boss_slug, []).append(battle)
+            ranked_metadata = [
+                battle
+                for group in metadata_by_boss.values()
+                for battle in self._best_public_battles_by_account(group)
+            ]
+        hydrated = self._query_uploaded_battle_summaries_by_ids(
+            {battle.battle_id for battle in ranked_metadata}
+        )
+        hydrated_by_id = {battle.battle_id: battle for battle in hydrated}
+        return [
+            hydrated_by_id[battle.battle_id]
+            for battle in ranked_metadata
+            if battle.battle_id in hydrated_by_id
+        ]
+
+    def _query_public_ranking_metadata(self, *, boss_slug: str | None) -> list[DemoBattle]:
+        statement = select(
+            UploadedBattleRecord.id,
+            UploadedBattleRecord.uploader_user_id,
+            UploadedBattleRecord.uploader_nickname,
+            UploadedBattleRecord.boss_key,
+            UploadedBattleRecord.boss_slug,
+            UploadedBattleRecord.boss_name,
+            UploadedBattleRecord.dungeon_name,
+            UploadedBattleRecord.duration_ms,
+            UploadedBattleRecord.battle_start_at,
+            UploadedBattleRecord.battle_end_at,
+            UploadedBattleRecord.total_damage,
+            UploadedBattleRecord.total_dps,
+            UploadedBattleRecord.parser_version,
+            UploadedBattleRecord.rules_version,
+            UploadedBattleRecord.battle_fingerprint,
+            UploadedBattleRecord.time_source,
+            UploadedBattleRecord.official_timer_end_seen,
+            UploadedBattleRecord.official_timer_observed_elapsed_ms,
+            UploadedBattleRecord.packet_timer_elapsed_ms,
+            UploadedBattleRecord.timer_integrity_ok,
+            UploadedBattleRecord.timer_integrity_reasons_json,
+            UploadedBattleRecord.rdps_strict_ok,
+            UploadedBattleRecord.contract_tag_score,
+            UploadedBattleRecord.contract_tags_json,
+            UploadedBattleRecord.visibility,
+            UploadedBattleRecord.status,
+            UploadedBattleRecord.clear_flag,
+        ).where(
+            UploadedBattleRecord.status == "valid",
+            UploadedBattleRecord.visibility == "public",
+            UploadedBattleRecord.clear_flag.is_(True),
+            UploadedBattleRecord.official_timer_end_seen.is_(True),
+            UploadedBattleRecord.time_source == "game_timer",
+        )
+        if boss_slug is not None:
+            statement = statement.where(or_(*self._uploaded_battle_boss_filter_conditions(boss_slug)))
+        try:
+            with SessionLocal() as session:
+                rows = session.execute(statement).all()
+        except OperationalError:
+            return []
+
+        battles: list[DemoBattle] = []
+        for row in rows:
+            try:
+                battle_start_at = datetime.fromisoformat(row.battle_start_at)
+                battle_end_at = datetime.fromisoformat(row.battle_end_at)
+            except (TypeError, ValueError):
+                continue
+            canonical_slug = self._canonical_uploaded_boss_slug(row.boss_slug, row.boss_key)
+            contract_tag_score, contract_tags = _contract_fields_for_boss(
+                canonical_slug,
+                row.contract_tag_score,
+                _load_contract_tags(row.contract_tags_json),
+            )
+            battles.append(
+                DemoBattle(
+                    battle_id=row.id,
+                    uploader_user_id=row.uploader_user_id,
+                    uploader_nickname=row.uploader_nickname,
+                    boss_key=row.boss_key,
+                    boss_slug=canonical_slug,
+                    boss_name=row.boss_name,
+                    dungeon_name=row.dungeon_name,
+                    duration_ms=row.duration_ms,
+                    battle_start_at=battle_start_at,
+                    battle_end_at=battle_end_at,
+                    total_damage=row.total_damage,
+                    total_dps=row.total_dps,
+                    roster=[],
+                    participants=[],
+                    timeline_events=[],
+                    role_skill_stats=[],
+                    parser_version=row.parser_version,
+                    rules_version=row.rules_version,
+                    battle_fingerprint=row.battle_fingerprint,
+                    time_source=row.time_source,
+                    official_timer_end_seen=row.official_timer_end_seen,
+                    official_timer_observed_elapsed_ms=row.official_timer_observed_elapsed_ms,
+                    packet_timer_elapsed_ms=row.packet_timer_elapsed_ms,
+                    timer_integrity_ok=row.timer_integrity_ok,
+                    timer_integrity_reasons=(
+                        json.loads(row.timer_integrity_reasons_json)
+                        if row.timer_integrity_reasons_json
+                        else []
+                    ),
+                    rdps_strict_ok=row.rdps_strict_ok,
+                    contract_tag_score=contract_tag_score,
+                    contract_tags=contract_tags,
+                    clear_flag=row.clear_flag,
+                    visibility=row.visibility,
+                    status=row.status,
+                )
+            )
+        return battles
+
+    def _query_uploaded_battle_summaries_by_ids(self, battle_ids: set[str]) -> list[DemoBattle]:
+        if not battle_ids:
+            return []
+        try:
+            with SessionLocal() as session:
+                statement = (
+                    select(UploadedBattleRecord)
+                    .where(UploadedBattleRecord.id.in_(battle_ids))
+                    .options(
+                        load_only(
+                            UploadedBattleRecord.id,
+                            UploadedBattleRecord.uploader_user_id,
+                            UploadedBattleRecord.uploader_nickname,
+                            UploadedBattleRecord.boss_key,
+                            UploadedBattleRecord.boss_slug,
+                            UploadedBattleRecord.boss_name,
+                            UploadedBattleRecord.dungeon_name,
+                            UploadedBattleRecord.duration_ms,
+                            UploadedBattleRecord.battle_start_at,
+                            UploadedBattleRecord.battle_end_at,
+                            UploadedBattleRecord.total_damage,
+                            UploadedBattleRecord.total_dps,
+                            UploadedBattleRecord.clear_flag,
+                            UploadedBattleRecord.roster_json,
+                            UploadedBattleRecord.participants_json,
+                            UploadedBattleRecord.parser_version,
+                            UploadedBattleRecord.rules_version,
+                            UploadedBattleRecord.battle_fingerprint,
+                            UploadedBattleRecord.time_source,
+                            UploadedBattleRecord.timeline_zero_source,
+                            UploadedBattleRecord.timer_start_seen,
+                            UploadedBattleRecord.timer_end_seen,
+                            UploadedBattleRecord.official_timer_start_seen,
+                            UploadedBattleRecord.official_timer_end_seen,
+                            UploadedBattleRecord.official_timer_observed_elapsed_ms,
+                            UploadedBattleRecord.packet_timer_elapsed_ms,
+                            UploadedBattleRecord.timer_integrity_ok,
+                            UploadedBattleRecord.timer_integrity_reasons_json,
+                            UploadedBattleRecord.timer_start_inferred,
+                            UploadedBattleRecord.timer_window_valid,
+                            UploadedBattleRecord.rdps_preflight_ok,
+                            UploadedBattleRecord.rdps_strict_ok,
+                            UploadedBattleRecord.rdps_preflight_blocker_count,
+                            UploadedBattleRecord.boss_identity_source,
+                            UploadedBattleRecord.dungeon_context_id,
+                            UploadedBattleRecord.dungeon_identity_source,
+                            UploadedBattleRecord.loadout_fallback_used,
+                            UploadedBattleRecord.contract_tag_score,
+                            UploadedBattleRecord.contract_tags_json,
+                            UploadedBattleRecord.visibility,
+                            UploadedBattleRecord.status,
+                        )
+                    )
+                )
+                rows = session.execute(statement).scalars().all()
+        except OperationalError:
+            return []
+        return [self._record_to_uploaded_battle(row, summary_only=True) for row in rows]
 
     def _list_public_ranked_battles_by_boss(self) -> dict[str, list[DemoBattle]]:
+        if "_list_uploaded_battles" not in self.__dict__:
+            battles_by_boss: dict[str, list[DemoBattle]] = {}
+            for battle in self._list_public_ranked_battles(metric="dps"):
+                battles_by_boss.setdefault(battle.boss_slug, []).append(battle)
+            return battles_by_boss
         battles_by_boss: dict[str, list[DemoBattle]] = {}
         for battle in self._list_uploaded_battle_summaries():
             battles_by_boss.setdefault(battle.boss_slug, []).append(battle)
@@ -3031,8 +4271,10 @@ class DemoPublicDataService:
             battle
             for battle in battles
             if battle.official_timer_end_seen is True
+            and battle.boss_slug not in REVIEWED_NON_RANKING_DUNGEON_SLUGS
             and battle.time_source == "game_timer"
             and _parser_version_number(battle.parser_version) >= RANKING_MIN_PARSER_VERSION
+            and self._timer_integrity_eligible_for_ranking(battle)
         ]
         # (3) Boss 实际击杀校验：剔除伤害远低于同 boss 正常通关水平的“假通关”（boss 没真打死）。
         incomplete_ids = self._incomplete_clear_battle_ids(eligible)
@@ -3047,13 +4289,23 @@ class DemoPublicDataService:
         return sorted(best_by_account.values(), key=self._public_battle_sort_key)
 
     @staticmethod
-    def _incomplete_clear_battle_ids(eligible: list[DemoBattle]) -> set[str]:
+    def _timer_integrity_eligible_for_ranking(battle: DemoBattle) -> bool:
+        if battle.boss_slug == CRISIS_CONTRACT_BOSS_SLUG:
+            return True
+        if _parser_version_number(battle.parser_version) >= 47:
+            return battle.timer_integrity_ok is True
+        return True
+
+    @staticmethod
+    def _incomplete_clear_battle_ids(
+        eligible: list[DemoBattle] | list[CharacterStatisticsBattleRow],
+    ) -> set[str]:
         """按 boss 分组，对固定血量 boss（伤害紧密聚集）剔除伤害不足中位数 60% 的假通关。
 
         判据见 RANKING_* 常量注释：固定血量 boss 正常通关伤害≈血量、紧密聚集（p25/median≥0.95），
         伤害显著偏低=没真打死；伤害离散的 boss（混桶/多目标）不套用，避免误伤正常低伤记录。
         """
-        by_boss: dict[str, list[DemoBattle]] = {}
+        by_boss: dict[str, list[DemoBattle | CharacterStatisticsBattleRow]] = {}
         for battle in eligible:
             by_boss.setdefault(battle.boss_slug, []).append(battle)
         incomplete: set[str] = set()
@@ -3155,6 +4407,15 @@ class DemoPublicDataService:
             timer_end_seen=row.timer_end_seen,
             official_timer_start_seen=row.official_timer_start_seen,
             official_timer_end_seen=row.official_timer_end_seen,
+            official_timer_observed_elapsed_ms=row.official_timer_observed_elapsed_ms,
+            packet_timer_elapsed_ms=row.packet_timer_elapsed_ms,
+            timer_integrity_ok=row.timer_integrity_ok,
+            timer_integrity_reasons=(
+                json.loads(row.timer_integrity_reasons_json)
+                if row.timer_integrity_reasons_json
+                else []
+            ),
+            timer_evidence=(json.loads(row.timer_evidence_json) if not summary_only and row.timer_evidence_json else None),
             timer_start_inferred=row.timer_start_inferred,
             timer_window_valid=row.timer_window_valid,
             rdps_preflight_ok=row.rdps_preflight_ok,
@@ -3211,6 +4472,11 @@ class DemoPublicDataService:
             timer_end_seen=battle.timer_end_seen,
             official_timer_start_seen=battle.official_timer_start_seen,
             official_timer_end_seen=battle.official_timer_end_seen,
+            official_timer_observed_elapsed_ms=battle.official_timer_observed_elapsed_ms,
+            packet_timer_elapsed_ms=battle.packet_timer_elapsed_ms,
+            timer_integrity_ok=battle.timer_integrity_ok,
+            timer_integrity_reasons_json=_dump_json(battle.timer_integrity_reasons),
+            timer_evidence_json=_dump_json(battle.timer_evidence) if battle.timer_evidence is not None else None,
             timer_start_inferred=battle.timer_start_inferred,
             timer_window_valid=battle.timer_window_valid,
             rdps_preflight_ok=battle.rdps_preflight_ok,

@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>效果监控</title>
+<style>
+:root{color-scheme:dark;font:13px "Microsoft YaHei",sans-serif;color:#e8eff0}*{box-sizing:border-box}body{margin:0;background:rgba(13,25,32,.92);padding:14px}header{display:flex;align-items:center;gap:10px}h1{font-size:16px;margin:0;flex:1}small,.muted{color:#94aab3}#state{font-size:11px;color:#e2c16d}summary{cursor:pointer;color:#b7cbd2;padding:10px 0}details{border-bottom:1px solid #344a54;margin-bottom:12px}label{display:block;margin:8px 0}input,select,button{font:inherit;color:inherit;background:#152b35;border:1px solid #425d69;border-radius:4px;padding:6px;max-width:100%}select,input[type=search]{width:100%}input[type=checkbox]{accent-color:#e3be65}button{cursor:pointer}#choices{height:100px;margin-top:6px}#picked{display:flex;flex-wrap:wrap;gap:5px;margin:6px 0}#picked button{font-size:11px;padding:3px 6px}#target-picker{margin-top:6px}#list{display:grid;gap:15px}.target-group{padding-top:2px}.target-title{display:flex;align-items:center;gap:8px;margin:0 0 9px;font-size:13px;font-weight:600;color:#dae6eb}.target-title span{font-size:10px;font-weight:400;color:#8ca6b2}.target-body{display:grid;gap:9px}.group-title{font-size:10px;color:#91a9b5;margin-bottom:5px}.cards{display:flex;flex-wrap:wrap;gap:5px}.effect{position:relative;display:flex;flex-direction:column;align-items:center;justify-content:start;width:62px;min-height:67px;padding:5px 3px;border:1px solid #3c525d;border-radius:5px;background:#1b303a;cursor:help}.effect:focus-visible{outline:2px solid #e0bd68;outline-offset:2px}.effect.off{opacity:.42}.icon{width:32px;height:32px;object-fit:contain}.placeholder{display:grid;place-items:center;background:#304954;border-radius:4px;color:#d1bd80;font-size:18px}.name{width:100%;margin-top:4px;font-size:10px;line-height:1.4;text-align:center;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;word-break:break-word}.meta{font-size:9px;color:#9db3bd;margin-top:2px;white-space:nowrap}.observation-count{color:#e1c67e}#empty{padding:23px 8px;text-align:center;color:#a4bac4}footer{font-size:10px;color:#829ca7;margin-top:12px;line-height:1.7}.help{font-size:11px;color:#92aab5;line-height:1.6}.row{display:flex;gap:7px;align-items:center}.row>*{flex:1}[hidden]{display:none!important}
+.effect.state-unknown{border-style:dashed;border-color:#77858d;background:#26323a}.effect.state-unknown .icon{filter:grayscale(.85);opacity:.7}.effect.state-unknown .effect-status{color:#d4dce0}.effect.state-disabled{border-color:#52616b;background:#19242c}.effect.state-disabled .icon{filter:grayscale(1);opacity:.4}.effect.state-disabled .name,.effect.state-disabled .effect-status{color:#abb8c0}.effect.state-active .effect-status{color:#b2d7bb}
+.skill-progress{font-size:12px;color:#b8c6cc}.presentation-note{font-size:9px;color:#aebdc5}
+</style>
+<header><h1>效果监控</h1><span id="state">等待采集</span></header>
+<details id="settings" open>
+ <summary>监控设置</summary>
+ <label>监控目标<select id="mode"><option value="party">本队角色</option><option value="all">所有已识别目标</option><option value="character">指定角色</option><option value="target">指定目标（含怪物／首领）</option></select></label>
+ <select id="target-picker" hidden aria-label="选择目标"></select>
+ <label>显示范围<select id="display-mode"><option value="game-icons">游戏图标效果</option><option value="all">全部观测</option></select></label>
+ <div class="help">游戏图标效果依据游戏原有的显示配置筛选。全部观测保留内部效果和未识别 ID，不据此猜测增益或减益。</div>
+ <label>效果目录<input id="search" type="search" placeholder="搜索配置说明或准确 ID；目录始终保留全部效果"></label>
+ <select id="choices" size="4" aria-label="效果列表"></select>
+ <div class="row"><button id="add">加入监控</button><button id="all">监控全部效果</button></div>
+ <label>准确效果 ID<div class="row"><input id="exact-id" maxlength="256" placeholder="粘贴检查器中的准确 ID" aria-label="准确效果 ID"><button id="add-id">按 ID 添加</button></div></label>
+ <div id="entry-message" class="help" role="status">未识别 ID 可切换“全部观测”查看，无需根据名称猜测。</div>
+ <div id="picked"></div><div id="catalog-note" class="help">等待目录</div>
+ <label><input id="hide-unknown" type="checkbox"> 隐藏未识别 ID</label>
+ <label><input id="hide-unknown-state" type="checkbox"> 隐藏状态未知项</label>
+ <label><input id="hide-disabled" type="checkbox"> 日常隐藏已停用项</label>
+ <label><input id="hide-inactive" type="checkbox"> 日常隐藏未观测项</label>
+ <div class="help">展开设置时可查看已停用项和已选效果占位。状态未知不代表正在生效；未识别 ID 与状态未知可分别筛选。</div>
+</details>
+<div id="empty">等待新的游戏数据</div><main id="list"></main>
+<footer id="coverage">仅显示准确观测到的效果；空列表不代表确定没有效果。未知层数和时长不会推算。</footer>
+<script>
+(() => {
+'use strict';
+const $ = id => document.getElementById(id);
+const defaults = {mode:'party',target:'',displayMode:'game-icons',effectIds:[],hideUnknown:false,hideUnknownState:false,hideDisabled:true,hideInactive:true,editing:true};
+let config = {...defaults}, catalog = [], catalogIcons = Object.create(null), aliases = new Map(), targets = [], envelope = null, cancelEffects = null;
+const observedUnknown = new Map();
+const cancels = [];
+try { const saved=JSON.parse(localStorage.getItem('endfield-monitor.v1')||'null'); if(saved && typeof saved==='object')config={...defaults,...saved}; } catch {}
+if(!['party','all','character','target'].includes(config.mode))config.mode='party';
+if(!['game-icons','all'].includes(config.displayMode))config.displayMode='game-icons';
+config.effectIds=Array.isArray(config.effectIds)?[...new Set(config.effectIds.filter(x=>typeof x==='string'&&x.trim()&&x.length<=256&&!/[\x00-\x1f\x7f]/.test(x)).map(x=>x.trim()))].slice(0,512):[];
+config.target=typeof config.target==='string'?config.target:'';
+const save=()=>{try{localStorage.setItem('endfield-monitor.v1',JSON.stringify(config));}catch{}};
+const shortLabel=row=>row?.label || `${row?.canonicalId?'未命名效果':'未识别效果'} · ${row?.canonicalId || row?.effectId || ''}`;
+const runtimeMetadata=row=>row.canonicalId?aliases.get(row.canonicalId)||{}:{};
+const metadataValue=(row,key)=>row[key]??runtimeMetadata(row)[key];
+const gameIcon=row=>Boolean(row.canonicalId&&metadataValue(row,'hasIcon')===true);
+const effectState=row=>row.state==='not-observed'?'not-observed':row.state!=='observed-open'?'unavailable':row.enabled===true?'active':row.enabled===false?'disabled':'unknown';
+const effectStateLabel={active:'已确认生效',disabled:'已停用',unknown:'状态未知','not-observed':'未观测到'};
+function effectImage(row){
+ const inline=metadataValue(row,'icon'),key=metadataValue(row,'iconKey');
+ const image=typeof inline==='string'?inline:typeof key==='string'&&Object.hasOwn(catalogIcons,key)?catalogIcons[key]:null;
+ return typeof image==='string'&&/^data:image\/(?:png|webp);base64,[A-Za-z0-9+/=]+$/.test(image)?image:null;
+}
+function visibleObservation(row,settingsOpen){
+ const state=effectState(row);
+ return state!=='unavailable'&&state!=='not-observed'&&(!config.hideUnknownState||state!=='unknown')&&(!config.hideDisabled||settingsOpen||state!=='disabled')&&(!config.hideUnknown||Boolean(row.canonicalId))&&(config.displayMode==='all'||gameIcon(row));
+}
+const positiveGroups=new Set(['KeywordBuff','AttentionBuff','CommonCharBuff']);
+const negativeGroups=new Set(['KeywordDebuff','AttentionDebuff','CommonCharDebuff']);
+function iconGroup(row){
+ if(!row.canonicalId||metadataValue(row,'classificationSource')!=='official-icon-priority-group')return 'other';
+ const group=metadataValue(row,'uiGroup');
+ return positiveGroups.has(group)?'buff':negativeGroups.has(group)?'debuff':'other';
+}
+function refreshCatalog(){
+ const query=$('search').value.trim().toLowerCase(); const found=[...catalog,...observedUnknown.values()].filter(row=>!query || [row.effectId,row.canonicalId,row.label,row.description,...(row.numericIds||[])].some(v=>typeof v==='string'&&v.toLowerCase().includes(query)));
+ const fragment=document.createDocumentFragment();
+ for(const row of found.slice(0,100)){const option=document.createElement('option');option.value=row.effectId;option.textContent=shortLabel(row);fragment.append(option);}
+ $('choices').replaceChildren(fragment);$('catalog-note').textContent=`目录 ${catalog.length} 项 · 匹配 ${found.length} 项${found.length>100?'，输入更多内容缩小范围':''}`;
+ const picked=document.createDocumentFragment();
+ for(const id of config.effectIds){const button=document.createElement('button');button.textContent=shortLabel(aliases.get(id)||{effectId:id})+' ×';button.onclick=()=>{config.effectIds=config.effectIds.filter(v=>v!==id);save();refreshCatalog();subscribeEffects();};picked.append(button);}
+ $('picked').replaceChildren(picked);
+}
+function refreshTargets(){
+ const picker=$('target-picker');picker.hidden=!['character','target'].includes(config.mode);
+ const fragment=document.createDocumentFragment();const first=document.createElement('option');first.value='';first.textContent='请选择明确目标';fragment.append(first);
+ const seen=new Set();
+ for(const target of targets){
+  const id=config.mode==='character'?target.templateId:target.id;
+  if(!id || (config.mode==='character'&&target.kind!=='party') || seen.has(id))continue;seen.add(id);
+  const option=document.createElement('option');option.value=id;option.textContent=(target.label||'未命名目标')+(config.mode==='target'?` · ${target.id}`:'');fragment.append(option);
+ }
+ if(config.target&&!seen.has(config.target)){const option=document.createElement('option');option.value=config.target;option.textContent='所选目标尚未观测到';fragment.append(option);}
+ picker.replaceChildren(fragment);picker.value=config.target;
+}
+function subscribeEffects(){
+ if(cancelEffects)cancelEffects();envelope=null;render();
+ const filter={target:config.mode==='target'?'all':config.mode,effectIds:config.effectIds,onlyGameIcons:config.displayMode==='game-icons'};
+ if(config.mode==='target')filter.targetIds=config.target?[config.target]:[];
+ if(config.mode==='character')filter.characterIds=config.target?[config.target]:[];
+ if(['target','character'].includes(config.mode)&&!config.target){$('empty').textContent='请先选择监控目标';return;}
+ cancelEffects=window.endfieldOverlay.subscribe({topic:'effects.actual.v1',filter},value=>{envelope=value;render();});
+}
+function foldObservations(rows){
+ const groups=new Map();
+ for(const row of rows){
+  const identity=row.canonicalId?['canonical',row.canonicalId]:['raw',row.effectId];
+  const key=JSON.stringify([row.namespace||'',row.targetId??null,...identity,effectState(row)]);
+  if(!groups.has(key))groups.set(key,{row,rows:[],key});
+  groups.get(key).rows.push(row);
+ }
+ return [...groups.values()];
+}
+function tooltip(group,target){
+ const row=group.row,metadata=runtimeMetadata(row),lines=[];
+ const label=metadataValue(row,'label'),description=metadataValue(row,'description'),labelSource=metadataValue(row,'labelSource');
+ if(label)lines.push(labelSource==='official-config-summary'?`配置摘要：${label}`:label);
+ if(typeof description==='string'&&description)lines.push(`配置说明：${description}`);
+ if(labelSource==='official-config-summary')lines.push('以上为游戏配置说明，不是已确认的官方效果专名。');
+ if(!effectImage(row)&&metadataValue(row,'iconPresentation')==='skill-button-progress')lines.push('游戏将此效果显示在技能按钮进度中，未提供独立效果图标；当前进度未知，不绘制推测进度。');
+ lines.push(`效果 ID：${row.canonicalId||row.effectId||'未知'}`,`目标：${target?.label||row.targetId||'未确认'}`,`数据来源：${row.namespace||'目录占位'}`);
+ if(row.state==='not-observed'){lines.push('当前未观测到开放实例；仅在设置中保留占位。');return lines.join('\n');}
+ lines.push(`观测 ${group.rows.length} 条；观测条数不代表层数，也不证明效果仍在持续生效。`);
+ const rawIds=[...new Set(group.rows.map(value=>value.effectId).filter(Boolean))];
+ if(rawIds.some(value=>value!==row.canonicalId))lines.push(`原始 ID：${rawIds.slice(0,8).join('、')}${rawIds.length>8?'…':''}`);
+ for(const value of group.rows.slice(0,8)){
+  const instance=value.instanceId||value.slotId||'未知';
+  const stacks=value.stackCount==null?'层数未知':`${value.stackCount} 层`;
+  const duration=value.remainingMs==null?'剩余时长未知':`剩余 ${(value.remainingMs/1000).toFixed(1)} 秒`;
+  lines.push(`实例 ${instance}：${effectStateLabel[effectState(value)]||'状态不可用'}；${stacks}；${duration}`);
+ }
+ if(group.rows.length>8)lines.push(`另有 ${group.rows.length-8} 条，完整记录见数据检查器。`);
+ if(!label&&!description)lines.push(metadata.canonicalId?'尚无可用的中文配置说明。':'此 ID 尚未与当前官方效果目录建立准确关联。');
+ return lines.join('\n');
+}
+function makeCard(group,target){
+ const row=group.row,card=document.createElement('article');
+ const state=effectState(row);
+ card.className='effect state-'+state+(state==='not-observed'?' off':'');card.tabIndex=0;
+ card.dataset.effectState=state;
+ card.dataset.effectId=row.effectId||'';card.dataset.canonicalId=row.canonicalId||'';
+ card.dataset.instanceId=group.rows.length===1?(row.instanceId||''):'';
+ card.dataset.namespace=row.namespace||'';card.dataset.observationCount=row.state==='not-observed'?'0':String(group.rows.length);
+ const image=effectImage(row),progressPresentation=!image&&metadataValue(row,'iconPresentation')==='skill-button-progress',icon=document.createElement(image?'img':'div');
+ icon.className='icon'+(image?'':' placeholder')+(progressPresentation?' skill-progress':'');if(image){icon.src=image;icon.alt='';}else icon.textContent=progressPresentation?'进度':'?';
+ card.append(icon);
+ const text=metadataValue(row,'label')||(image?'':row.canonicalId?'效果':'未识别');
+ if(text){const label=document.createElement('div');label.className='name';label.textContent=text;card.append(label);}
+ if(progressPresentation&&text!=='技能按钮进度'){const note=document.createElement('div');note.className='meta presentation-note';note.textContent='技能按钮进度';card.append(note);}
+ const status=document.createElement('div');status.className='meta effect-status';status.textContent=effectStateLabel[state]||'状态不可用';card.append(status);
+ card.title=tooltip(group,target);card.setAttribute('aria-label',card.title);
+ return card;
+}
+function render(){
+ const list=$('list');list.replaceChildren();$('empty').hidden=false;
+ if(!envelope || envelope.state!=='ready' || !envelope.data){$('state').textContent='等待采集';$('empty').textContent=envelope?.reason==='window-payload-limit'?'效果资料过多，请缩小目标或效果筛选范围':'连接不可用，旧数据已清空';return;}
+ const data=envelope.data;
+ if(data.selectionState==='unavailable'){$('state').textContent='目标未确认';$('empty').textContent='尚无足够数据确认所选目标';return;}
+ $('state').textContent='已连接 · 部分观测';
+ let newUnknown=false;for(const row of data.effects||[])if(!row.canonicalId&&!observedUnknown.has(row.effectId)){observedUnknown.set(row.effectId,{effectId:row.effectId,label:null});newUnknown=true;}if(newUnknown)refreshCatalog();
+ let rows=(data.effects||[]).filter(row=>visibleObservation(row,$('settings').open));
+ const selected=new Set((data.effects||[]).filter(row=>row.state==='observed-open').flatMap(row=>[row.effectId,row.canonicalId].filter(Boolean)));
+ if($('settings').open || !config.hideInactive){
+  for(const id of config.effectIds)if(!selected.has(id)){
+   const metadata=aliases.get(id)||{effectId:id};
+   if((!config.hideUnknown||metadata.canonicalId)&&(config.displayMode==='all'||gameIcon(metadata)))rows.push({...metadata,key:'placeholder:'+id,state:'not-observed',targetId:null});
+  }
+ }
+ const groups=foldObservations(rows),byTarget=new Map();let shown=0;
+ for(const group of groups){
+  const key=group.row.state==='not-observed'?'__settings_placeholder__':group.row.targetId??'__unknown_target__';
+  if(!byTarget.has(key))byTarget.set(key,[]);byTarget.get(key).push(group);
+ }
+ const names={buff:'增益图标',debuff:'减益图标',other:config.displayMode==='game-icons'?'其他图标':'其他观测'};
+ for(const [targetId,targetGroups] of byTarget){
+  const target=targets.find(value=>value.id===targetId),section=document.createElement('section'),heading=document.createElement('h2'),body=document.createElement('div');
+  section.className='target-group';section.dataset.targetId=targetId;heading.className='target-title';body.className='target-body';
+  heading.textContent=target?.label||(targetId==='__settings_placeholder__'?'设置占位':targetId==='__unknown_target__'?'目标未确认':`目标 ${targetId}`);
+  const count=document.createElement('span');count.textContent=`${targetGroups.length} 项`;heading.append(count);
+  for(const [kind,title] of Object.entries(names)){
+   const grouped=targetGroups.filter(group=>iconGroup(group.row)===kind);if(!grouped.length)continue;
+   const category=document.createElement('div'),caption=document.createElement('div'),cards=document.createElement('div');
+   caption.className='group-title';caption.textContent=`${title} · ${grouped.length}`;cards.className='cards';
+   for(const group of grouped.slice(0,128-shown)){cards.append(makeCard(group,target));shown++;}
+   category.append(caption,cards);body.append(category);if(shown>=128)break;
+  }
+  section.append(heading,body);list.append(section);if(shown>=128)break;
+ }
+ $('empty').hidden=groups.length>0;$('empty').textContent=config.displayMode==='game-icons'?'尚未观测到符合筛选的游戏图标效果，可切换“全部观测”查看其他记录':config.hideUnknown?'当前筛选下没有已识别效果':'尚未观测到符合筛选的效果';
+ const filtered=Number.isInteger(data.gameIconFilteredCount)&&data.gameIconFilteredCount>0?`另有 ${data.gameIconFilteredCount} 条观测记录不在游戏图标范围。`:'';
+ $('coverage').textContent=`仅已观测；未列出不代表不存在。${config.displayMode==='game-icons'?filtered:''}${groups.length>128?`显示前128项，共${groups.length}项。`:''}${data.omittedOpenCount?'部分记录因容量限制未保留。':''}观测条数不是层数；层数、时长及配置说明见图标详情，未知值不推算。`;
+}
+$('mode').value=config.mode;$('display-mode').value=config.displayMode;$('hide-unknown').checked=Boolean(config.hideUnknown);$('hide-unknown-state').checked=Boolean(config.hideUnknownState);$('hide-disabled').checked=Boolean(config.hideDisabled);$('hide-inactive').checked=Boolean(config.hideInactive);$('settings').open=config.editing!==false;
+$('mode').onchange=()=>{config.mode=$('mode').value;config.target='';save();refreshTargets();subscribeEffects();};
+$('target-picker').onchange=()=>{config.target=$('target-picker').value;save();subscribeEffects();};
+$('display-mode').onchange=()=>{config.displayMode=$('display-mode').value;save();subscribeEffects();};
+$('search').oninput=refreshCatalog;
+$('add').onclick=()=>{
+ const id=$('choices').value;if(!id||config.effectIds.includes(id))return;
+ if(config.effectIds.length>=512){$('entry-message').textContent='最多选择 512 个效果 ID，请先移除部分选项。';return;}
+ config.effectIds.push(id);save();refreshCatalog();subscribeEffects();
+ $('entry-message').textContent=config.displayMode==='game-icons'&&aliases.get(id)?.hasIcon!==true?'已加入监控；该目录项未配置游戏图标，请切换“全部观测”查看。':'已加入监控。';
+};
+$('add-id').onclick=()=>{
+ const id=$('exact-id').value.trim();
+ if(!id||id.length>256||/[\x00-\x1f\x7f]/.test(id)){$('entry-message').textContent='请输入不超过 256 个字符的准确 ID。';return;}
+ if(config.effectIds.length>=512&&!config.effectIds.includes(id)){$('entry-message').textContent='最多选择 512 个效果 ID，请先移除部分选项。';return;}
+ if(!config.effectIds.includes(id))config.effectIds.push(id);
+ $('exact-id').value='';save();refreshCatalog();subscribeEffects();
+ $('entry-message').textContent=config.displayMode==='game-icons'&&aliases.get(id)?.hasIcon!==true?'已添加准确 ID；该项尚无已确认的游戏图标配置，请切换“全部观测”查看。':'已添加准确 ID。';
+};
+$('all').onclick=()=>{config.effectIds=[];save();refreshCatalog();subscribeEffects();};
+$('hide-unknown').onchange=()=>{config.hideUnknown=$('hide-unknown').checked;save();render();};
+$('hide-unknown-state').onchange=()=>{config.hideUnknownState=$('hide-unknown-state').checked;save();render();};
+$('hide-disabled').onchange=()=>{config.hideDisabled=$('hide-disabled').checked;save();render();};
+$('hide-inactive').onchange=()=>{config.hideInactive=$('hide-inactive').checked;save();render();};
+$('settings').ontoggle=()=>{config.editing=$('settings').open;save();render();};
+if(!window.endfieldOverlay){$('state').textContent='未连接客户端';$('empty').textContent='请在客户端的悬浮窗设置中添加此 HTML 页面';return;}
+cancels.push(window.endfieldOverlay.subscribe({topic:'effects.catalog.v1'},value=>{if(value.state!=='ready')return;catalog=value.data?.effects||[];catalogIcons=value.data?.icons||Object.create(null);aliases=new Map();for(const row of catalog)for(const id of [row.effectId,row.canonicalId])if(id)aliases.set(id,row);refreshCatalog();render();}));
+cancels.push(window.endfieldOverlay.subscribe({topic:'targets.current.v1'},value=>{targets=value.state==='ready'?(value.data?.targets||[]):[];refreshTargets();render();}));
+subscribeEffects();
+window.addEventListener('pagehide',()=>{if(cancelEffects)cancelEffects();for(const cancel of cancels)cancel();});
+})();
+</script>
+</html>

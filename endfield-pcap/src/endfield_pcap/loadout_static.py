@@ -17,6 +17,21 @@ def _read_json(path: Path) -> Any:
         return None
 
 
+def _catalog_roots(base: Path, kind: str) -> tuple[Path, ...]:
+    """Return the legacy AKEData and current local-table item roots.
+
+    AKEData is still the richest source for older items, while the local table
+    is the authoritative source immediately after a game update.  Keeping the
+    two sources here lets a newly added weapon/equipment piece be displayed
+    before the next AKEData mirror is available.
+    """
+    roots: list[Path] = [base / "data" / "akedata" / kind / "items"]
+    local_root = base / "data" / "local_tables" / kind / "items"
+    if local_root not in roots:
+        roots.append(local_root)
+    return tuple(roots)
+
+
 def _clean_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value or "")).strip()
 
@@ -30,7 +45,7 @@ def _value_options(value: Any) -> list[Any]:
 
 
 def _select_option(options: list[Any], level: Any) -> Any:
-    if not options or level is None:
+    if not options or level is None or isinstance(level, bool) or not isinstance(level, (int, str)):
         return None
     try:
         level_int = int(level)
@@ -38,8 +53,6 @@ def _select_option(options: list[Any], level: Any) -> Any:
         return None
     if 0 <= level_int < len(options):
         return options[level_int]
-    if 1 <= level_int <= len(options):
-        return options[level_int - 1]
     return None
 
 
@@ -82,52 +95,119 @@ def _build_affix_rows(item: dict[str, Any]) -> list[dict[str, Any]]:
 @lru_cache(maxsize=1)
 def weapon_catalog(root: str | None = None) -> dict[str, dict[str, Any]]:
     base = Path(root) if root else bundle_root()
-    items_dir = base / "data" / "akedata" / "weapon" / "items"
     result: dict[str, dict[str, Any]] = {}
-    if not items_dir.exists():
-        return result
-    for path in sorted(items_dir.glob("*.json")):
-        payload = _read_json(path)
-        if not isinstance(payload, dict):
+    for items_dir in _catalog_roots(base, "weapon"):
+        if not items_dir.exists():
             continue
-        weapon_id = str(payload.get("weaponId") or path.stem)
-        result[weapon_id] = {
-            "weapon_id": weapon_id,
-            "name": _clean_text(payload.get("title") or payload.get("name") or weapon_id),
-            "rarity": payload.get("rarity"),
-            "base_atk": payload.get("baseAtk") if isinstance(payload.get("baseAtk"), list) else [],
-            "skilllist": payload.get("skilllist") if isinstance(payload.get("skilllist"), list) else [],
-        }
+        for path in sorted(items_dir.glob("*.json")):
+            payload = _read_json(path)
+            if not isinstance(payload, dict):
+                continue
+            weapon_id = str(payload.get("weaponId") or path.stem)
+            raw = payload.get("raw") if isinstance(payload.get("raw"), dict) else {}
+            current = result.setdefault(weapon_id, {"weapon_id": weapon_id})
+            current.update(
+                {
+                    "name": _clean_text(payload.get("title") or payload.get("name") or weapon_id),
+                    "rarity": payload.get("rarity"),
+                    "base_atk": payload.get("baseAtk") if isinstance(payload.get("baseAtk"), list) else current.get("base_atk", []),
+                    "skilllist": payload.get("skilllist") if isinstance(payload.get("skilllist"), list) else current.get("skilllist", []),
+                    "max_lv": raw.get("maxLv") if raw.get("maxLv") is not None else current.get("max_lv"),
+                    "weapon_skill_ids": raw.get("weaponSkillList") if isinstance(raw.get("weaponSkillList"), list) else current.get("weapon_skill_ids", []),
+                }
+            )
     return result
 
 
 @lru_cache(maxsize=1)
 def equip_piece_catalog(root: str | None = None) -> dict[str, dict[str, Any]]:
     base = Path(root) if root else bundle_root()
-    items_dir = base / "data" / "akedata" / "equip" / "items"
     result: dict[str, dict[str, Any]] = {}
-    if not items_dir.exists():
-        return result
-    for path in sorted(items_dir.glob("*.json")):
-        payload = _read_json(path)
-        if not isinstance(payload, dict):
+    for items_dir in _catalog_roots(base, "equip"):
+        if not items_dir.exists():
             continue
-        suit_id = str(payload.get("suitID") or path.stem)
-        suit_name = _clean_text(payload.get("套组名称") or payload.get("displayName") or payload.get("name"))
-        equip_items = payload.get("equip")
-        if not isinstance(equip_items, dict):
-            continue
-        for item_id, item in equip_items.items():
+        for path in sorted(items_dir.glob("*.json")):
+            payload = _read_json(path)
+            if not isinstance(payload, dict):
+                continue
+            suit_id = str(payload.get("suitID") or path.stem)
+            suit_name = _clean_text(payload.get("套组名称") or payload.get("displayName") or payload.get("name"))
+            equip_items = payload.get("equip")
+            if not isinstance(equip_items, dict):
+                continue
+            for item_id, item in equip_items.items():
+                if not isinstance(item, dict):
+                    continue
+                item_key = str(item.get("itemId") or item_id)
+                # Local-table entries are newer and should replace an older
+                # AKEData copy; older AKEData remains a fallback for pieces not
+                # present in the latest table export.
+                result[item_key] = {
+                    "item_id": item_key,
+                    "name": _clean_text(item.get("name")) or item_key,
+                    "suit_id": suit_id,
+                    "suit_name": suit_name,
+                    "part": _clean_text(item.get("部位")),
+                    "affixes": _build_affix_rows(item),
+                }
+    # The local-table generator stores the current piece records in one
+    # pieces.json file rather than repeating them inside each suit file.  Add
+    # those records after AKEData so new suits/pieces are immediately usable.
+    pieces_path = base / "data" / "local_tables" / "equip" / "pieces.json"
+    pieces_payload = _read_json(pieces_path)
+    if isinstance(pieces_payload, dict) and isinstance(pieces_payload.get("entries"), list):
+        suit_names: dict[str, str] = {}
+        for suit_path in (base / "data" / "local_tables" / "equip" / "items").glob("*.json"):
+            suit_payload = _read_json(suit_path)
+            if isinstance(suit_payload, dict):
+                suit_id = str(suit_payload.get("suitID") or suit_path.stem)
+                suit_names[suit_id] = _clean_text(suit_payload.get("name") or suit_payload.get("displayName"))
+        for item in pieces_payload["entries"]:
             if not isinstance(item, dict):
                 continue
-            item_key = str(item.get("itemId") or item_id)
+            item_key = str(item.get("itemId") or item.get("id") or "")
+            if not item_key:
+                continue
+            slot_parts = pieces_payload.get('slotPartTypes')
+            valid_slots = [slot for slot, part in enumerate(slot_parts) if part == item.get('partType')] if (
+                isinstance(slot_parts, list) and all(type(part) is int for part in slot_parts)
+                and type(item.get('partType')) is int
+                and re.fullmatch(r'[0-9a-f]{64}', str(pieces_payload.get('sourceGlobalConstSha256') or ''))) else []
+            if item_key in result:
+                # Preserve the richer AKEData affix descriptions for existing
+                # pieces; local tables are a fallback for newly added pieces.
+                result[item_key]['valid_slots'] = valid_slots
+                continue
+            affixes: list[dict[str, Any]] = []
+            main = item.get("displayBaseAttrModifier")
+            if isinstance(main, dict):
+                attr_type = main.get("attrType")
+                affixes.append({
+                    "kind": "main", "index": 0,
+                    "desc": f"attribute_type_{attr_type}",
+                    "value": main.get("attrValue"),
+                    "value_options": [main.get("attrValue")],
+                })
+            for index, raw in enumerate(item.get("displayAttrModifiers") or []):
+                if not isinstance(raw, dict):
+                    continue
+                attr_type = raw.get("attrType")
+                values = [raw.get("attrValue")] + list(raw.get("enhancedAttrValues") or [])
+                affixes.append({
+                    "kind": "sub", "index": index,
+                    "desc": f"attribute_type_{attr_type}",
+                    "value": values[0] if values else None,
+                    "value_options": values,
+                })
+            suit_id = str(item.get("suitID") or "suit_none")
             result[item_key] = {
                 "item_id": item_key,
                 "name": _clean_text(item.get("name")) or item_key,
                 "suit_id": suit_id,
-                "suit_name": suit_name,
-                "part": _clean_text(item.get("部位")),
-                "affixes": _build_affix_rows(item),
+                "suit_name": suit_names.get(suit_id, suit_id),
+                "part": _clean_text(item.get("partName")),
+                "affixes": affixes,
+                "valid_slots": valid_slots,
             }
     return result
 
@@ -161,7 +241,7 @@ def weapon_base_atk(weapon_template: str, weapon_level: int) -> int | float | No
     if not isinstance(values, list) or not values:
         return None
     if weapon_level <= 0:
-        weapon_level = len(values)
+        return None
     if weapon_level > len(values):
         return None
     value = values[weapon_level - 1]
@@ -178,12 +258,6 @@ def weapon_base_atk_bounds(weapon_template: str) -> dict[str, int | float | None
         "lv1": first if isinstance(first, (int, float)) else None,
         "max": last if isinstance(last, (int, float)) else None,
     }
-
-
-def _full_option_level(options: list[Any]) -> int | None:
-    if not options:
-        return None
-    return len(options) - 1
 
 
 def selected_weapon_blackboard(weapon_template: str, refine: int) -> list[dict[str, Any]]:
@@ -211,49 +285,10 @@ def selected_weapon_blackboard(weapon_template: str, refine: int) -> list[dict[s
     return rows
 
 
-def _weapon_skill_blackboard_rows(weapon_template: str) -> list[dict[str, Any]]:
-    meta = weapon_catalog().get(str(weapon_template or ""), {})
-    rows: list[dict[str, Any]] = []
-    for index, skill in enumerate(meta.get("skilllist") or []):
-        if not isinstance(skill, dict):
-            continue
-        blackboard_rows = [
-            raw
-            for raw in skill.get("blackboard") or []
-            if isinstance(raw, dict) and _clean_text(raw.get("key"))
-        ]
-        if not blackboard_rows:
-            continue
-        rows.append(
-            {
-                "index": index,
-                "skill_name": _clean_text(skill.get("skillName")) or f"weapon_skill_{index}",
-                "keys": {_clean_text(raw.get("key")) for raw in blackboard_rows},
-                "blackboard": blackboard_rows,
-            }
-        )
-    return rows
 
 
-def _weapon_values_match(expected: Any, observed: Any) -> bool:
-    if isinstance(expected, (int, float)) and isinstance(observed, (int, float)):
-        return math.isclose(float(expected), float(observed), rel_tol=1e-6, abs_tol=1e-6)
-    return str(expected) == str(observed)
 
 
-def _normalize_weapon_refine_index(index: int, option_count: int) -> int:
-    if option_count <= 0:
-        return index
-    # Weapon static tables often expose 9 blackboard tiers while the user-facing
-    # refine scale is 6 tiers. The leading tiers are server-side pre-offset slots,
-    # so we collapse them back to the raw 0-based refine value used by upload/site.
-    display_tier_count = 6
-    offset = max(0, option_count - display_tier_count)
-    normalized = index - offset
-    if normalized < 0:
-        return 0
-    max_normalized = max(0, min(option_count, display_tier_count) - 1)
-    return min(normalized, max_normalized)
 
 
 def _coerce_int(value: Any) -> int | None:
@@ -263,81 +298,71 @@ def _coerce_int(value: Any) -> int | None:
         return None
 
 
-def infer_weapon_refine_from_source_skills(
-    weapon_template: str,
-    source_skills: list[dict[str, Any]] | None,
-) -> int | None:
-    skill_rows = _weapon_skill_blackboard_rows(weapon_template)
-    if not skill_rows:
-        return None
+@lru_cache(maxsize=1)
+def _weapon_refine_catalog() -> dict[str, Any]:
+    data = _read_json(bundle_root() / 'data' / 'local_tables' / 'weapon' / 'refine_catalog.json')
+    return data.get('entries', {}) if isinstance(data, dict) else {}
 
-    source_rows: list[dict[str, Any]] = []
+
+def infer_verified_weapon_refine_from_levels(weapon_template: str, source_skills: Any, *, gem_terms: Any = None) -> int | None:
+    """Use only the weapon's third (potential) skill, never attribute skills."""
+    entry = _weapon_refine_catalog().get(weapon_template, {})
+    main_id = str(entry.get('mainSkillId') or '')
+    accepted_ids = {main_id, str(entry.get('mainSkillNumId') or '')} - {''}
+    gem_cost = None
+    if gem_terms is not None:
+        # Callers must bind this complete gem snapshot to the equipped weapon.
+        if not isinstance(gem_terms, list) or not gem_terms:
+            return None
+        terms = {}
+        for term in gem_terms:
+            if (not isinstance(term, dict) or type(term.get('term_num_id')) is not int
+                    or type(term.get('cost')) is not int or term['term_num_id'] <= 0
+                    or not 0 <= term['cost'] <= 6 or term['term_num_id'] in terms):
+                return None
+            terms[term['term_num_id']] = term['cost']
+        term_id = entry.get('mainSkillGemTermNumId')
+        if type(term_id) is not int or not entry.get('mainSkillBounds') or not entry.get('refineBonusBounds'):
+            return None
+        gem_cost = terms.get(term_id, 0)
+    values = set()
     for skill in source_skills or []:
         if not isinstance(skill, dict):
             continue
-        blackboard = skill.get("blackboard")
-        if not isinstance(blackboard, dict) or not blackboard:
+        ids = {str(skill[key]) for key in ('skill_str_id', 'skill_int_id', 'skill_id') if skill.get(key) not in (None, '', 0)}
+        if not ids.intersection(accepted_ids):
             continue
-        keys = {_clean_text(key) for key in blackboard.keys() if _clean_text(key)}
-        if not keys:
-            continue
-        level = _coerce_int(skill.get("level")) or 0
-        source_rows.append(
-            {
-                "keys": keys,
-                "blackboard": blackboard,
-                "level": level,
-                "potential_lv": skill.get("potential_lv", skill.get("potentialLv")),
-            }
-        )
-    if not source_rows:
-        return None
+        if not ids.issubset(accepted_ids):
+            return None
+        level = skill.get('level')
+        if isinstance(level, bool) or not str(level).isdigit():
+            return None
+        value = entry.get('skillLevelToRefine', {}).get(str(int(level)))
+        if gem_cost is not None:
+            if int(level) not in entry.get('supportedSkillLevels', []):
+                return None
+            # WeaponUtil: add refinement to both bounds, then the matching
+            # gem's cost to the lower bound, capped at the upper bound.
+            candidates = {int(refine) for refine, bonus in entry['refineBonusBounds'].items()
+                          for bound in entry['mainSkillBounds']
+                          if min(bound['lowerBound'] + bonus['lowerBound'] + gem_cost,
+                                 bound['upperBound'] + bonus['upperBound']) == int(level)}
+            value = next(iter(candidates)) if len(candidates) == 1 else None
+        if value is None:
+            return None
+        values.add(int(value))
+    return next(iter(values)) if len(values) == 1 else None
 
-    passive_row = max(skill_rows, key=lambda row: (len(row["keys"]), int(row["index"])))
-    passive_keys = set(passive_row["keys"])
-    best_source = max(
-        source_rows,
-        key=lambda row: (
-            len(passive_keys & set(row["keys"])),
-            len(set(row["keys"])),
-            int(row["level"]),
-        ),
-    )
-    if not (passive_keys & set(best_source["keys"])):
-        return None
 
-    max_option_count = max(
-        len(_value_options(raw.get("value")))
-        for raw in passive_row["blackboard"]
-        if _value_options(raw.get("value"))
-    )
-    candidates: list[int] = []
-    for refine in range(max_option_count):
-        compared = 0
-        mismatch = False
-        for raw in passive_row["blackboard"]:
-            key = _clean_text(raw.get("key"))
-            if not key or key not in best_source["blackboard"]:
-                continue
-            expected = _select_option(_value_options(raw.get("value")), refine)
-            observed = best_source["blackboard"].get(key)
-            compared += 1
-            if expected is None or not _weapon_values_match(expected, observed):
-                mismatch = True
-                break
-        if compared and not mismatch:
-            candidates.append(refine)
-
-    hinted_refine = int(best_source["level"] - 1) if int(best_source["level"]) > 0 else None
-    if len(candidates) == 1:
-        return _normalize_weapon_refine_index(candidates[0], max_option_count)
-    if hinted_refine is not None and hinted_refine in candidates:
-        return _normalize_weapon_refine_index(hinted_refine, max_option_count)
-    if hinted_refine is not None and 0 <= hinted_refine < max_option_count:
-        return _normalize_weapon_refine_index(hinted_refine, max_option_count)
-    if candidates:
-        return _normalize_weapon_refine_index(candidates[0], max_option_count)
-    return None
+def infer_weapon_refine_from_source_skills(
+    weapon_template: str,
+    source_skills: list[dict[str, Any]] | None,
+    *, gem_terms: Any = None,
+) -> int | None:
+    # Only the explicitly identified third weapon potential skill is valid
+    # evidence. Gem arithmetic additionally requires the explicit bound gem
+    # identity and the official skill tag/bounds; blackboard similarity is not evidence.
+    return infer_verified_weapon_refine_from_levels(weapon_template, source_skills, gem_terms=gem_terms)
 
 
 def format_weapon_refine_stats(weapon_template: str, refine: int) -> str:
@@ -358,10 +383,17 @@ def format_weapon_refine_stats(weapon_template: str, refine: int) -> str:
 
 def selected_equip_affixes(item_id: str, enhance: dict[int, int] | dict[Any, Any] | None) -> list[dict[str, Any]]:
     meta = equip_piece_catalog().get(str(item_id or ""), {})
-    levels: dict[int, int] = {}
+    levels: dict[int, int | None] = {}
     for key, value in dict(enhance or {}).items():
         try:
-            levels[int(key)] = int(value)
+            if isinstance(key, bool) or not isinstance(key, (int, str)):
+                continue
+            index = int(key)
+            level = int(value) if isinstance(value, (int, str)) and not isinstance(value, bool) else None
+            if index in levels and levels[index] != level:
+                levels[index] = None
+            else:
+                levels[index] = level
         except (TypeError, ValueError):
             continue
     rows: list[dict[str, Any]] = []
@@ -371,14 +403,11 @@ def selected_equip_affixes(item_id: str, enhance: dict[int, int] | dict[Any, Any
         row = dict(raw)
         if row.get("kind") == "sub":
             index = int(row.get("index") or 0)
-            level = levels.get(index + 1, levels.get(index))
-            if level is None:
-                level = _full_option_level(row.get("value_options") or [])
+            level = levels.get(index + 1)
             row["level"] = level
             selected = _select_option(row.get("value_options") or [], level)
-            if selected is not None:
-                row["value"] = selected
-                row["selected_value"] = selected
+            row["value"] = selected
+            row["selected_value"] = selected
         rows.append(row)
     return rows
 
@@ -390,7 +419,9 @@ def format_equip_stats(item_id: str, enhance: dict[int, int] | dict[Any, Any] | 
         if not desc:
             continue
         value = row.get("value")
-        if isinstance(value, float):
+        if value is None:
+            value_text = 'unknown'
+        elif isinstance(value, float):
             value_text = f"{value:.6g}"
         else:
             value_text = str(value)

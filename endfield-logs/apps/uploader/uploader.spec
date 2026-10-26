@@ -9,6 +9,7 @@ project_root = Path.cwd().resolve().parents[1]
 uploader_root = project_root / "apps" / "uploader"
 parser_root = project_root / "packages" / "parser_core"
 uploader_core_root = project_root / "packages" / "uploader_core"
+client_source = project_root.parent / "endfield-pcap" / "src"
 
 for source_root in (uploader_root, parser_root, uploader_core_root):
     source_path = str(source_root)
@@ -17,7 +18,7 @@ for source_root in (uploader_root, parser_root, uploader_core_root):
 
 datas = [
     (str(project_root / "data" / "akedata"), "data/akedata"),
-    (str(project_root / "data" / "local_static" / "skill"), "data/local_static/skill"),
+    (str(project_root / "data" / "local_static"), "data/local_static"),
     (str(project_root / "data" / "local_semantics"), "data/local_semantics"),
     (str(project_root / "data" / "local_tables"), "data/local_tables"),
     (str(project_root / "data" / "packet_semantics"), "data/packet_semantics"),
@@ -32,7 +33,7 @@ hiddenimports += ["socksio"]
 
 a = Analysis(
     [str(uploader_root / "app" / "main.py")],
-    pathex=[str(uploader_root), str(parser_root), str(uploader_core_root)],
+    pathex=[str(uploader_root), str(parser_root), str(uploader_core_root), str(client_source)],
     binaries=[],
     datas=datas,
     hiddenimports=hiddenimports,

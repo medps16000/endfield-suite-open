@@ -24,7 +24,7 @@ def _damage_event(target_id: int = 100804) -> dict:
     }
 
 
-def test_damage_target_uses_dungeon_enemy_hint_for_unknown_packet_actor(tmp_path):
+def test_damage_target_stays_unresolved_with_only_dungeon_context(tmp_path):
     trace_path = tmp_path / "trace.log"
     bridge = TraceBridge(trace_path)
     bridge.id_to_name[100701] = "chr_0027_tangtang"
@@ -40,11 +40,22 @@ def test_damage_target_uses_dungeon_enemy_hint_for_unknown_packet_actor(tmp_path
 
     lines = trace_path.read_text(encoding="utf-8").splitlines()
     hp_line = next(line for line in lines if " HP_V2 " in line)
-    assert "tgt=eny_0079_nefarp2" in hp_line
+    assert "tgt=id_100804" in hp_line
     assert "tgtId=100804" in hp_line
 
 
-def test_damage_target_uses_battletower_game_resource_hint_immediately(tmp_path):
+def test_damage_trace_preserves_packet_instance_and_sequence(tmp_path):
+    path = tmp_path / 'identity.log'
+    bridge = TraceBridge(path)
+    bridge.id_to_name[100701] = 'chr_0027_tangtang'
+    event = _damage_event()
+    event.update(inst_id=2305843009213695858, seq_id=2377, client_tick_tms=35597)
+    bridge.handle_event(event)
+    line = next(line for line in path.read_text(encoding='utf-8').splitlines() if ' HP_V2 ' in line)
+    assert 'eventInstId=2305843009213695858 eventOwnerId=100701 packetSeq=2377 clientTick=35597' in line
+
+
+def test_damage_target_stays_unresolved_with_only_battletower_context(tmp_path):
     trace_path = tmp_path / "trace.log"
     bridge = TraceBridge(trace_path)
     bridge.id_to_name[100701] = "chr_0027_tangtang"
@@ -63,10 +74,13 @@ def test_damage_target_uses_battletower_game_resource_hint_immediately(tmp_path)
         for line in trace_path.read_text(encoding="utf-8").splitlines()
         if " HP_V2 " in line
     )
-    assert "tgt=eny_0082_hsbear" in hp_line
+    assert "tgt=id_100804" in hp_line
+    bridge.id_to_name[100804] = 'eny_0082_hsbear'
+    bridge.handle_event(_damage_event())
+    assert 'tgt=eny_0082_hsbear' in trace_path.read_text(encoding='utf-8').splitlines()[-1]
 
 
-def test_damage_target_uses_indie_hard011_boss_hint(tmp_path):
+def test_damage_target_stays_unresolved_with_only_indie_context(tmp_path):
     trace_path = tmp_path / "trace.log"
     bridge = TraceBridge(trace_path)
     bridge.id_to_name[100701] = "chr_0027_tangtang"
@@ -82,11 +96,11 @@ def test_damage_target_uses_indie_hard011_boss_hint(tmp_path):
 
     lines = trace_path.read_text(encoding="utf-8").splitlines()
     hp_line = next(line for line in lines if " HP_V2 " in line)
-    assert "tgt=eny_0090_wgabyss" in hp_line
+    assert "tgt=id_100804" in hp_line
     assert "tgtId=100804" in hp_line
 
 
-def test_damage_target_can_use_enemy_buff_hint_without_dungeon_context(tmp_path):
+def test_damage_target_never_uses_buff_name_as_actor_identity(tmp_path):
     trace_path = tmp_path / "trace.log"
     bridge = TraceBridge(trace_path)
     bridge.id_to_name[100701] = "chr_0027_tangtang"
@@ -105,7 +119,7 @@ def test_damage_target_can_use_enemy_buff_hint_without_dungeon_context(tmp_path)
 
     lines = trace_path.read_text(encoding="utf-8").splitlines()
     hp_line = next(line for line in lines if " HP_V2 " in line)
-    assert "tgt=eny_0078_nefarp1" in hp_line
+    assert "tgt=id_100804" in hp_line
 
 
 def test_damage_target_keeps_existing_known_enemy_over_context_hint(tmp_path):
@@ -129,7 +143,7 @@ def test_damage_target_keeps_existing_known_enemy_over_context_hint(tmp_path):
     assert "tgt=eny_0079_nefarp2" not in hp_line
 
 
-def test_character_buff_on_enemy_does_not_alias_target_as_character(tmp_path):
+def test_character_buff_and_dungeon_context_cannot_identify_target(tmp_path):
     trace_path = tmp_path / "trace.log"
     bridge = TraceBridge(trace_path)
     bridge.id_to_name[100701] = "chr_0027_tangtang"
@@ -155,7 +169,7 @@ def test_character_buff_on_enemy_does_not_alias_target_as_character(tmp_path):
 
     lines = trace_path.read_text(encoding="utf-8").splitlines()
     hp_line = next(line for line in lines if " HP_V2 " in line)
-    assert "tgt=eny_0079_nefarp2" in hp_line
+    assert "tgt=id_100804" in hp_line
     assert "tgt=chr_0027_tangtang" not in hp_line
 
 
@@ -172,6 +186,7 @@ def test_numeric_buff_identity_wins_and_duplicate_uid_start_is_suppressed(tmp_pa
             "timestamp_ms": 1_000,
             "owner_id": 100266,
             "inst_id": 500,
+            "trigger_type": 0,
             "template_type": "Skill",
             "template_str_id": "chr_0032_lizhiyan_normal_skill",
             "action": {
@@ -225,6 +240,7 @@ def test_explicit_created_buff_number_overrides_stale_uid_identity(tmp_path):
             "timestamp_ms": 2_000,
             "owner_id": 100327,
             "inst_id": 5002,
+            "trigger_type": 0,
             "template_type": "Buff",
             "template_int_id": 585,
             "action": {

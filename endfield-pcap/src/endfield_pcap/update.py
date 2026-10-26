@@ -15,8 +15,10 @@ from typing import Callable
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 
 from .runtime_paths import app_root, bundle_root
+from .component_updates import prepare_component_package
 
 
 LOGGER = logging.getLogger(__name__)
@@ -476,12 +478,40 @@ def check_and_maybe_start_update() -> bool:
     package_path: Path | None = None
     expected_sha256 = ""
     actual_sha256 = ""
+    component_descriptor = manifest.get("components")
+    if isinstance(component_descriptor, dict):
+        try:
+            def fetch_component(artifact: dict) -> Path:
+                downloaded, expected, actual = _download_update_artifact(
+                    artifact, remote_version=remote_version, remote_build=remote_build,
+                )
+                if actual != expected:
+                    raise ValueError("组件下载校验失败。")
+                return downloaded
+
+            package_path, actual_sha256, component_report = prepare_component_package(
+                component_descriptor, app_root(), _updates_root() / "components",
+                fetch_component, expected_version=remote_version, expected_build=remote_build,
+            )
+            expected_sha256 = actual_sha256
+            update_arg = "--package"
+            LOGGER.info("component update staged: reused=%s downloaded=%s repaired=%s",
+                        component_report["reused"], component_report["downloaded"], component_report["repaired"])
+        except (OSError, ValueError, zipfile.BadZipFile, urllib.error.URLError, http.client.HTTPException) as exc:
+            # Never change an active component in place. Any unsupported ABI,
+            # missing baseline or corrupt payload takes the proven full path.
+            LOGGER.warning("component update unavailable; using full package (%s)", type(exc).__name__)
+            package_path = None
+            update_artifact = manifest
+            patch_manifest = None
+            update_arg = "--package"
     try:
-        package_path, expected_sha256, actual_sha256 = _download_update_artifact(
-            update_artifact,
-            remote_version=remote_version,
-            remote_build=remote_build,
-        )
+        if package_path is None:
+            package_path, expected_sha256, actual_sha256 = _download_update_artifact(
+                update_artifact,
+                remote_version=remote_version,
+                remote_build=remote_build,
+            )
     except (OSError, urllib.error.URLError, ValueError, http.client.HTTPException) as exc:
         LOGGER.warning("failed to download update package", exc_info=True)
         if patch_manifest is not None:

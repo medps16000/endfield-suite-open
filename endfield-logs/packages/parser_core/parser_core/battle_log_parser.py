@@ -2,21 +2,26 @@ from __future__ import annotations
 
 import bisect
 import copy
+import gzip
+import hashlib
 import json
 import os
 import re
 import sys
 from collections import Counter, defaultdict
 from datetime import date, datetime, time, timedelta
+from decimal import Decimal, InvalidOperation
 from functools import lru_cache
-from math import isclose, log
+from math import isclose, isfinite, log
 from pathlib import Path
 from typing import Any
 
 from parser_core.integrity import build_canonical_sha256
+from parser_core.critical_context import build_critical_context, critical_buff_profile, update_critical_observation
+from parser_core.timer_evidence import collect_timer_evidence, validate_timer_evidence
 
-PARSER_VERSION = "raw-log-parser-v43"
-RULES_VERSION = "raw-log-parser-v37"
+PARSER_VERSION = "raw-log-parser-v59"
+RULES_VERSION = "raw-log-parser-v44"
 UNKNOWN_DUNGEON_KEY = "unknown_dungeon"
 UNKNOWN_DUNGEON_NAME = "未知副本"
 UNKNOWN_ENEMY_KEY = "eny_0000_unknown"
@@ -31,7 +36,7 @@ _KV_RE = re.compile(r'(\w+)=(".*?"|\S+)')
 _CHAR_KEY_RE = re.compile(r"(chr_\d{4}_[a-z0-9]+)")
 _SQUAD_MEMBER_RE = re.compile(r"(chr_\d{4}_[a-z0-9]+)_(\d+)")
 _ENEMY_KEY_RE = re.compile(r"(eny_\d{4}_[a-z0-9]+)")
-_FULL_ENEMY_KEY_RE = re.compile(r"^(eny_\d{4}_[a-z0-9]+(?:(?:_hard)|(?:_hdg\d*)|(?:_assult))?(?:_assult)?)$")
+_FULL_ENEMY_KEY_RE = re.compile(r"^(eny_\d{4}_[a-z0-9]+(?:_[a-z0-9]+)*)$")
 _HIT_SEQ_RE = re.compile(r"\bHP_V2\s+#(\d+)\b")
 _POISE_RE = re.compile(r"\bPOISE_V1\b")
 _SHORT_ID_RE = re.compile(r"^id_(\d+)$")
@@ -222,6 +227,8 @@ _RDPS_DEBUG_ZONE_LABELS = {
     "combo": "连击",
     "crit": "暴击",
     "arts_strength": "源石技艺强度",
+    "prod_dmg_inc": "独立增伤",
+    "prod_vuln_taken": "独立承伤易伤",
 }
 _RDPS_DEBUG_ZONE_ORDER = {
     "atk": 0,
@@ -233,8 +240,11 @@ _RDPS_DEBUG_ZONE_ORDER = {
     "combo": 6,
     "crit": 7,
     "arts_strength": 8,
+    "prod_dmg_inc": 9,
+    "prod_vuln_taken": 10,
 }
-_RDPS_ALLOCATABLE_ZONES = {"atk", "dmg_inc", "amp", "fragile", "vuln_taken", "res", "combo", "arts_strength"}
+_RDPS_ALLOCATABLE_ZONES = {"atk", "dmg_inc", "amp", "fragile", "vuln_taken", "res", "combo", "arts_strength",
+                           "prod_dmg_inc", "prod_vuln_taken"}
 _DPD_ZONE_BUCKETS = {
     "dmg_inc": ("atk", 1),
     "amp": ("atk", 3),
@@ -242,33 +252,17 @@ _DPD_ZONE_BUCKETS = {
     "vuln_taken": ("def", 1),
     "fragile": ("def", 5),
 }
-_ELEMENTAL_ELEMENTS = {"fire", "pulse", "cryst", "natural"}
-_ARTS_STRENGTH_EFFECT_BUFF_IDS = {
-    "buff_physical_do_fracture",
-    "buff_common_pulse_pulse_conduct_triggered_do",
-    "buff_common_pulse_cryst_triggered",
-    "buff_common_natural_cryst_triggered",
-    "buff_common_natural_pulse_triggered",
-}
-_ARTS_STRENGTH_PHYSICAL_ANOMALY_DAMAGE_IDS = {
-    "buff_physical_airborne",
-    "buff_physical_crushed",
-    "buff_physical_knockdown",
-    "buff_physical_do_fracture",
-}
-_ARTS_STRENGTH_BB_KEYS = {
-    "phy_spell_up",
-    "physpell_up",
-    "physpell",
-    "physicalandspellinflictionenhance",
-}
+_ELEMENTAL_ELEMENTS = {"fire", "pulse", "cryst", "natural", "ether"}
 _ACTION_DAMAGE_TYPE_TO_ELEMENT = {
     "physical": "physical",
+    "real": "real",
     "fire": "fire",
     "pulse": "pulse",
     "cryst": "cryst",
     "crystal": "cryst",
+    "lifedrain": "lifedrain",
     "natural": "natural",
+    "ether": "ether",
 }
 _CHAR_TYPE_TO_ELEMENT = {
     "物理": "physical",
@@ -276,6 +270,12 @@ _CHAR_TYPE_TO_ELEMENT = {
     "寒冷": "cryst",
     "电磁": "pulse",
     "自然": "natural",
+    "Physical": "physical",
+    "Fire": "fire",
+    "Cryst": "cryst",
+    "Pulse": "pulse",
+    "Natural": "natural",
+    "Ether": "ether",
 }
 _ENHANCED_ACTION_SUBTYPE_TO_ELEMENT = {
     "crystal": "cryst",
@@ -336,8 +336,8 @@ _ATTR_TYPE_TO_EFFECT = {
     10: ("crit", "all"),
     17: ("dmg_inc", "all"),
     28: ("dmg_inc", "all"),
-    32: ("dmg_inc", "spell"),
-    33: ("dmg_inc", "spell"),
+    32: ("dmg_inc", "all"),
+    33: ("dmg_inc", "all"),
     50: ("dmg_inc", "physical"),
     51: ("dmg_inc", "fire"),
     # 52/54 依据 AttributeMetaTable 官方语义补齐（icon_pulse/natural_damage_increase），
@@ -345,6 +345,7 @@ _ATTR_TYPE_TO_EFFECT = {
     52: ("dmg_inc", "pulse"),
     53: ("dmg_inc", "cryst"),
     54: ("dmg_inc", "natural"),
+    55: ("dmg_inc", "ether"),
     65: ("amp", "fire"),
     66: ("amp", "pulse"),
     67: ("amp", "cryst"),
@@ -354,12 +355,7 @@ _ATTR_TYPE_TO_EFFECT = {
     72: ("fragile", "pulse"),
     73: ("fragile", "cryst"),
     74: ("fragile", "natural"),
-    80: ("fragile", "physical"),
-    81: ("fragile", "natural"),
-    82: ("fragile", "cryst"),
-    83: ("fragile", "pulse"),
-    84: ("fragile", "fire"),
-    85: ("fragile", "spell"),
+    75: ("fragile", "ether"),
 }
 _DEF_DECREASE_ATTR_TYPE_TO_EFFECT = {
     80: ("res", "physical"),
@@ -367,7 +363,7 @@ _DEF_DECREASE_ATTR_TYPE_TO_EFFECT = {
     82: ("res", "cryst"),
     83: ("res", "pulse"),
     84: ("res", "fire"),
-    85: ("res", "spell"),
+    85: ("res", "ether"),
 }
 _DAMAGE_TAG_TO_ELEMENT = {
     "pd": "physical",
@@ -379,10 +375,13 @@ _DAMAGE_TAG_TO_ELEMENT = {
 }
 _DPD_DAMAGE_TYPE_TO_ELEMENT = {
     0: "physical",
+    1: "real",
     2: "fire",
     3: "pulse",
     4: "cryst",
+    5: "lifedrain",
     6: "natural",
+    7: "ether",
 }
 _ELEMENT_LABELS = {
     "physical": "物理",
@@ -390,25 +389,32 @@ _ELEMENT_LABELS = {
     "pulse": "电磁",
     "cryst": "寒冷",
     "natural": "自然",
+    "ether": "源石技艺",
+    "real": "真实",
+    "lifedrain": "生命汲取",
     "spell": "法术",
 }
-_BUFF_SKILL_FILTER = {
-    "buff_wpn_sword_0006_valid": re.compile(r"normal_skill|ult_attack"),
-    "buff_equipsuit_combo_cd01_spellup": re.compile(r"normal_skill|combo|ultimate"),
+# Compatibility exports for old callers. Name-based effect filters are retired;
+# current typed conditions and observed hit masks determine applicability.
+_BUFF_SKILL_FILTER = {}
+_BUFF_EFFECT_SKILL_FILTER = {}
+_ATTR_TYPE_DAMAGE_MASK = {17: 0x20484, 28: 0x200, 32: 0x100, 33: 0x2000}
+_NATIVE_DAMAGE_SEMANTICS_BINDING = {
+    'gameAssemblySha256': 'c24495e51b406f03b03890c4788ee618ae022c991405be5d5b8b787cb775ae89',
+    'metadataSha256': '0076743397acadf03d3b0064343a963c7c88863b8160526d397e4b3efb96f02e',
 }
-_BUFF_EFFECT_SKILL_FILTER = {
-    ("576", "dmg_inc"): re.compile(r"normal_skill"),
-    ("buff_equipsuit_attrisuit_01", "dmg_inc"): re.compile(r"normal_skill.*_1"),
-    ("buff_equipsuit_attrisuitup_01", "dmg_inc"): re.compile(r"normal_skill.*_1"),
-    # suit_atk02: the persistent atk_up remains on the wearer; the child
-    # dmg_up is consumed by the wearer's next combo skill.
-    ("buff_equipsuit_atk_02_addcombodamage", "dmg_inc"): re.compile(r"combo"),
-    ("buff_equipsuit_atk_02_addcombodamage_buff", "dmg_inc"): re.compile(r"combo"),
+# Complete typed resources have an independent layout provenance. This does
+# not renew the separate native zone/keyword/equipment semantics proofs above.
+_CURRENT_TYPED_RESOURCE_BINDING = {
+    'gameAssemblySha256': 'ab00f1c41e13edf9816f142b166e3c2536d5bc7707992c39e5ed52d1cc888e2c',
+    'metadataSha256': '461321d9dca6a832bce3bd2390402efc7c83c145554e97a8058bb68fbec1c8ca',
+    'schemaSha256': '42bd4483f3f6f5937fd4a1f8bd43f3152ee62d33e259c67260a4be25a8a4bcf2',
 }
-_ATTR_TYPE_SKILL_FILTER = {
-    28: re.compile(r"ultimate"),
-    32: re.compile(r"normal_skill"),
-    33: re.compile(r"combo"),
+# Independently re-proved GetKeywordBuffName switches and metadata literals.
+# This does not renew the unrelated legacy zone/mask/equipment native proof.
+_CURRENT_KEYWORD_BINDING = {
+    'gameAssemblySha256': 'ab00f1c41e13edf9816f142b166e3c2536d5bc7707992c39e5ed52d1cc888e2c',
+    'metadataSha256': '461321d9dca6a832bce3bd2390402efc7c83c145554e97a8058bb68fbec1c8ca',
 }
 _SINGLETON_REFRESH_EVENT_PATTERNS = (
     re.compile(r"^buff_equipsuit_", re.IGNORECASE),
@@ -434,13 +440,30 @@ _DEF_DECREASE_BASE_KEYS = {"def_decrease", "additional_def_decrease"}
 _DEF_DECREASE_TICKS_PER_SEC = 3.5
 
 
-def _attr_type_applies_to_skill(attr_type: int | None, skill_key: str | None) -> bool:
+def _attr_type_applies_to_skill(
+    attr_type: int | None, skill_key: str | None, *, damage_decorate_mask: int | None = None,
+    static_damage_decorate_mask: int | None = None,
+    static_damage_decorate_mask_source: str | None = None,
+) -> bool | None:
     if attr_type is None:
         return True
-    skill_filter = _ATTR_TYPE_SKILL_FILTER.get(attr_type)
-    if skill_filter is None:
+    mask = _ATTR_TYPE_DAMAGE_MASK.get(attr_type)
+    if mask is None:
         return True
-    return bool(skill_filter.search(str(skill_key or "")))
+    # Current DamagePackData._GetAttackerDamageScaleIncreaseFromSkillType
+    # tests these bits independently. Names and damage school are not inputs.
+    if damage_decorate_mask is not None:
+        if type(damage_decorate_mask) is not int or not 0 <= damage_decorate_mask < 2**64:
+            return None
+        return bool(damage_decorate_mask & mask)
+    # An exact current unit proves its positive skill-category bits only.
+    # Runtime-added bits can be absent from the template, so absence is unknown.
+    if (static_damage_decorate_mask_source == 'current_typed_skill_or_buff_exact_unit_generation_only'
+            and type(static_damage_decorate_mask) is int
+            and 0 <= static_damage_decorate_mask < 2**64
+            and static_damage_decorate_mask & mask):
+        return True
+    return None
 _HIDDEN_COMBO_RULES = (
     {
         "rule_key": "karin_hidden_combo",
@@ -488,31 +511,6 @@ _DUNGEON_CONTEXT_ALIASES: dict[str, tuple[str, str]] = {
     "indie_hard020_s": ("indie_hard020_s", "溶解窥看·苦难"),
     "indie_hard021": ("indie_hard021", "冯河断水"),
     "indie_hard021_s": ("indie_hard021_s", "冯河断水·苦难"),
-}
-_DUNGEON_ENEMY_HINT_ALIASES: dict[str, str] = {
-    "indie_hard011_s": "eny_0090_wgabyss",
-    "indie_hard016": "eny_0046_lbshamman",
-    "indie_hard016_s": "eny_0046_lbshamman",
-    "indie_hard017": "eny_0095_ethillu",
-    "indie_hard017_s": "eny_0095_ethillu",
-    "indie_hard018": "eny_0082_hsbear",
-    "indie_hard018_s": "eny_0082_hsbear",
-    "indie_hard019": "eny_0088_wgthorns",
-    "indie_hard019_s": "eny_0088_wgthorns",
-    "indie_hard020": "eny_0107_wgshoal2",
-    "indie_hard020_s": "eny_0107_wgshoal2",
-    "indie_hard021": "eny_0102_hstiger2",
-    "indie_hard021_s": "eny_0102_hstiger2",
-    "dung01_bossrush01_01": "eny_0051_rodin",
-    "dung01_bossrush01_02": "eny_0051_rodin",
-    "dung01_bossrush01_03": "eny_0051_rodin",
-    "dung01_bossrush01_04": "eny_0051_rodin",
-    "dung01_bossrush03_01": "eny_0052_palesent",
-    "dung01_bossrush03_02": "eny_0052_palesent",
-    "dung01_bossrush03_03": "eny_0052_palesent",
-    "dung02_bossrush02_01": "eny_0079_nefarp2",
-    "dung02_bossrush02_02": "eny_0079_nefarp2",
-    "dung02_bossrush02_03": "eny_0079_nefarp2",
 }
 _VISUAL_HIT_GROUP_WINDOW_MS = 120
 
@@ -612,14 +610,9 @@ def _load_nonstacking_weapon_ids() -> set[str]:
 
 def _is_nonstacking_refresh_event(event_key: str | None) -> bool:
     event_key = str(event_key or "")
-    if _is_food_potion_buff(event_key):
-        return True
-    match = _WEAPON_ID_FROM_BUFF_RE.match(event_key)
-    if match and match.group(1) in _load_nonstacking_weapon_ids():
-        return True
-    if _STACKABLE_EVENT_NAME_RE.search(event_key):
-        return False
-    return any(pattern.search(event_key) for pattern in _SINGLETON_REFRESH_EVENT_PATTERNS)
+    root = _load_current_buff_roots().get(event_key)
+    settings = root.get('stackingSettings') if isinstance(root, dict) else None
+    return isinstance(settings, dict) and settings.get('stackingType') == 'Unique'
 
 
 def _is_food_potion_buff(event_key: str | None) -> bool:
@@ -707,12 +700,24 @@ def _load_weapon_buff_stack_limits() -> dict[str, int]:
     return limits
 
 
-def _buff_stack_limit(event_key: str | None) -> int | None:
+def _buff_stack_limit(event_key: str | None, bb_values: dict[str, Any] | None = None) -> int | None:
     event_key = str(event_key or "")
     if not event_key:
         return None
-    if _is_food_potion_buff(event_key):
-        return 1
+    root = _load_current_buff_roots().get(event_key)
+    settings = root.get('stackingSettings') if isinstance(root, dict) else None
+    if isinstance(settings, dict):
+        if settings.get('stackingType') == 'HighPriority':
+            return 1
+        if settings.get('stackingType') == 'Unique' and settings.get('useMaxStackCntKey') is False:
+            return _positive_int(settings.get('maxStackCnt')) or 1
+        if settings.get('useMaxStackCntKey') is True:
+            value = _positive_int((bb_values or {}).get(str(settings.get('maxStackCntKey') or '')))
+            return value
+        value = _positive_int(settings.get('maxStackCnt'))
+        if value is not None:
+            return value
+        return None
     semantic_entry = _load_local_buff_semantic_entries().get(event_key)
     if isinstance(semantic_entry, dict):
         stacking = semantic_entry.get("stacking")
@@ -724,10 +729,6 @@ def _buff_stack_limit(event_key: str | None) -> int | None:
     if exact_limit is not None:
         return exact_limit
     match = _WEAPON_ID_FROM_BUFF_RE.match(event_key)
-    if match:
-        weapon_id = match.group(1)
-        if event_key == f"buff_{weapon_id}_atk_up" or event_key.startswith(f"buff_{weapon_id}_atk_up_"):
-            return _load_weapon_id_stack_limits().get(weapon_id)
     return None
 
 
@@ -818,8 +819,6 @@ def _apply_dungeon_catalog_overrides() -> None:
     for key, value in (parser_tables.get("dungeon_context_aliases") or {}).items():
         if isinstance(value, list) and len(value) == 2:
             _DUNGEON_CONTEXT_ALIASES[str(key)] = (str(value[0]), str(value[1]))
-    for key, value in (parser_tables.get("dungeon_enemy_hints") or {}).items():
-        _DUNGEON_ENEMY_HINT_ALIASES[str(key)] = str(value)
 
 
 _apply_dungeon_catalog_overrides()
@@ -873,7 +872,10 @@ def _parse_bb_assignments(blob: str | None) -> dict[str, Any]:
             continue
         key, raw_value = item.split("=", 1)
         value = raw_value.strip()
-        rate = _safe_positive_rate(value)
+        # Blackboard values can be signed (for example resistance reductions
+        # use -20). Preserve the numeric value here; individual effect
+        # semantics decide whether a positive rate is required.
+        rate = _coerce_optional_float(value)
         values[key.strip()] = rate if rate is not None else value
     return values
 
@@ -1012,8 +1014,16 @@ def _packet_numeric_buff_hint(buff_id: str | None) -> dict[str, Any]:
     return _mechanism_registry_buff_hint(key)
 
 
+# Derived indexes belong to the exact immutable resources loaded below. Test
+# overrides and replacement catalogs fall back to their own complete scans.
+_RDPS_VERIFIED_INDEX: tuple[dict, dict, dict, dict, dict] | None = None
+_BUFF_ACTION_TYPES_INDEX: tuple[dict, dict] | None = None
+
+
 @lru_cache(maxsize=1)
 def _load_rdps_semantics_registry() -> dict[str, Any]:
+    global _RDPS_VERIFIED_INDEX
+    _RDPS_VERIFIED_INDEX = None
     path = _repo_root() / "data" / "packet_semantics" / "rdps_semantics_registry.json"
     if not path.exists():
         return {}
@@ -1021,7 +1031,37 @@ def _load_rdps_semantics_registry() -> dict[str, Any]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {}
-    return payload if isinstance(payload, dict) else {}
+    if not isinstance(payload, dict):
+        return {}
+    try:
+        keyword = json.loads((_repo_root() / 'data/local_static/buff/keyword_buff_map.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        keyword = {}
+    if (isinstance(keyword, dict) and type(keyword.get('schemaVersion')) is int and keyword['schemaVersion'] == 1
+            and keyword.get('source') == 'current_native_keyword_switch_and_metadata_literals'
+            and keyword.get('decoder') == _CURRENT_KEYWORD_BINDING):
+        mapping = keyword.get('mapping')
+        subtypes = {'All', 'Spell', 'Physical', 'Natural', 'Fire', 'Crystal', 'Pulse'}
+        if (isinstance(mapping, dict) and set(mapping) == {'Vulnerable', 'Enhanced'}
+                and all(isinstance(rows, dict) and set(rows) == subtypes
+                        and all(isinstance(value, str) and value for value in rows.values()) for rows in mapping.values())):
+            payload['_keyword_buff_map'] = mapping
+    verified = payload.get('verified_effects')
+    if isinstance(verified, dict):
+        exact_index: dict[str, set[str]] = defaultdict(set)
+        runtime_index: dict[str, set[str]] = defaultdict(set)
+        for key, entry in verified.items():
+            if not isinstance(entry, dict):
+                continue
+            for identity in [key, *(entry.get('aliases') or []), *(entry.get('numeric_ids') or [])]:
+                if str(identity):
+                    exact_index[str(identity)].add(key)
+            for binding in entry.get('runtime_bindings') or []:
+                if isinstance(binding, dict) and isinstance(binding.get('template'), str):
+                    runtime_index[binding['template']].add(key)
+        _RDPS_VERIFIED_INDEX = (payload, verified, dict(exact_index), dict(runtime_index),
+                                {key: order for order, key in enumerate(verified)})
+    return payload
 
 
 def _record_bb_key_set(record: dict[str, Any]) -> set[str]:
@@ -1068,6 +1108,30 @@ def _rdps_registry_entry_matches_guard(entry: dict[str, Any], record: dict[str, 
     source_key = str(record.get("source_character_key") or "")
     target_key = str(record.get("target_character_key") or "")
     packet_mapping = record.get("packet_mapping") if isinstance(record.get("packet_mapping"), dict) else {}
+    if guard.get('requires_actor_identity') is True:
+        if (not source_key or any(type(record.get(key)) is not str
+                or not re.fullmatch(r'[1-9]\d*', record[key]) or int(record[key]) >= 2**64
+                for key in ('uid', 'source_actor_id', 'target_actor_id'))
+                or record.get('uid') == '4294967295'):
+            return False
+    if guard.get('target_kind') == 'enemy':
+        enemy = record.get('target_enemy_key')
+        if not enemy or target_key not in ('', enemy) or record.get('target_player_key'):
+            return False
+    if guard.get('target_kind') == 'character' and (not target_key or record.get('target_enemy_key')):
+        return False
+    if guard.get('recipient') == 'self':
+        if not source_key or target_key != source_key:
+            return False
+        source_actor, target_actor = record.get('source_actor_id'), record.get('target_actor_id')
+        if (source_actor or target_actor) and (not source_actor or not target_actor or str(source_actor) != str(target_actor)):
+            return False
+    if guard.get('recipient') == 'other_character':
+        if not source_key or not target_key or source_key == target_key:
+            return False
+        source_actor, target_actor = record.get('source_actor_id'), record.get('target_actor_id')
+        if (source_actor or target_actor) and (not source_actor or not target_actor or str(source_actor) == str(target_actor)):
+            return False
 
     source_guard = str(guard.get("source_character_key") or guard.get("source_character_id") or "")
     if source_guard and source_key != source_guard:
@@ -1088,6 +1152,11 @@ def _rdps_registry_entry_matches_guard(entry: dict[str, Any], record: dict[str, 
 
     weapon_guard = str(guard.get("weapon_id") or "")
     if weapon_guard:
+        # New equipment approvals require the loadout observed at this Buff
+        # instance's creation. A template name or later roster cannot supply it.
+        if (guard.get('requires_source_loadout') is True
+                and record.get('source_weapon_template') != weapon_guard):
+            return False
         mapping_weapon = str(packet_mapping.get("weapon_id") or "")
         event_key = _normalize_buff_id(record.get("event_key"))
         raw_event_key = _normalize_buff_id(record.get("raw_event_key"))
@@ -1106,7 +1175,8 @@ def _rdps_registry_entry_matches_guard(entry: dict[str, Any], record: dict[str, 
     return True
 
 
-def _rdps_registry_matching_effect_entry(record: dict[str, Any], *, require_guard: bool) -> dict[str, Any] | None:
+def _rdps_registry_matching_effect_entry(record: dict[str, Any], *, require_guard: bool,
+                                         root_lookup_cache: dict | None = None) -> dict[str, Any] | None:
     registry = _load_rdps_semantics_registry()
     verified = registry.get("verified_effects") if isinstance(registry.get("verified_effects"), dict) else {}
     candidates = {
@@ -1116,7 +1186,63 @@ def _rdps_registry_matching_effect_entry(record: dict[str, Any], *, require_guar
     candidates.discard("")
     raw_numeric = _normalize_buff_id(record.get("raw_event_key"))
 
-    for canonical_buff_id, entry in verified.items():
+    # A current creation action may forward an approved field under a different
+    # child key. The reviewed action/recipient contract, not the child name,
+    # grants that existing approval to the actual packet instance.
+    actual_candidates = {_load_num_id_str_buff_map().get(key, key) if key.isdigit() else key for key in candidates}
+    index = _RDPS_VERIFIED_INDEX
+    indexed = index is not None and index[0] is registry and index[1] is verified
+    runtime_keys = set().union(*(index[3].get(key, set()) for key in actual_candidates)) if indexed else None
+    runtime_entries = verified.items() if runtime_keys is None else (
+        (key, verified[key]) for key in sorted(runtime_keys, key=index[4].__getitem__)
+    )
+    for approval_key, entry in runtime_entries:
+        if not isinstance(entry, dict):
+            continue
+        for binding in entry.get('runtime_bindings') or []:
+            if binding.get('template') not in actual_candidates:
+                continue
+            if (binding.get('decoder') != _NATIVE_DAMAGE_SEMANTICS_BINDING
+                    or not re.fullmatch(r'[0-9a-f]{64}', str(binding.get('sourceRootSha256') or ''))
+                    or require_guard and not _rdps_registry_entry_matches_guard(entry, record)):
+                continue
+            origins = record.get('origin_observations') or []
+            valid = bool(origins)
+            for origin in origins:
+                parent = origin.get('templateStrId')
+                if parent in (None, '') and type(origin.get('templateIntId')) is int:
+                    parent = (_load_num_id_str_skill_map() if binding.get('parent_kind') == 'Skill'
+                              else _load_num_id_str_buff_map()).get(str(origin['templateIntId']))
+                elif not isinstance(parent, str) or not parent or origin.get('templateIntId') is not None:
+                    parent = None
+                if (origin.get('_boundCreateRecord') is not True
+                        or str(origin.get('environmentType') or '').lower() != str(binding.get('parent_kind') or '').lower()
+                        or parent != binding.get('parent_template')
+                        or type(origin.get('actionId')) is not int or origin['actionId'] not in binding.get('create_actions', [])
+                        or origin.get('triggerType') != 0
+                        or origin.get('buffUid') != record.get('uid')
+                        or origin.get('buffTemplate') not in candidates | actual_candidates
+                        or origin.get('sourceActorId') != record.get('source_actor_id')
+                        or origin.get('targetActorId') != record.get('target_actor_id')
+                        or any(not re.fullmatch(r'[1-9]\d*', str(origin.get(key) or ''))
+                               or int(origin[key]) >= 2**64 for key in ('buffUid', 'sourceActorId', 'targetActorId'))
+                        or binding.get('recipient') == 'other_character' and origin['sourceActorId'] == origin['targetActorId']):
+                    valid = False
+                    break
+            if valid:
+                remap = binding.get('bb_key_remap') or {}
+                effects = [{**effect, 'bb_key': remap.get(effect.get('bb_key'), effect.get('bb_key'))}
+                           for effect in entry.get('effects') or []]
+                return {**entry, 'effects': effects, '_rdps_whitelist_keys': [approval_key],
+                        '_runtime_binding': copy.deepcopy(binding)}
+
+    exact_matches: list[dict[str, Any]] = []
+    exact_keys: list[str] = []
+    indexed_exact_keys = set().union(*(index[2].get(key, set()) for key in candidates)) if indexed else None
+    exact_entries = verified.items() if indexed_exact_keys is None else (
+        (key, verified[key]) for key in sorted(indexed_exact_keys, key=index[4].__getitem__)
+    )
+    for canonical_buff_id, entry in exact_entries:
         if not isinstance(entry, dict):
             continue
         aliases = {str(value) for value in entry.get("aliases") or [] if str(value)}
@@ -1129,9 +1255,44 @@ def _rdps_registry_matching_effect_entry(record: dict[str, Any], *, require_guar
             continue
         if require_guard and not _rdps_registry_entry_matches_guard(entry, record):
             continue
-        return entry
+        exact_matches.append(entry)
+        exact_keys.append(str(canonical_buff_id))
+    if exact_matches:
+        actual = _normalize_buff_id(record.get('event_key'))
+        actual = _load_num_id_str_buff_map().get(actual, actual) if actual.isdigit() else actual
+        lifecycle_approvals = {
+            'buff_chr_0023_antal_tageffect': 'buff_chr_0023_antal_normal_fragile',
+            'buff_common_natural_natural_corrupt_triggered': 'buff_chr_0025_ardelia_dynamic_def_decrease',
+        }
+        lifecycle_key = lifecycle_approvals.get(actual)
+        if (lifecycle_key is None and len(exact_keys) == 1
+                and verified[exact_keys[0]].get('lifecycle_only') is True):
+            lifecycle_key = exact_keys[0]
+        if lifecycle_key in exact_keys:
+            root = _load_current_buff_roots().get(actual)
+            if (isinstance(root, dict) and (root.get('attributeModifier') or {}).get('attributeModifiers') == []
+                    and root.get('damageModifier') == [] and root.get('globalModifier') == []):
+                entry = verified[lifecycle_key]
+                return {**entry, 'dynamic': False, 'effects': [], 'dynamic_effects': [],
+                        'ignored_bb_keys': sorted(set(entry.get('ignored_bb_keys') or [])
+                                                  | _rdps_registry_effect_bb_keys(entry)),
+                        '_rdps_whitelist_keys': [lifecycle_key], '_rdps_lifecycle_only': True}
+        # The character approval and the generic corrosion approval describe
+        # the same current Buff, not two independently stacked contributions.
+        corrosion_key = 'buff_common_natural_natural_corrupt_do'
+        ardelia_key = 'buff_chr_0025_ardelia_dynamic_def_decrease'
+        if (actual == corrosion_key and set(exact_keys) == {corrosion_key, ardelia_key}
+                and verified[corrosion_key].get('effects') == verified[ardelia_key].get('effects')
+                and corrosion_key in (verified[ardelia_key].get('aliases') or [])):
+            return {**verified[corrosion_key], '_rdps_whitelist_keys': sorted(exact_keys)}
+        signatures = {
+            json.dumps(entry, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+            for entry in exact_matches
+        }
+        return {**exact_matches[0], '_rdps_whitelist_keys': sorted(exact_keys)} if len(signatures) == 1 else None
 
     prefixes = registry.get("verified_prefixes") if isinstance(registry.get("verified_prefixes"), list) else []
+    prefix_matches: list[dict[str, Any]] = []
     for key in candidates:
         if not key:
             continue
@@ -1144,33 +1305,368 @@ def _rdps_registry_matching_effect_entry(record: dict[str, Any], *, require_guar
             if require_guard and not _rdps_registry_entry_matches_guard(entry, record):
                 continue
             if _rdps_registry_bb_keys_allowed(entry, record):
-                return entry
+                prefix_matches.append(entry)
+    if prefix_matches:
+        signatures = {
+            json.dumps(entry, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+            for entry in prefix_matches
+        }
+        return {**prefix_matches[0], '_rdps_whitelist_keys': sorted({str(row['prefix']) for row in prefix_matches})} if len(signatures) == 1 else None
+    origins = record.get('origin_observations')
+    keyword_map = registry.get('_keyword_buff_map')
+    if isinstance(origins, list) and origins and isinstance(keyword_map, dict):
+        projected = []
+        for origin in origins:
+            if (not isinstance(origin, dict) or origin.get('_boundCreateRecord') is not True
+                    or origin.get('buffTemplate') not in {record.get('event_key'), record.get('raw_event_key')}
+                    or any(type(origin.get(key)) is not str or not re.fullmatch(r'[1-9]\d*', origin[key])
+                           or int(origin[key]) >= 2**64
+                           for key in ('buffUid', 'sourceActorId', 'targetActorId', 'environmentInstId'))
+                    or origin.get('buffUid') != record.get('uid')
+                    or origin.get('sourceActorId') != record.get('source_actor_id')
+                    or origin.get('targetActorId') != record.get('target_actor_id')
+                    or str(origin.get('environmentType') or '').lower() != 'buff'
+                    or str(origin.get('ownerType') or '') != '1'
+                    or origin.get('environmentInstId') in (None, '', '0', '4294967295')
+                    or type(origin.get('actionId')) is not int or origin['actionId'] < 0):
+                return None
+            actual_main = _normalize_buff_id(record.get('event_key'))
+            for identity in (record.get('raw_event_key'), origin.get('buffTemplate')):
+                if identity in (None, ''):
+                    continue
+                template = _normalize_buff_id(identity)
+                if template.isdigit():
+                    template = _load_num_id_str_buff_map().get(template)
+                if template and template != actual_main:
+                    return None
+                if identity and not template:
+                    return None
+            parent = origin.get('templateStrId')
+            numeric = origin.get('templateIntId')
+            if isinstance(parent, str) and parent and numeric is None:
+                parent = _normalize_buff_id(parent)
+            elif parent in (None, '') and type(numeric) is int and numeric >= 0:
+                parent = _load_num_id_str_buff_map().get(str(numeric))
+            else:
+                return None
+            parent_entries = [(key, value) for key, value in verified.items()
+                              if isinstance(value, dict) and (key == parent or parent in (value.get('aliases') or []))
+                              and (not require_guard or _rdps_registry_entry_matches_guard(value, record))]
+            parent_signatures = {json.dumps(value, sort_keys=True, ensure_ascii=False) for _, value in parent_entries}
+            if len(parent_signatures) > 1:
+                return None
+            entry = parent_entries[0][1] if parent_entries else None
+            parent_approval_keys = sorted(key for key, _ in parent_entries)
+            root = _load_current_buff_roots().get(parent)
+            if not isinstance(root, dict):
+                return None
+            if root_lookup_cache is None:
+                actions = []; pending = [(root, True)]
+                while pending:
+                    value, ancestors_enabled = pending.pop()
+                    if isinstance(value, dict):
+                        enabled = ancestors_enabled and ('serverActionIndex' not in value or value.get('isEnable') is True)
+                        if (value.get('$type') in {'Beyond.Gameplay.Core.VulnerableAction.Data', 'Beyond.Gameplay.Core.EnhancedAction.Data'}
+                                and type(value.get('serverActionIndex')) is int
+                                and value['serverActionIndex'] == origin['actionId']):
+                            actions.append((value, enabled))
+                        pending.extend((item, enabled) for item in value.values())
+                    elif isinstance(value, list):
+                        pending.extend((item, ancestors_enabled) for item in value)
+            else:
+                cached_lookup = root_lookup_cache.get(id(root))
+                if cached_lookup is None or cached_lookup[0] is not root:
+                    root_actions = {}
+                    create_actions = []
+                    pending = [(root, True)]
+                    while pending:
+                        value, ancestors_enabled = pending.pop()
+                        if isinstance(value, dict):
+                            enabled = ancestors_enabled and ('serverActionIndex' not in value or value.get('isEnable') is True)
+                            if type(value.get('serverActionIndex')) is int:
+                                root_actions.setdefault(value['serverActionIndex'], []).append((value, enabled))
+                            if value.get('$type') == 'Beyond.Gameplay.Core.CreateBuffAction.Data':
+                                create_actions.append((value, enabled))
+                            pending.extend((item, enabled) for item in value.values())
+                        elif isinstance(value, list):
+                            pending.extend((item, ancestors_enabled) for item in value)
+                    cached_lookup = (root, root_actions, create_actions)
+                    root_lookup_cache[id(root)] = cached_lookup
+                actions = [(value, enabled) for value, enabled in cached_lookup[1].get(origin['actionId'], [])
+                           if value.get('$type') in {'Beyond.Gameplay.Core.VulnerableAction.Data',
+                                                     'Beyond.Gameplay.Core.EnhancedAction.Data'}]
+            if len(actions) != 1 or actions[0][1] is not True:
+                return None
+            action = actions[0][0]
+            kind = {'Beyond.Gameplay.Core.VulnerableAction.Data': 'Vulnerable',
+                    'Beyond.Gameplay.Core.EnhancedAction.Data': 'Enhanced'}[action['$type']]
+            child = (keyword_map.get(kind) or {}).get(action.get('subType'))
+            if not child or child != _normalize_buff_id(record.get('event_key')):
+                return None
+            rate_config = action.get('rate') or {}
+            if (rate_config.get('useBlackboardKey') is not True
+                    or not isinstance(rate_config.get('blackboardKey'), str) or not rate_config['blackboardKey']):
+                return None
+            approval_key = parent_approval_keys[0] if parent_approval_keys else parent
+            parent_approval = isinstance(entry, dict)
+            if not isinstance(entry, dict):
+                # Some historical approvals name the visual child. Resolve
+                # the native keyword main -> explicitly selected child path;
+                # neither naming conventions nor a visual rate create credit.
+                main_root = _load_current_buff_roots().get(child)
+                if not isinstance(main_root, dict):
+                    return None
+                child_config = action.get('childBuffId') or {}
+                if (action.get('overrideChildBuffId') is True
+                        and child_config.get('useBlackboardKey') is False):
+                    visual_child = child_config.get('value')
+                elif action.get('overrideChildBuffId') is False:
+                    defaults = [row for row in main_root.get('blackboard') or []
+                                if isinstance(row, dict) and row.get('key') == 'child_buff_id']
+                    if len(defaults) != 1 or defaults[0].get('isDynamic') is not False:
+                        return None
+                    visual_child = defaults[0].get('valueStr')
+                else:
+                    return None
+                if not isinstance(visual_child, str) or not visual_child:
+                    return None
+                entry = verified.get(visual_child)
+                visual_root = _load_current_buff_roots().get(visual_child)
+                if not isinstance(entry, dict) or not isinstance(visual_root, dict):
+                    return None
+                attributes = visual_root.get('attributeModifier')
+                if (not isinstance(attributes, dict) or attributes.get('attributeModifiers') != []
+                        or visual_root.get('damageModifier') != [] or visual_root.get('globalModifier') != []):
+                    return None
+                forwards = []
+                if root_lookup_cache is None:
+                    pending = [(main_root, True)]
+                    while pending:
+                        value, ancestors_enabled = pending.pop()
+                        if isinstance(value, dict):
+                            enabled = ancestors_enabled and ('serverActionIndex' not in value or value.get('isEnable') is True)
+                            if value.get('$type') == 'Beyond.Gameplay.Core.CreateBuffAction.Data':
+                                for created in value.get('buffs') or []:
+                                    if (created.get('readIdFromBlackboard') is True
+                                            and created.get('buffIdKey') == 'child_buff_id'):
+                                        forwards.append((created, enabled))
+                            pending.extend((item, enabled) for item in value.values())
+                        elif isinstance(value, list):
+                            pending.extend((item, ancestors_enabled) for item in value)
+                else:
+                    cached_lookup = root_lookup_cache.get(id(main_root))
+                    if cached_lookup is None or cached_lookup[0] is not main_root:
+                        root_actions = {}
+                        create_actions = []
+                        pending = [(main_root, True)]
+                        while pending:
+                            value, ancestors_enabled = pending.pop()
+                            if isinstance(value, dict):
+                                enabled = ancestors_enabled and ('serverActionIndex' not in value or value.get('isEnable') is True)
+                                if type(value.get('serverActionIndex')) is int:
+                                    root_actions.setdefault(value['serverActionIndex'], []).append((value, enabled))
+                                if value.get('$type') == 'Beyond.Gameplay.Core.CreateBuffAction.Data':
+                                    create_actions.append((value, enabled))
+                                pending.extend((item, enabled) for item in value.values())
+                            elif isinstance(value, list):
+                                pending.extend((item, ancestors_enabled) for item in value)
+                        cached_lookup = (main_root, root_actions, create_actions)
+                        root_lookup_cache[id(main_root)] = cached_lookup
+                    for value, enabled in cached_lookup[2]:
+                        for created in value.get('buffs') or []:
+                            if (created.get('readIdFromBlackboard') is True
+                                    and created.get('buffIdKey') == 'child_buff_id'):
+                                forwards.append((created, enabled))
+                if len(forwards) != 1 or forwards[0][1] is not True or forwards[0][0].get('assignBlackboard') is not True:
+                    return None
+                assignments = forwards[0][0].get('assignItems') or []
+                for key in ('rate', 'duration'):
+                    assigned = [row for row in assignments if isinstance(row, dict) and row.get('targetKey') == key]
+                    if (len(assigned) != 1 or assigned[0].get('useDirectValue') is not False
+                            or assigned[0].get('inputValueKey') != key):
+                        return None
+                approval_key = visual_child
+                expected_zone = {'Vulnerable': 'fragile', 'Enhanced': 'amp'}[kind]
+                expected_element = {'All': 'all', 'Spell': 'spell', 'Physical': 'physical', 'Natural': 'natural',
+                                    'Fire': 'fire', 'Crystal': 'cryst', 'Pulse': 'pulse'}.get(action.get('subType'))
+                if any(spec.get('zone') != expected_zone or _normalize_effect_element(spec.get('element')) != expected_element
+                       for spec in entry.get('effects') or []):
+                    return None
+            if require_guard and not _rdps_registry_entry_matches_guard(entry, record):
+                return None
+            if (parent == 'buff_chr_0023_antal_tageffect'
+                    and parent_approval_keys == ['buff_chr_0023_antal_normal_fragile']):
+                # The actual keyword Buff reports its current rate. It already
+                # includes any enhancement applied during creation; later op15
+                # observations update that same rate, never a guessed timer.
+                entry = {**entry, 'dynamic': bool(record.get('keyword_rate_snapshots')),
+                         'effects': [{'zone': 'fragile', 'element': element, 'bb_key': 'rate'}
+                                     for element in ('pulse', 'fire')]}
+            specs = entry.get('effects') or []
+            # A reviewed parent input alias only authorizes the exact typed
+            # origin; it must never become a fallback rate on the parent.
+            # The actual keyword main Buff still must expose its own rate.
+            if not specs or any((parent_approval and rate_config.get('blackboardKey') not in {spec.get('bb_key'), *(spec.get('bb_keys') or []), *(spec.get('origin_bb_keys') or [])})
+                                or 'rate' not in {spec.get('bb_key'), *(spec.get('bb_keys') or [])}
+                                for spec in specs):
+                return None
+            projected.extend((key, entry) for key in (parent_approval_keys if parent_approval else [approval_key]))
+        signatures = {json.dumps(entry, sort_keys=True, ensure_ascii=False) for _, entry in projected}
+        if len(signatures) == 1:
+            return {**projected[0][1], '_rdps_whitelist_keys': sorted({key for key, _ in projected}),
+                    '_keyword_origin': copy.deepcopy(origins)}
     return None
 
 
 def _rdps_registry_known_non_rdps_entry(record: dict[str, Any]) -> dict[str, Any] | None:
-    registry = _load_rdps_semantics_registry()
-    known = registry.get("known_non_rdps") if isinstance(registry.get("known_non_rdps"), dict) else {}
-    exact = known.get("exact_buff_ids") if isinstance(known.get("exact_buff_ids"), dict) else {}
     candidates = [
         _normalize_buff_id(record.get("event_key")),
         _normalize_buff_id(record.get("raw_event_key")),
     ]
+    # A registry label is not a structural proof. Check the current typed root.
+    roots = _load_current_buff_roots()
+    type_index = _BUFF_ACTION_TYPES_INDEX
     for key in candidates:
-        entry = exact.get(key)
-        if isinstance(entry, dict) and _rdps_registry_bb_keys_allowed(entry, record):
-            return entry
-
-    prefixes = known.get("prefixes") if isinstance(known.get("prefixes"), list) else []
-    for key in candidates:
-        if not key:
+        root = roots.get(key)
+        if not isinstance(root, dict):
             continue
-        for entry in prefixes:
-            if not isinstance(entry, dict):
-                continue
-            prefix = str(entry.get("prefix") or "")
-            if prefix and key.startswith(prefix) and _rdps_registry_bb_keys_allowed(entry, record):
-                return entry
+        attribute_block = root.get("attributeModifier")
+        attribute_rows = (attribute_block.get("attributeModifiers")
+                          if isinstance(attribute_block, dict) else None)
+        action_types = type_index[1].get(key) if type_index is not None and type_index[0] is roots else None
+        if action_types is None:
+            action_types = set()
+            pending = [root]
+            while pending:
+                value = pending.pop()
+                if isinstance(value, dict):
+                    type_name = str(value.get("$type") or "")
+                    if type_name:
+                        action_types.add(type_name.replace("+", "."))
+                    pending.extend(value.values())
+                elif isinstance(value, list):
+                    pending.extend(value)
+        unsafe_action_tokens = (
+            "DamageScaleProcessor", "InstantModifyAttribute",
+            "ModifyDynamicBlackboard", "DamageActionData",
+        )
+        safe_attribute_types = {
+            "MoveSpeedScalar", "InAirMoveSpeedScalar", "TurnRateScalar",
+            "NormalAttackRange", "PoiseRecTime", "PoiseRecTimeScalar",
+            "ComboSkillCooldownScalar", "ComboSkillCooldownFinalAddition",
+            "ComboSkillCooldownRecoveryScalar", "NormalSkillCooldownAddition",
+            "SkillCooldownScalar", "AtbCostAddition", "MaxUltimateSp",
+            "UltimateSpGainScalar", "MaxHp", "HealTakenIncrease",
+            "HealOutputIncrease", "HpRecoveryPerSecByMaxHpRatio",
+            "SlowActionSpeedScalar", "KeywordSpeedUpScalar",
+            "KnockDownTimeAddition",
+        }
+        attribute_types_safe = (
+            isinstance(attribute_rows, list)
+            and all(isinstance(item, dict) and item.get("attributeType") in safe_attribute_types
+                    for item in attribute_rows)
+        )
+        damage_modifiers_empty = (
+            isinstance(root.get("damageModifier"), list)
+            and all(isinstance(item, dict) and not item.get("damageProcessors")
+                    for item in root.get("damageModifier") or [])
+        )
+        defensive_attribute_names = {
+            "PhysicalDamageTakenScalar", "FireDamageTakenScalar",
+            "PulseDamageTakenScalar", "CrystDamageTakenScalar",
+            "EtherDamageTakenScalar", "NaturalDamageTakenScalar",
+            "HealTakenIncrease",
+        }
+        defensive_attributes_only = (
+            isinstance(attribute_rows, list)
+            and bool(attribute_rows)
+            and all(
+                isinstance(item, dict)
+                and item.get("attributeType") in defensive_attribute_names
+                and item.get("modifyAttributeType") == "Specific"
+                for item in attribute_rows
+            )
+        )
+        defensive_damage_only = (
+            isinstance(root.get("damageModifier"), list)
+            and bool(root.get("damageModifier"))
+            and all(
+                isinstance(item, dict)
+                and item.get("enableSide") == "Defender"
+                and all(
+                    isinstance(proc, dict)
+                    and str(proc.get("$type") or "").endswith("DamageScaleProcessor")
+                    and proc.get("side") == "Defender"
+                    and proc.get("zoneName") == "ProdCalcZone"
+                    for proc in item.get("damageProcessors") or []
+                )
+                for item in root.get("damageModifier") or []
+            )
+        )
+        if (str(record.get("target_character_key") or "").startswith("chr_")
+                and not record.get("target_enemy_key")
+                and not any(any(token in item for token in (
+                    "InstantModifyAttribute", "ModifyDynamicBlackboard", "DamageActionData"))
+                    for item in action_types)
+                and not root.get("globalModifier") and not root.get("healModifier")
+                and ((defensive_attributes_only and damage_modifiers_empty)
+                     or (defensive_attributes_only and defensive_damage_only))):
+            return {
+                "kind": "typed_defensive_only_effect",
+                "proof_kind": "typed_root_structural",
+                "reason": "current typed root only modifies incoming damage/healing on an identified player",
+                "suppress_zone_effects": True,
+            }
+        non_allocating_types = {
+            "Beyond.Blackboard.AssignPair", "Beyond.Blackboard.BlackboardDouble",
+            "Beyond.Blackboard.BlackboardInt", "Beyond.Blackboard.DataPair",
+            "Beyond.Gameplay.AttributeModifierData", "Beyond.Gameplay.Core.AbilityActionMap",
+            "Beyond.Gameplay.Core.AttackClickListenerAction.Data",
+            "Beyond.Gameplay.Core.BuffActionMap", "Beyond.Gameplay.Core.BuffData",
+            "Beyond.Gameplay.Core.BuffIconConfig", "Beyond.Gameplay.Core.BuffIconDurationSourceSetting",
+            "Beyond.Gameplay.Core.BuffStackingSettings", "Beyond.Gameplay.Core.CompareFloat.Data",
+            "Beyond.Gameplay.Core.Conditions.CheckEntityNum.Data",
+            "Beyond.Gameplay.Core.Conditions.CheckSkillType.Data",
+            "Beyond.Gameplay.Core.CreateBuffAction.Data", "Beyond.Gameplay.Core.CreateBuffActionInput",
+            "Beyond.Gameplay.Core.DirectionSettings", "Beyond.Gameplay.Core.FindTargetAction.FindTargetActionData",
+            "Beyond.Gameplay.Core.GameplayTagQuery", "Beyond.Gameplay.Core.IfElseAction.IfElseActionData",
+            "Beyond.Gameplay.Core.ModifyDynamicBlackboard.Data",
+            "Beyond.Gameplay.Core.NotifyCharPassiveUIAction.Data",
+            "Beyond.Gameplay.Core.PlaySoundAction.PlaySoundActionData",
+            "Beyond.Gameplay.Core.ReadSkillSettingData.Data", "Beyond.Gameplay.Core.ReadSkillSettingData.ReadData",
+            "Beyond.Gameplay.Core.Selector.DistanceValidator.Data",
+            "Beyond.Gameplay.Core.Selector.OwnerSpawnedEntityFinder.Data",
+            "Beyond.Gameplay.Core.Selector.SelectorData", "Beyond.Gameplay.Core.Selector.TagValidator.Data",
+            "Beyond.Gameplay.Core.SequenceActionData", "Beyond.Gameplay.Core.SimpleCalcBBAction.Data",
+            "Beyond.Gameplay.Core.TargetSettings", "Beyond.Gameplay.Core.TriggerLiinoUIEvent.Data",
+        }
+        no_allocatable_payload = (
+            root.get("$type") == "Beyond.Gameplay.Core.BuffData"
+            and isinstance(attribute_rows, list) and not attribute_rows
+            and isinstance(root.get("damageModifier"), list) and not root.get("damageModifier")
+            and not root.get("globalModifier") and not root.get("healModifier")
+            and not root.get("poiseModifier") and not root.get("shieldConfigs")
+            and action_types and action_types <= non_allocating_types
+        )
+        if no_allocatable_payload:
+            return {
+                "kind": "typed_root_no_allocatable_effect",
+                "proof_kind": "typed_root_structural",
+                "reason": "current typed root has no attribute, damage, global, heal, poise, or shield effect",
+                "suppress_zone_effects": True,
+            }
+        if (isinstance(attribute_rows, list)
+                and not any(any(token in item for token in unsafe_action_tokens) for item in action_types)
+                and (not attribute_rows or attribute_types_safe)
+                and damage_modifiers_empty
+                and not root.get("globalModifier")
+                and not root.get("healModifier")):
+            return {
+                "kind": "typed_root_no_direct_damage_execution",
+                "proof_kind": "typed_root_structural",
+                "reason": "version-bound BuffData root has no direct damage processor or modifier",
+                "suppress_zone_effects": True,
+            }
     return None
 
 
@@ -1179,12 +1675,19 @@ def _rdps_registry_suppresses_zone_effects(record: dict[str, Any]) -> bool:
     return bool(entry and entry.get("suppress_zone_effects"))
 
 
-def _rdps_registry_verified_effect_entry(record: dict[str, Any]) -> dict[str, Any] | None:
-    return _rdps_registry_matching_effect_entry(record, require_guard=True)
+def _rdps_registry_verified_effect_entry(record: dict[str, Any], *, root_lookup_cache: dict | None = None) -> dict[str, Any] | None:
+    return _rdps_registry_matching_effect_entry(record, require_guard=True, root_lookup_cache=root_lookup_cache)
 
 
-def _rdps_registry_candidate_effect_entry(record: dict[str, Any]) -> dict[str, Any] | None:
-    return _rdps_registry_matching_effect_entry(record, require_guard=False)
+def _rdps_registry_stack_limit(record: dict[str, Any]) -> int | None:
+    entry = _rdps_registry_verified_effect_entry(record)
+    if not isinstance(entry, dict):
+        return None
+    return _positive_int(entry.get("stack_limit"))
+
+
+def _rdps_registry_candidate_effect_entry(record: dict[str, Any], *, root_lookup_cache: dict | None = None) -> dict[str, Any] | None:
+    return _rdps_registry_matching_effect_entry(record, require_guard=False, root_lookup_cache=root_lookup_cache)
 
 
 def _rdps_registry_effect_bb_keys(entry: dict[str, Any]) -> set[str]:
@@ -1202,38 +1705,23 @@ def _rdps_registry_effect_bb_keys(entry: dict[str, Any]) -> set[str]:
 
 
 def _rdps_registry_ignored_bb_keys(entry: dict[str, Any]) -> set[str]:
-    ignored = {key.lower() for key in _RDPS_REGISTRY_CONTROL_BB_KEYS}
-    ignored.update(str(key).lower() for key in _rdps_registry_effect_bb_keys(entry))
-    ignored.update(str(key).lower() for key in entry.get("ignored_bb_keys") or [] if str(key))
-    ignored.update(str(key).lower() for key in entry.get("self_bb_keys") or [] if str(key))
+    ignored = set(_RDPS_REGISTRY_CONTROL_BB_KEYS)
+    ignored.update(_rdps_registry_effect_bb_keys(entry))
+    ignored.update(str(key) for key in entry.get("ignored_bb_keys") or [] if str(key))
+    ignored.update(str(key) for key in entry.get("self_bb_keys") or [] if str(key))
+    ignored.update(str(key) for key in entry.get("allowed_bb_keys") or [] if str(key) != "*")
     return ignored
-
-
-def _rdps_registry_effect_like_bb_key(record: dict[str, Any], bb_key: str) -> bool:
-    lowered = str(bb_key or "").lower()
-    if lowered in _RDPS_REGISTRY_CONTROL_BB_KEYS:
-        return False
-    if _is_damage_increase_bb_key(lowered):
-        return True
-    if any(token in lowered for token in ("atk", "attack", "dmg", "damage", "vulnerable", "fragile", "res", "def_decrease", "crit")):
-        return True
-    label = _label_from_bb_key(
-        lowered,
-        buff_id=_normalize_buff_id(record.get("event_key")),
-        target_is_enemy=bool(record.get("target_enemy_key")),
-    )
-    return _zone_from_label(label or "") is not None
 
 
 def _rdps_registry_unrecognized_effect_bb_keys(entry: dict[str, Any], record: dict[str, Any]) -> list[str]:
     ignored = _rdps_registry_ignored_bb_keys(entry)
-    keys: set[str] = set()
+    keys: set[str] = set(_record_bb_key_set(record))
     keys.update(str(key) for key in (record.get("bb_values") or {}).keys() if str(key))
     keys.update(str(mod.get("bb_key") or "") for mod in record.get("attr_mods") or [] if str(mod.get("bb_key") or ""))
     return sorted(
         key
         for key in keys
-        if key.lower() not in ignored and _rdps_registry_effect_like_bb_key(record, key)
+        if key not in ignored
     )
 
 
@@ -1241,16 +1729,20 @@ def _rdps_registry_effect_runtime_rate(
     spec: dict[str, Any],
     record: dict[str, Any],
 ) -> tuple[float | None, str | None]:
-    bb_values = {str(key): value for key, value in (record.get("bb_values") or {}).items()}
-    candidate_keys = [str(key) for key in spec.get("bb_keys") or [] if str(key)]
-    primary_key = str(spec.get("bb_key") or "")
-    if primary_key and primary_key not in candidate_keys:
-        candidate_keys.insert(0, primary_key)
-    for bb_key in candidate_keys:
-        rate = _safe_positive_rate(bb_values.get(bb_key))
-        if rate is not None:
-            return rate, bb_key
-
+    bb_values = record.get("bb_values") or {}
+    keys = list(dict.fromkeys([str(key) for key in spec.get("bb_keys") or [] if str(key)]))
+    primary = str(spec.get("bb_key") or "")
+    if primary and primary not in keys:
+        keys.insert(0, primary)
+    present = [(key, _coerce_optional_float(bb_values[key])) for key in keys if key in bb_values]
+    if present:
+        if any(value is None or value < 0 for _, value in present):
+            record["rdps_invalid_runtime_rate"] = True
+            return None, None
+        if len({value for _, value in present}) != 1:
+            record["rdps_conflicting_runtime_rate"] = True
+            return None, None
+        return present[0][1], present[0][0]
     formula = str(spec.get("formula") or "")
     if formula == "atk_add_plus_mult_consume_half_for_other_targets":
         add = _coerce_optional_float(bb_values.get(str(spec.get("add_bb_key") or "atk_up_add")))
@@ -1259,15 +1751,17 @@ def _rdps_registry_effect_runtime_rate(
         if add is None or mult is None or consumed is None:
             return None, None
         rate = add + mult * consumed
-        source_key = str(record.get("source_character_key") or "")
-        target_key = str(record.get("target_character_key") or "")
-        if target_key and source_key and target_key != source_key:
-            rate *= float(spec.get("other_target_multiplier") or 0.5)
-        return rate if rate > 0 else None, primary_key or str(spec.get("add_bb_key") or "atk_up_add")
-
-    static_rate = _safe_positive_rate(spec.get("rate"))
-    if static_rate is not None and str(spec.get("value_source") or "").lower() in {"constant", "static_literal"}:
-        return static_rate, primary_key or None
+        source = str(record.get("source_character_key") or "")
+        target = str(record.get("target_character_key") or "")
+        if target and source and target != source:
+            factor = _coerce_optional_float(spec.get("other_target_multiplier", 0.5))
+            if factor is None:
+                return None, None
+            rate *= factor
+        return (rate, primary or str(spec.get("add_bb_key") or "atk_up_add")) if isfinite(rate) and rate >= 0 else (None, None)
+    if str(spec.get("value_source") or "").lower() in {"constant", "static_literal"}:
+        rate = _coerce_optional_float(spec.get("rate"))
+        return (rate, primary or None) if rate is not None and rate >= 0 else (None, None)
     return None, None
 
 
@@ -1291,27 +1785,39 @@ def _rdps_registry_zone_effects(record: dict[str, Any], entry: dict[str, Any]) -
         }
         if used_bb_key:
             effect["_registry_bb_key"] = used_bb_key
-            _attach_bb_key_damage_type_condition(effect, used_bb_key)
+            effect['_registry_bb_keys'] = sorted({used_bb_key, str(spec.get('bb_key') or ''),
+                                                  *(str(key) for key in spec.get('bb_keys') or [])} - {''})
             if spec.get("expose_bb_key"):
                 effect["bb_key"] = used_bb_key
-        if isinstance(spec.get("condition"), dict):
-            effect["condition"] = dict(spec["condition"])
+        if "condition" in spec:
+            effect["condition"] = copy.deepcopy(spec["condition"])
         effects.append(effect)
     return effects
 
 
 def _rdps_registry_validation_error(entry: dict[str, Any], record: dict[str, Any]) -> dict[str, Any] | None:
+    record.pop("rdps_invalid_runtime_rate", None)
+    record.pop("rdps_conflicting_runtime_rate", None)
+    if record.get("rdps_unresolved_semantic_condition"):
+        return {"reason": "unresolved_semantic_condition", "condition_errors": record["rdps_unresolved_semantic_condition"]}
+    if record.get("rdps_unresolved_dynamic_effect"):
+        return {"reason": "unresolved_dynamic_effect_parameters"}
     if not _rdps_registry_bb_keys_allowed(entry, record):
         return {"reason": "registry allowed_bb_keys check failed"}
     unknown_bb_keys = _rdps_registry_unrecognized_effect_bb_keys(entry, record)
     if unknown_bb_keys:
         return {
-            "reason": "verified rDPS buff carried effect-like BB keys not declared by rdps_semantics_registry",
+            "reason": "verified rDPS buff carried BB keys not declared by rdps_semantics_registry",
             "unknown_bb_keys": unknown_bb_keys,
         }
     if entry.get("dynamic"):
         return None
-    if entry.get("effects") and not _rdps_registry_zone_effects(record, entry):
+    resolved = _rdps_registry_zone_effects(record, entry)
+    if record.get("rdps_conflicting_runtime_rate"):
+        return {"reason": "conflicting_runtime_rate"}
+    if record.get("rdps_invalid_runtime_rate"):
+        return {"reason": "invalid_runtime_rate"}
+    if entry.get("effects") and len(resolved) != len(entry["effects"]):
         return {
             "reason": "verified rDPS buff did not expose required runtime BB value declared by rdps_semantics_registry",
             "required_bb_keys": sorted(_rdps_registry_effect_bb_keys(entry)),
@@ -1332,9 +1838,15 @@ def _parse_loadout_suits(raw: str) -> set[str]:
 def _load_weapon_catalog() -> dict[str, dict[str, Any]]:
     root = _repo_root() / "data" / "akedata" / "weapon" / "items"
     catalog: dict[str, dict[str, Any]] = {}
-    if not root.is_dir():
-        return catalog
-    for path in root.glob("*.json"):
+    try:
+        attack_catalog = json.loads((_repo_root() / 'data/packet_semantics/weapon_static_attack_catalog.json').read_text(encoding='utf8'))
+    except (OSError, json.JSONDecodeError):
+        attack_catalog = {}
+    attack_fields = (attack_catalog.get('entries') or []) if (
+        attack_catalog.get('schemaVersion') == 1
+        and attack_catalog.get('source') == 'current_WeaponSkill_cardAttributeModifier'
+        and attack_catalog.get('decoder') == _NATIVE_DAMAGE_SEMANTICS_BINDING) else []
+    for path in root.glob("*.json") if root.is_dir() else []:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -1350,6 +1862,38 @@ def _load_weapon_catalog() -> dict[str, dict[str, Any]]:
             "base_atk_values": payload.get("baseAtk") if isinstance(payload.get("baseAtk"), list) else [],
             "skilllist": payload.get("skilllist") if isinstance(payload.get("skilllist"), list) else [],
         }
+    local_manifest = _repo_root() / "data" / "local_tables" / "weapon" / "manifest.json"
+    try:
+        local_payload = json.loads(local_manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        local_payload = {}
+    for item in local_payload.get("entries", []) if isinstance(local_payload, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        weapon_id = str(item.get("weaponId") or item.get("id") or "")
+        if not weapon_id:
+            continue
+        current = catalog.setdefault(weapon_id, {"weapon_template": weapon_id, "base_atk_values": [], "skilllist": []})
+        current["weapon_name"] = str(item.get("name") or current.get("weapon_name") or weapon_id)
+        current["weapon_type"] = item.get("weaponType") or current.get("weapon_type")
+        current["rarity"] = item.get("rarity") or current.get("rarity")
+        definition_path = _repo_root() / 'data/local_tables/weapon/items' / f'{weapon_id}.json'
+        try:
+            definition_bytes = definition_path.read_bytes()
+            definition = json.loads(definition_bytes)
+        except (OSError, json.JSONDecodeError):
+            continue
+        skills = (definition.get('raw') or {}).get('weaponSkillList')
+        if isinstance(skills, list) and all(isinstance(skill, str) for skill in skills):
+            current['weapon_skill_ids'] = list(skills)
+            current['weapon_definition_sha256'] = hashlib.sha256(definition_bytes).hexdigest()
+            current['static_attack_fields'] = [dict(field) for field in attack_fields
+                if field.get('weaponId') == weapon_id and field.get('skillId') in skills
+                and field.get('modifyAttributeType') == 'Specific'
+                and field.get('formulaItem') in {'BaseMultiplier', 'BaseFinalAddition'}
+                and isinstance(field.get('bbKey'), str)
+                and isinstance(field.get('sourceRootSha256'), str)
+                and re.fullmatch(r'[0-9a-f]{64}', field['sourceRootSha256'])]
     return catalog
 
 
@@ -1369,6 +1913,7 @@ def _load_character_base_stat_catalog() -> dict[str, dict[int, dict[str, Any]]]:
         if not isinstance(attributes, list):
             continue
         level_rows: dict[int, dict[str, Any]] = {}
+        ambiguous_levels: set[int] = set()
         for row in attributes:
             if not isinstance(row, dict):
                 continue
@@ -1387,16 +1932,16 @@ def _load_character_base_stat_catalog() -> dict[str, dict[int, dict[str, Any]]]:
                 except (TypeError, ValueError):
                     continue
                 values[attr_type] = attr_value
-                if attr_type == 0:
-                    level = int(round(attr_value))
-            if level is None:
+                if attr_type == 0 and isfinite(attr_value) and attr_value.is_integer():
+                    level = int(attr_value)
+            if level is None or level in ambiguous_levels:
                 continue
-            break_stage = int(row.get("breakStage") or 0)
+            break_stage = _coerce_optional_int(row.get("breakStage"))
             previous = level_rows.get(level)
-            if previous is not None and int(previous.get("break_stage") or 0) > break_stage:
-                continue
-            level_rows[level] = {
+            current = {
                 "level": level,
+                "main_attr_type": raw.get('mainAttrType'),
+                "sub_attr_type": raw.get('subAttrType'),
                 "break_stage": break_stage,
                 "hp": values.get(1),
                 "atk": values.get(2),
@@ -1406,6 +1951,11 @@ def _load_character_base_stat_catalog() -> dict[str, dict[int, dict[str, Any]]]:
                 "attr_41": values.get(41),
                 "attr_42": values.get(42),
             }
+            if previous is not None and previous != current:
+                level_rows.pop(level)
+                ambiguous_levels.add(level)
+                continue
+            level_rows[level] = current
         if level_rows:
             catalog[path.stem] = level_rows
     return catalog
@@ -1418,39 +1968,22 @@ def _character_base_stats(character_key: str | None, level: int | None) -> dict[
     rows = _load_character_base_stat_catalog().get(key)
     if not rows:
         return None
-    if level is None or level <= 0:
-        max_level = max(rows)
-        return {
-            **rows[max_level],
-            "level_source": "assumed_max_level",
-        }
+    if type(level) is not int or level <= 0:
+        return None
     exact = rows.get(int(level))
     if exact is not None:
         return {
             **exact,
             "level_source": "loadout",
         }
-    lower_levels = [value for value in rows if value <= int(level)]
-    if lower_levels:
-        nearest = max(lower_levels)
-        return {
-            **rows[nearest],
-            "level_source": "nearest_lower_level",
-        }
-    nearest = min(rows)
-    return {
-        **rows[nearest],
-        "level_source": "nearest_level",
-    }
+    return None
 
 
 @lru_cache(maxsize=1)
 def _load_suit_catalog() -> dict[str, dict[str, Any]]:
     root = _repo_root() / "data" / "akedata" / "equip" / "items"
     catalog: dict[str, dict[str, Any]] = {}
-    if not root.is_dir():
-        return catalog
-    for path in root.glob("*.json"):
+    for path in root.glob("*.json") if root.is_dir() else []:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -1464,16 +1997,89 @@ def _load_suit_catalog() -> dict[str, dict[str, Any]]:
             "description": str(payload.get("技能描述") or ""),
             "value": payload.get("value") if isinstance(payload.get("value"), dict) else {},
         }
+    local_root = _repo_root() / "data" / "local_tables" / "equip" / "items"
+    for path in local_root.glob("*.json") if local_root.is_dir() else []:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        suit_id = str(payload.get("suitID") or path.stem)
+        current = catalog.setdefault(suit_id, {"suit_id": suit_id})
+        current.update({
+            "suit_name": str(payload.get("name") or payload.get("displayName") or current.get("suit_name") or suit_id),
+            "description": str(payload.get("skillDescription") or current.get("description") or ""),
+            "value": payload.get("value") if isinstance(payload.get("value"), dict) else current.get("value", {}),
+            "required_piece_count": payload.get("requiredPieceCount") if type(payload.get("requiredPieceCount")) is int else None,
+        })
     return catalog
+
+
+@lru_cache(maxsize=1)
+def _load_weapon_refine_catalog() -> dict[str, Any]:
+    path = _repo_root() / 'data' / 'local_tables' / 'weapon' / 'refine_catalog.json'
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data.get('entries', {}) if isinstance(data, dict) else {}
+
+
+def _infer_verified_weapon_refine_from_levels(weapon_template: str, source_skills: Any, *, gem_terms: Any = None) -> int | None:
+    entry = _load_weapon_refine_catalog().get(weapon_template, {})
+    main_id = str(entry.get('mainSkillId') or '')
+    accepted_ids = {main_id, str(entry.get('mainSkillNumId') or '')} - {''}
+    gem_cost = None
+    if gem_terms is not None:
+        # Callers must bind this complete gem snapshot to the equipped weapon.
+        if not isinstance(gem_terms, list) or not gem_terms:
+            return None
+        terms = {}
+        for term in gem_terms:
+            if (not isinstance(term, dict) or type(term.get('term_num_id')) is not int
+                    or type(term.get('cost')) is not int or term['term_num_id'] <= 0
+                    or not 0 <= term['cost'] <= 6 or term['term_num_id'] in terms):
+                return None
+            terms[term['term_num_id']] = term['cost']
+        term_id = entry.get('mainSkillGemTermNumId')
+        if type(term_id) is not int or not entry.get('mainSkillBounds') or not entry.get('refineBonusBounds'):
+            return None
+        gem_cost = terms.get(term_id, 0)
+    values = set()
+    for skill in source_skills or []:
+        if not isinstance(skill, dict):
+            continue
+        ids = {str(skill[key]) for key in ('skill_id', 'skillKey', 'skill_str_id', 'skill_int_id') if skill.get(key) not in (None, '', 0)}
+        if not ids.intersection(accepted_ids):
+            continue
+        if not ids.issubset(accepted_ids):
+            return None
+        level = skill.get('level')
+        if isinstance(level, bool) or not str(level).isdigit():
+            return None
+        # Base breakthrough/gem levels and refinement bonuses overlap.
+        # Accept only totals with one possible refinement in the official tables.
+        value = entry.get('skillLevelToRefine', {}).get(str(int(level)))
+        if gem_cost is not None:
+            if int(level) not in entry.get('supportedSkillLevels', []):
+                return None
+            candidates = {int(refine) for refine, bonus in entry['refineBonusBounds'].items()
+                          for bound in entry['mainSkillBounds']
+                          if min(bound['lowerBound'] + bonus['lowerBound'] + gem_cost,
+                                 bound['upperBound'] + bonus['upperBound']) == int(level)}
+            value = next(iter(candidates)) if len(candidates) == 1 else None
+        if value is None:
+            return None
+        values.add(int(value))
+    return next(iter(values)) if len(values) == 1 else None
 
 
 @lru_cache(maxsize=1)
 def _load_equip_item_catalog() -> dict[str, dict[str, Any]]:
     root = _repo_root() / "data" / "akedata" / "equip" / "items"
     catalog: dict[str, dict[str, Any]] = {}
-    if not root.is_dir():
-        return catalog
-    for path in root.glob("*.json"):
+    for path in root.glob("*.json") if root.is_dir() else []:
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -1499,6 +2105,57 @@ def _load_equip_item_catalog() -> dict[str, dict[str, Any]]:
                 "main_attr": item.get("主词条") if isinstance(item.get("主词条"), dict) else None,
                 "sub_attrs": item.get("副词条") if isinstance(item.get("副词条"), dict) else {},
             }
+    local_root = _repo_root() / "data" / "local_tables" / "equip"
+    suit_names: dict[str, str] = {}
+    for suit_path in (local_root / "items").glob("*.json") if (local_root / "items").is_dir() else []:
+        try:
+            suit_payload = json.loads(suit_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(suit_payload, dict):
+            suit_id = str(suit_payload.get("suitID") or suit_path.stem)
+            suit_names[suit_id] = str(suit_payload.get("name") or suit_payload.get("displayName") or suit_id)
+    pieces_path = local_root / "pieces.json"
+    try:
+        pieces_payload = json.loads(pieces_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        pieces_payload = {}
+    for item in pieces_payload.get("entries", []) if isinstance(pieces_payload, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("itemId") or item.get("id") or "")
+        if not key:
+            continue
+        typed_attributes = item.get('equipAttrModifiers')
+        typed_proof = pieces_payload.get('sourceTableSha256')
+        if key in catalog:
+            catalog[key]['attribute_modifiers'] = typed_attributes
+            catalog[key]['attribute_source_sha256'] = typed_proof
+            continue
+        main = item.get("displayBaseAttrModifier")
+        sub_rows = item.get("displayAttrModifiers") if isinstance(item.get("displayAttrModifiers"), list) else []
+        main_attr = None
+        if isinstance(main, dict):
+            main_attr = {"desc": f"attribute_type_{main.get('attrType')}", "value": main.get("attrValue")}
+        sub_attrs: dict[str, dict[str, Any]] = {}
+        for index, row in enumerate(sub_rows, start=1):
+            if not isinstance(row, dict):
+                continue
+            values = [row.get("attrValue"), *(row.get("enhancedAttrValues") or [])]
+            sub_attrs[f"词条{index}"] = {"desc": f"attribute_type_{row.get('attrType')}", "value": values}
+        suit_id = str(item.get("suitID") or "suit_none")
+        catalog[key] = {
+            "item_id": key,
+            "item_name": str(item.get("name") or key),
+            "suit_id": suit_id,
+            "suit_name": suit_names.get(suit_id, suit_id),
+            "part_name": str(item.get("partName") or ""),
+            "rarity": item.get("rarity"),
+            "main_attr": main_attr,
+            "sub_attrs": sub_attrs,
+            "attribute_modifiers": typed_attributes,
+            "attribute_source_sha256": typed_proof,
+        }
     return catalog
 
 
@@ -1588,7 +2245,9 @@ def _parse_suit_counts(raw: str | None) -> list[dict[str, Any]]:
                 "suit_id": suit_id,
                 "suit_name": meta.get("suit_name") or suit_id,
                 "piece_count": count,
-                "active": count >= 3,
+                "required_piece_count": meta.get("required_piece_count"),
+                "active": (type(meta.get("required_piece_count")) is int
+                           and count >= int(meta["required_piece_count"])),
                 "description": meta.get("description") or "",
                 "value": meta.get("value") or {},
             }
@@ -1618,142 +2277,23 @@ def _parse_weapon_source_skills(blob: str | None) -> list[dict[str, Any]]:
     return skills
 
 
-def _weapon_value_options(value: Any) -> list[Any]:
-    if isinstance(value, list):
-        return value
-    if value is None:
-        return []
-    return [value]
 
 
-def _select_weapon_option(options: list[Any], level: Any) -> Any:
-    if not options or level is None:
-        return None
-    try:
-        level_int = int(level)
-    except (TypeError, ValueError):
-        return None
-    if 0 <= level_int < len(options):
-        return options[level_int]
-    if 1 <= level_int <= len(options):
-        return options[level_int - 1]
-    return None
 
 
-def _weapon_values_match(expected: Any, observed: Any) -> bool:
-    if isinstance(expected, (int, float)) and isinstance(observed, (int, float)):
-        return isclose(float(expected), float(observed), rel_tol=1e-6, abs_tol=1e-6)
-    return str(expected) == str(observed)
 
 
-def _normalize_weapon_refine_index(index: int, option_count: int) -> int:
-    if option_count <= 0:
-        return index
-    display_tier_count = 6
-    offset = max(0, option_count - display_tier_count)
-    normalized = index - offset
-    if normalized < 0:
-        return 0
-    max_normalized = max(0, min(option_count, display_tier_count) - 1)
-    return min(normalized, max_normalized)
 
 
-def _weapon_skill_blackboard_rows(weapon_template: str) -> list[dict[str, Any]]:
-    meta = _load_weapon_catalog().get(weapon_template, {})
-    rows: list[dict[str, Any]] = []
-    for index, skill in enumerate(meta.get("skilllist") or []):
-        if not isinstance(skill, dict):
-            continue
-        blackboard_rows = [
-            raw
-            for raw in skill.get("blackboard") or []
-            if isinstance(raw, dict) and str(raw.get("key") or "").strip()
-        ]
-        if not blackboard_rows:
-            continue
-        rows.append(
-            {
-                "index": index,
-                "keys": {str(raw.get("key") or "").strip() for raw in blackboard_rows},
-                "blackboard": blackboard_rows,
-            }
-        )
-    return rows
+
+
 
 
 def _infer_weapon_refine_from_source_skills(
     weapon_template: str,
     source_skills: list[dict[str, Any]] | None,
 ) -> int | None:
-    skill_rows = _weapon_skill_blackboard_rows(weapon_template)
-    if not skill_rows:
-        return None
-
-    source_rows: list[dict[str, Any]] = []
-    for skill in source_skills or []:
-        if not isinstance(skill, dict):
-            continue
-        blackboard = skill.get("bb") if isinstance(skill.get("bb"), dict) else skill.get("blackboard")
-        if not isinstance(blackboard, dict) or not blackboard:
-            continue
-        keys = {str(key or "").strip() for key in blackboard.keys() if str(key or "").strip()}
-        if not keys:
-            continue
-        source_rows.append(
-            {
-                "keys": keys,
-                "blackboard": blackboard,
-                "level": _coerce_int(skill.get("level"), default=0),
-            }
-        )
-    if not source_rows:
-        return None
-
-    passive_row = max(skill_rows, key=lambda row: (len(row["keys"]), int(row["index"])))
-    passive_keys = set(passive_row["keys"])
-    best_source = max(
-        source_rows,
-        key=lambda row: (
-            len(passive_keys & set(row["keys"])),
-            len(set(row["keys"])),
-            int(row["level"] or 0),
-        ),
-    )
-    if not (passive_keys & set(best_source["keys"])):
-        return None
-
-    max_option_count = max(
-        len(_weapon_value_options(raw.get("value")))
-        for raw in passive_row["blackboard"]
-        if _weapon_value_options(raw.get("value"))
-    )
-    candidates: list[int] = []
-    for refine in range(max_option_count):
-        compared = 0
-        mismatch = False
-        for raw in passive_row["blackboard"]:
-            key = str(raw.get("key") or "").strip()
-            if not key or key not in best_source["blackboard"]:
-                continue
-            expected = _select_weapon_option(_weapon_value_options(raw.get("value")), refine)
-            observed = best_source["blackboard"].get(key)
-            compared += 1
-            if expected is None or not _weapon_values_match(expected, observed):
-                mismatch = True
-                break
-        if compared and not mismatch:
-            candidates.append(refine)
-
-    hinted_refine = int(best_source["level"] - 1) if int(best_source["level"] or 0) > 0 else None
-    if len(candidates) == 1:
-        return _normalize_weapon_refine_index(candidates[0], max_option_count)
-    if hinted_refine is not None and hinted_refine in candidates:
-        return _normalize_weapon_refine_index(hinted_refine, max_option_count)
-    if hinted_refine is not None and 0 <= hinted_refine < max_option_count:
-        return _normalize_weapon_refine_index(hinted_refine, max_option_count)
-    if candidates:
-        return _normalize_weapon_refine_index(candidates[0], max_option_count)
-    return None
+    return _infer_verified_weapon_refine_from_levels(weapon_template, source_skills)
 
 
 def _selected_weapon_base_atk(weapon_template: str, weapon_level: int | None) -> Any:
@@ -1770,9 +2310,16 @@ def _parse_loadout_slot_snapshot(raw_line: str) -> dict[str, Any] | None:
     if not char_key or not char_key.startswith("chr_"):
         return None
     weapon_template = _token_field(raw_line, "weaponTemplate") or ""
-    weapon_level = _coerce_int(_token_field(raw_line, "weaponLv"), default=0)
+    # The wire format uses weaponLv=0 when the instance level is not present
+    # (for example template_only syncs). Preserve that distinction instead of
+    # exposing zero as a real level; static attack curves require a positive
+    # level and must remain unknown otherwise.
+    raw_weapon_level = _coerce_int(_token_field(raw_line, "weaponLv"), default=0)
+    weapon_level = raw_weapon_level if raw_weapon_level > 0 else None
     weapon_meta = _load_weapon_catalog().get(weapon_template, {})
     equip_suit_blob = _braced_field(raw_line, "equipSuit") or ""
+    raw_refine = _token_field(raw_line, "refine") or ""
+    weapon_refine = int(raw_refine) if re.fullmatch(r"[0-5]", raw_refine) else None
     row = {
         "slot": _coerce_int(_token_field(raw_line, "slot"), default=0),
         "character_key": char_key,
@@ -1783,8 +2330,8 @@ def _parse_loadout_slot_snapshot(raw_line: str) -> dict[str, Any] | None:
         "weapon_template": weapon_template,
         "weapon_name": weapon_meta.get("weapon_name") or weapon_template,
         "weapon_level": weapon_level,
-        "weapon_refine": _coerce_int(_token_field(raw_line, "refine"), default=0),
-        "weapon_refine_source": "loadout",
+        "weapon_refine": weapon_refine,
+        "weapon_refine_source": "loadout" if weapon_refine is not None else None,
         "weapon_break": _coerce_int(_token_field(raw_line, "break"), default=0),
         "weapon_base_atk": _selected_weapon_base_atk(weapon_template, weapon_level),
         "weapon_catalog_skilllist": weapon_meta.get("skilllist") or [],
@@ -1797,20 +2344,69 @@ def _parse_loadout_slot_snapshot(raw_line: str) -> dict[str, Any] | None:
         "gem_template": None,
         "gem_terms": {},
     }
+    unplaced = re.search(r'\bunplacedEquipInstIds=\[([^\]]*)\]', raw_line)
+    if unplaced:
+        row['unresolved_equip_inst_ids'] = re.findall(r'\d+', unplaced.group(1))
+    complete = _token_field(raw_line, 'equipsComplete')
+    if complete in {'0', '1'}:
+        row['equipment_snapshot_complete'] = complete == '1'
     return row
 
 
-def _parse_loadout_stats_snapshot(raw_line: str) -> dict[str, Any] | None:
+def _parse_loadout_stats_snapshot(
+    raw_line: str,
+    *,
+    loadout_context: dict[str, Any] | None = None,
+    squad_actor_keys: dict[str, str] | None = None,
+    allow_bound_gem: bool = False,
+) -> dict[str, Any] | None:
+    if " CHAR_SKILLS " in raw_line:
+        parsed = _parse_char_skills_line(raw_line)
+        if parsed is None or not loadout_context or not squad_actor_keys:
+            return None
+        char_key, levels = parsed
+        owner_id = str(_token_field(raw_line, "ownerId") or "")
+        if (squad_actor_keys.get(owner_id) != char_key
+                or list(squad_actor_keys.values()).count(char_key) != 1
+                or loadout_context.get("character_key") != char_key
+                or not re.fullmatch(r"[1-9]\d*", str(loadout_context.get("weapon_inst_id") or ""))
+                or loadout_context.get("weapon_refine") is not None):
+            return None
+        weapon_template = str(loadout_context.get("weapon_template") or "")
+        main_skill = _load_weapon_refine_catalog().get(weapon_template, {}).get("mainSkillId")
+        if not main_skill or main_skill not in levels:
+            return None
+        refine = _infer_verified_weapon_refine_from_levels(
+            weapon_template, [{"skill_id": main_skill, "level": levels[main_skill]}]
+        )
+        if refine is None:
+            return None
+        return {**copy.deepcopy(loadout_context), "weapon_refine": refine,
+                "weapon_refine_source": "source_skill",
+                "weapon_refine_evidence": {"source": "CHAR_SKILLS", "owner_id": owner_id,
+                    "weapon_inst_id": str(loadout_context["weapon_inst_id"]),
+                    "skill_id": main_skill, "level": levels[main_skill]}}
     char_key = _token_field(raw_line, "char")
     if not char_key or not char_key.startswith("chr_"):
         return None
     weapon_template = _token_field(raw_line, "weaponTemplate") or ""
-    weapon_level = _coerce_int(_token_field(raw_line, "weaponLv"), default=0)
+    raw_weapon_level = _coerce_int(_token_field(raw_line, "weaponLv"), default=0)
+    weapon_level = raw_weapon_level if raw_weapon_level > 0 else None
     weapon_refine_stats = _parse_weapon_source_skills(_braced_field(raw_line, "weaponRefineStats"))
     weapon_source_skills = _parse_weapon_source_skills(_braced_field(raw_line, "weaponSourceSkills"))
-    inferred_refine = _infer_weapon_refine_from_source_skills(
+    gem_terms = None
+    weapon_inst = str(_token_field(raw_line, "weaponInstId") or "")
+    gem_inst = str(_token_field(raw_line, "gemInstId") or "")
+    raw_terms = _braced_field(raw_line, "gemTerms")
+    if (allow_bound_gem and re.fullmatch(r"[1-9]\d*", weapon_inst) and re.fullmatch(r"[1-9]\d*", gem_inst)
+            and _token_field(raw_line, "gemWeaponId") == weapon_inst and raw_terms):
+        matches = [re.fullmatch(r"(\d+):[^,@{}]*@cost(\d+)", part.strip()) for part in raw_terms.split(',')]
+        if all(matches):
+            gem_terms = [{"term_num_id": int(match[1]), "cost": int(match[2])} for match in matches]
+    inferred_refine = _infer_verified_weapon_refine_from_levels(
         weapon_template,
         weapon_source_skills or weapon_refine_stats,
+        gem_terms=gem_terms,
     )
     return {
         "character_key": char_key,
@@ -1833,6 +2429,10 @@ def _merge_loadout_snapshot(base: dict[str, Any], update: dict[str, Any]) -> dic
     current_refine_source = merged.get("weapon_refine_source")
     update_refine_source = update.get("weapon_refine_source")
     for key, value in update.items():
+        if update.get('equipment_snapshot_complete') is True and key in {
+                'equips', 'suit_effects', 'equip_suit_raw', 'unresolved_equip_inst_ids'}:
+            merged[key] = copy.deepcopy(value)
+            continue
         if value in (None, "", [], {}):
             continue
         if key == "equips" and isinstance(value, list):
@@ -1863,58 +2463,34 @@ def _select_loadout_snapshot_for_battle(
     fallback_by_char: dict[str, dict[str, Any]],
     *,
     anchor_ms: int | None,
+    anchor_line_no: int | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Pick the loadout group that belongs to the current battle window.
-
-    Live overlay context can contain stale bag/loadout snapshots from before a
-    timer reset. Use the most recent complete group before the first relevant
-    hit instead of merging every character ever seen in the retained context.
-    """
-    groups = [group for group in loadout_groups if group.get("rows")]
-    if anchor_ms is not None:
-        eligible = [
-            group
-            for group in groups
-            if int(group.get("ts_ms") or 0) <= anchor_ms + 1000
-        ]
-    else:
-        eligible = groups
-    if not eligible:
-        eligible = groups
-    if not eligible:
+    """Apply observed loadout updates in source order up to the battle boundary."""
+    groups = [group for group in loadout_groups if isinstance(group.get('rows'), dict) and group['rows']]
+    if not groups:
         return {key: dict(value) for key, value in fallback_by_char.items()}
-
-    reason_rank = {
-        "BATTLE_START": 4,
-        "SC_SELF_SCENE_INFO": 3,
-        "SC_SYNC_CHAR_BAG_INFO": 2,
-        "SC_ITEM_BAG_SCOPE_MODIFY": 1,
-    }
-    selected = max(
-        eligible,
-        key=lambda group: (
-            int(group.get("ts_ms") or 0),
-            reason_rank.get(str(group.get("reason") or ""), 0),
-            int(group.get("index") or 0),
-        ),
-    )
-    rows = selected.get("rows")
-    if not isinstance(rows, dict):
+    eligible = [group for group in groups if anchor_ms is None
+                or (type(group.get('ts_ms')) is int and (group['ts_ms'] < anchor_ms
+                    or (group['ts_ms'] == anchor_ms and (anchor_line_no is None
+                        or int(group.get('line_no') or 0) <= anchor_line_no))))]
+    if not eligible:
         return {}
-    merged_rows: dict[str, dict[str, Any]] = {}
-    for key, value in rows.items():
-        if not isinstance(value, dict):
-            continue
-        character_key = str(key)
-        fallback = fallback_by_char.get(character_key)
-        if isinstance(fallback, dict):
-            merged_rows[character_key] = _merge_loadout_snapshot(fallback, value)
-        else:
-            merged_rows[character_key] = dict(value)
-    return merged_rows
+    state: dict[str, dict[str, Any]] = {}
+    selected_rows: dict[str, Any] = {}
+    for group in eligible:
+        selected_rows = group['rows']
+        for key, value in selected_rows.items():
+            if not isinstance(value, dict):
+                continue
+            character_key = str(key)
+            state[character_key] = _merge_tracked_loadout_state(state.get(character_key, {}), value)
+    # Restrict output to the observed snapshot's character keys. Do not merge
+    # future fallback state into the historical battle or rank packet reasons.
+    return {str(key): state[str(key)] for key in selected_rows if str(key) in state}
 
 
 _WEAPON_LOADOUT_STATE_FIELDS = {
+    "weapon_refine_evidence",
     "weapon_inst_id",
     "weapon_template",
     "weapon_name",
@@ -2155,18 +2731,8 @@ def _repair_weapon_puton_loadout_groups(
     return repaired_fallback
 
 
-def _equip_is_edc(equip: dict[str, Any]) -> bool:
-    item_id = str(equip.get("item_id") or "")
-    part_name = str(equip.get("part_name") or "")
-    return "_edc_" in item_id or "饰品" in part_name or "终端" in part_name
 
 
-def _alternate_edc_slot(slot: int | None) -> int | None:
-    if slot == 2:
-        return 3
-    if slot == 3:
-        return 2
-    return None
 
 
 def _suit_effect_count_map(value: object) -> dict[str, int]:
@@ -2181,15 +2747,6 @@ def _suit_effect_count_map(value: object) -> dict[str, int]:
     return counts
 
 
-def _equip_suit_counts(equips: list[dict[str, Any]]) -> Counter[str]:
-    counts: Counter[str] = Counter()
-    for equip in equips:
-        if not isinstance(equip, dict):
-            continue
-        suit_id = str(equip.get("suit_id") or "")
-        if suit_id:
-            counts[suit_id] += 1
-    return counts
 
 
 def _merge_loadout_equips_by_slot(
@@ -2215,30 +2772,10 @@ def _merge_loadout_equips_by_slot(
             slot = None
         if slot is not None and slot in slot_index:
             existing = merged[slot_index[slot]]
-            alternate_slot = _alternate_edc_slot(slot)
-            existing_suit = str(existing.get("suit_id") or "")
-            update_suit = str(equip.get("suit_id") or "")
-            if (
-                alternate_slot is not None
-                and alternate_slot not in slot_index
-                and existing_suit
-                and _equip_is_edc(existing)
-                and _equip_is_edc(equip)
-                and suit_counts
-            ):
-                current_counts = _equip_suit_counts(merged)
-                after_replace = current_counts.get(existing_suit, 0) - 1
-                if update_suit == existing_suit:
-                    after_replace += 1
-                if int(suit_counts.get(existing_suit, 0) or 0) > after_replace:
-                    moved = dict(existing)
-                    moved["slot"] = alternate_slot
-                    merged.append(moved)
-                    slot_index[alternate_slot] = len(merged) - 1
-            merged[slot_index[slot]] = {
-                **existing,
-                **{key: value for key, value in equip.items() if value not in (None, "", [], {})},
-            }
+            # A different item replaces the whole old row. Its absent stats
+            # cannot be borrowed from the previous item in this slot.
+            merged[slot_index[slot]] = (dict(equip) if existing.get('item_id') != equip.get('item_id') else {
+                **existing, **equip})
         else:
             merged.append(dict(equip))
             if slot is not None:
@@ -2311,10 +2848,13 @@ def _canonical_packet_buff_id(
     canonical = hint.get("canonical_buff_id")
     if canonical:
         return str(canonical)
-    for candidate_key in (source_key, owner_key, None):
-        fallback = _canonical_num_table_buff_number(raw_buff_id, candidate_key)
-        if fallback:
-            return fallback
+    fallback_ids = {
+        fallback
+        for candidate_key in (source_key, owner_key, None)
+        if (fallback := _canonical_num_table_buff_number(raw_buff_id, candidate_key))
+    }
+    if len(fallback_ids) == 1:
+        return next(iter(fallback_ids))
     return raw_buff_id
 
 
@@ -2588,6 +3128,7 @@ def _parse_char_skills_line(raw_line: str) -> tuple[str, dict[str, int]] | None:
     if not owner_key or not tokens_match:
         return None
     levels: dict[str, int] = {}
+    conflicted: set[str] = set()
     for token in tokens_match.group(1).split():
         skill_id, _, level_text = token.rpartition(":")
         level = _coerce_int(level_text, default=0)
@@ -2598,7 +3139,13 @@ def _parse_char_skills_line(raw_line: str) -> tuple[str, dict[str, int]] | None:
             if not resolved:
                 continue
             skill_id = resolved
-        levels[skill_id] = level
+        if skill_id in conflicted:
+            continue
+        if skill_id in levels and levels[skill_id] != level:
+            levels.pop(skill_id)
+            conflicted.add(skill_id)
+        else:
+            levels[skill_id] = level
     if not levels:
         return None
     return owner_key, levels
@@ -2706,38 +3253,49 @@ def _is_runtime_numeric_skill_id(skill_key: str | None) -> bool:
 
 def _canonical_packet_skill_id(skill_key: str | None) -> str:
     raw_skill_key = str(skill_key or "")
-    hint = _packet_numeric_skill_hint(raw_skill_key)
-    canonical = hint.get("canonical_skill_id")
-    return str(canonical or raw_skill_key)
+    number = _runtime_skill_number(raw_skill_key)
+    if not number:
+        return raw_skill_key
+    return _canonical_num_table_skill_number(number, None) or raw_skill_key
 
 
 def _canonical_hit_skill_id(skill_key: str | None, character_key: str | None) -> str:
     raw_skill_key = str(skill_key or "")
-    direct = _canonical_packet_skill_id(raw_skill_key)
-    if direct != raw_skill_key:
-        return direct
-    skill_number = _runtime_skill_number(raw_skill_key)
-    if skill_number and character_key:
-        composite_key = f"{character_key}_skill_{skill_number}"
-        composite = _canonical_packet_skill_id(composite_key)
-        if composite != composite_key:
-            return composite
+    number = _runtime_skill_number(raw_skill_key)
+    if number and _canonical_num_table_skill_id(raw_skill_key, character_key) and _canonical_num_table_buff_number(number, character_key):
+        return raw_skill_key
     num_table_skill = _canonical_num_table_skill_id(raw_skill_key, character_key)
     if num_table_skill:
         return num_table_skill
     return raw_skill_key
 
 
-def _canonical_runtime_buff_skill_id(skill_key: str | None, character_key: str | None) -> str | None:
+def _canonical_runtime_buff_skill_id(
+    skill_key: str | None,
+    character_key: str | None,
+    *,
+    action_id: int | None = None,
+    damage_unit_index: int | None = None,
+) -> str | None:
     skill_number = _runtime_skill_number(skill_key)
     canonical_buff_id = _canonical_num_table_buff_number(skill_number, character_key)
     if not canonical_buff_id:
         return None
-    if canonical_buff_id.startswith(f"buff_{character_key}_"):
-        if any(token in canonical_buff_id for token in ("damage", "bleed", "effect", "trigger", "airborne", "break")):
-            return canonical_buff_id
-    if canonical_buff_id.startswith(("buff_common_", "buff_physical_", "buff_fire_", "buff_pulse_", "buff_cryst_", "buff_natural_")):
-        if any(token in canonical_buff_id for token in ("trigger", "airborne", "break", "damage")):
+    # Skill and Buff number spaces can overlap. An action/unit number alone
+    # cannot establish the namespace of a conflicting numeric template.
+    if _canonical_num_table_skill_id(skill_key, character_key):
+        return None
+    if action_id is not None:
+        profile = _load_official_skill_damage_catalog().get(canonical_buff_id, {})
+        units = (profile.get("actions") or {}).get(str(action_id), [])
+        exact_units = [
+            unit for unit in units
+            if isinstance(unit, dict)
+            and unit.get("damageAttribute") == "hp"
+            and unit.get("element")
+            and unit.get("index") == damage_unit_index
+        ]
+        if len(exact_units) == 1:
             return canonical_buff_id
     return None
 
@@ -2784,50 +3342,8 @@ def _skill_related_buff_ids(skill_id: str) -> set[str]:
     return ids
 
 
-@lru_cache(maxsize=16384)
-def _buff_semantically_reaches_buff(source_buff_id: str, target_buff_id: str, max_depth: int = 3) -> bool:
-    source = str(source_buff_id or "")
-    target = str(target_buff_id or "")
-    if not source or not target:
-        return False
-    if source == target:
-        return True
-    frontier = set(_related_child_buff_ids(source))
-    seen = set(frontier)
-    depth = 0
-    while frontier and depth < max_depth:
-        if target in frontier:
-            return True
-        next_frontier: set[str] = set()
-        for buff_id in frontier:
-            next_frontier.update(_related_child_buff_ids(buff_id))
-        next_frontier -= seen
-        seen.update(next_frontier)
-        frontier = next_frontier
-        depth += 1
-    return False
 
 
-@lru_cache(maxsize=16384)
-def _skill_semantically_reaches_buff(skill_id: str, target_buff_id: str, max_depth: int = 4) -> bool:
-    skill = str(skill_id or "")
-    target = str(target_buff_id or "")
-    if not skill or not target:
-        return False
-    frontier = set(_skill_related_buff_ids(skill))
-    seen = set(frontier)
-    depth = 0
-    while frontier and depth < max_depth:
-        if target in frontier:
-            return True
-        next_frontier: set[str] = set()
-        for buff_id in frontier:
-            next_frontier.update(_related_child_buff_ids(buff_id))
-        next_frontier -= seen
-        seen.update(next_frontier)
-        frontier = next_frontier
-        depth += 1
-    return False
 
 
 def _derived_skill_id_from_origin_skill(origin_skill_id: str | None) -> str | None:
@@ -2839,421 +3355,21 @@ def _derived_skill_id_from_origin_skill(origin_skill_id: str | None) -> str | No
     return f"{origin}_projhit"
 
 
-def _runtime_skill_trigger_chain_mapping(
-    skill_key: str | None,
-    character_key: str | None,
-    *,
-    original_template_int_id: int | None,
-    target_enemy_key: str | None,
-    ts_ms: int,
-    recent_numeric_buffs_by_source: dict[str, list[dict[str, Any]]],
-    max_delta_ms: int = 1000,
-) -> dict[str, Any] | None:
-    skill_number = _runtime_skill_number(skill_key)
-    if not skill_number or not character_key or original_template_int_id is None:
-        return None
-    trigger_buff_id = _canonical_num_table_buff_number(skill_number, character_key)
-    if not trigger_buff_id or not trigger_buff_id.startswith(f"buff_{character_key}_"):
-        return None
-    if not any(token in trigger_buff_id for token in ("damage", "trigger")):
-        return None
-    origin_skill_id = _canonical_num_table_skill_number(str(original_template_int_id), character_key)
-    if not origin_skill_id or not origin_skill_id.startswith(f"{character_key}_"):
-        return None
-    if not _skill_semantically_reaches_buff(origin_skill_id, trigger_buff_id):
-        return None
-
-    trigger_buff_evidence: dict[str, Any] | None = None
-    for buff in reversed(recent_numeric_buffs_by_source.get(str(character_key), [])):
-        delta_ms = ts_ms - int(buff.get("ts_ms") or 0)
-        if delta_ms < -50:
-            continue
-        if delta_ms > max_delta_ms:
-            break
-        buff_target_enemy = str(buff.get("target_enemy_key") or "")
-        if target_enemy_key and buff_target_enemy and buff_target_enemy != str(target_enemy_key):
-            continue
-        raw_event_key = str(buff.get("raw_event_key") or "")
-        if not raw_event_key.isdigit():
-            continue
-        candidate_buff_id = _canonical_num_table_buff_number(raw_event_key, character_key)
-        if not candidate_buff_id:
-            continue
-        if candidate_buff_id != trigger_buff_id and not _buff_semantically_reaches_buff(candidate_buff_id, trigger_buff_id):
-            continue
-        trigger_buff_evidence = {
-            "raw_event_key": raw_event_key,
-            "event_key": buff.get("event_key"),
-            "line_no": buff.get("line_no"),
-            "start_time": buff.get("time"),
-            "delta_ms": delta_ms,
-            "source_character_key": buff.get("source_character_key"),
-            "target_enemy_key": buff.get("target_enemy_key"),
-            "canonical_buff_id": candidate_buff_id,
-        }
-        break
-    if trigger_buff_evidence is None:
-        return None
-
-    canonical_skill_id = _derived_skill_id_from_origin_skill(origin_skill_id)
-    if not canonical_skill_id:
-        return None
-    return {
-        "canonical_skill_id": canonical_skill_id,
-        "origin_skill_id": origin_skill_id,
-        "trigger_buff_id": trigger_buff_id,
-        "trigger_buff_evidence": trigger_buff_evidence,
-    }
 
 
-def _same_frame_trigger_buff_for_runtime_skill(
-    skill_key: str | None,
-    character_key: str | None,
-    ts_ms: int,
-    *,
-    target_enemy_key: str | None,
-    recent_numeric_buffs_by_source: dict[str, list[dict[str, Any]]],
-    max_delta_ms: int = 10,
-) -> dict[str, Any] | None:
-    skill_number = _runtime_skill_number(skill_key)
-    if not skill_number or not character_key:
-        return None
-    for buff in reversed(recent_numeric_buffs_by_source.get(str(character_key), [])):
-        delta_ms = ts_ms - int(buff.get("ts_ms") or 0)
-        if delta_ms < -50:
-            continue
-        if delta_ms > 250:
-            break
-        raw_event_key = str(buff.get("raw_event_key") or "")
-        if not raw_event_key.isdigit() or raw_event_key == skill_number:
-            continue
-        buff_target_enemy = str(buff.get("target_enemy_key") or "")
-        if target_enemy_key and buff_target_enemy != str(target_enemy_key):
-            continue
-        if str(buff.get("event_key") or "") == "buff_common_vfx_char_atk_up":
-            continue
-        if str(buff.get("event_key") or "") == "buff_physical_handle_cryst_break":
-            continue
-        if delta_ms > max_delta_ms:
-            continue
-        if buff.get("bb_values") or buff.get("attr_mods"):
-            continue
-        return {
-            "buff": buff,
-            "delta_ms": delta_ms,
-        }
-    return None
 
 
-def _same_frame_trigger_buff_from_buff_starts(
-    skill_key: str | None,
-    character_key: str | None,
-    ts_ms: int,
-    *,
-    target_enemy_key: str | None,
-    buff_starts: list[dict[str, Any]],
-    max_delta_ms: int = 10,
-) -> dict[str, Any] | None:
-    skill_number = _runtime_skill_number(skill_key)
-    if not skill_number or not character_key:
-        return None
-    candidates: list[dict[str, Any]] = []
-    for buff in buff_starts:
-        buff_ts_ms = int(buff.get("ts_ms") or -1)
-        delta_ms = buff_ts_ms - ts_ms
-        if delta_ms < 0 or delta_ms > max_delta_ms:
-            continue
-        raw_event_key = str(buff.get("raw_event_key") or buff.get("event_key") or "")
-        is_numeric = raw_event_key.isdigit()
-        event_key = str(buff.get("event_key") or "")
-        is_static_trigger = bool(_STATIC_TRIGGER_DAMAGE_BUFF_RE.match(event_key))
-        if is_numeric and raw_event_key == skill_number:
-            continue
-        if not is_numeric and not is_static_trigger:
-            continue
-        if str(buff.get("source_character_key") or "") != str(character_key):
-            continue
-        buff_target_enemy = str(buff.get("target_enemy_key") or "")
-        if target_enemy_key and buff_target_enemy != str(target_enemy_key):
-            continue
-        if str(buff.get("event_key") or "") == "buff_common_vfx_char_atk_up":
-            continue
-        if buff.get("bb_values") or buff.get("attr_mods"):
-            continue
-        candidates.append(
-            {
-                "buff": buff,
-                "delta_ms": delta_ms,
-            }
-        )
-    if not candidates:
-        return None
-    candidates.sort(
-        key=lambda item: (
-            0
-            if str((item.get("buff") or {}).get("event_key") or "") == "buff_common_cryst_triggered_physical_break"
-            else 1,
-            int(item.get("delta_ms") or 0),
-        )
-    )
-    return candidates[0]
 
 
-def _same_frame_damage_buff_from_buff_starts(
-    hit: dict[str, Any],
-    buff_starts: list[dict[str, Any]],
-    *,
-    max_delta_ms: int = 250,
-) -> dict[str, Any] | None:
-    raw_skill_key = str(hit.get("raw_skill_key") or hit.get("skill_key") or "")
-    if not _runtime_skill_number(raw_skill_key):
-        return None
-    character_key = str(hit.get("character_key") or "")
-    target_enemy_key = str(hit.get("target_enemy_key") or "")
-    ts_ms = int(hit.get("ts_ms") or 0)
-    hit_line_no = int(hit.get("line_no") or 0)
-    action_id = hit.get("action_id")
-    damage_unit_index = hit.get("damage_unit_index")
-    candidates: list[dict[str, Any]] = []
-    for buff in buff_starts:
-        if str(buff.get("source_character_key") or "") != character_key:
-            continue
-        buff_target_enemy = str(buff.get("target_enemy_key") or "")
-        if target_enemy_key and buff_target_enemy != target_enemy_key:
-            continue
-        buff_line_no = int(buff.get("line_no") or 0)
-        if hit_line_no and buff_line_no and buff_line_no > hit_line_no:
-            continue
-        buff_ts_ms = int(buff.get("ts_ms") or 0)
-        delta_ms = ts_ms - buff_ts_ms
-        if delta_ms < 0 or delta_ms > max_delta_ms:
-            continue
-        event_key = str(buff.get("event_key") or "")
-        if not event_key.startswith("buff_"):
-            continue
-        action_element = _infer_skill_action_damage_element(event_key, action_id, damage_unit_index)
-        if action_element is None:
-            continue
-        candidates.append(
-            {
-                "buff": buff,
-                "delta_ms": delta_ms,
-                "action_element": action_element,
-            }
-        )
-    if not candidates:
-        return None
-    candidates.sort(
-        key=lambda item: (
-            int(item.get("delta_ms") or 0),
-            -int((item.get("buff") or {}).get("line_no") or 0),
-        )
-    )
-    return candidates[0]
 
 
-def _trigger_damage_identity_from_buff(
-    buff: dict[str, Any],
-    *,
-    damage_element: str | None,
-    target_enemy_key: str | None,
-    nearby_buffs: list[dict[str, Any]] | None = None,
-) -> tuple[str, str]:
-    event_key = str(buff.get("event_key") or "")
-    raw_event_key = str(buff.get("raw_event_key") or event_key or "unknown")
-    source_key = str(buff.get("source_character_key") or "")
-    element_label = _ELEMENT_LABELS.get(str(damage_element or ""), str(damage_element or "元素"))
-    bb_values = {str(key).lower(): value for key, value in (buff.get("bb_values") or {}).items()}
-
-    if event_key == "buff_physical_no_guard":
-        return event_key, "破防"
-    if event_key == "buff_physical_knockdown":
-        return event_key, "倒地"
-    if event_key == "buff_physical_crushed":
-        return event_key, "猛击"
-    if event_key == "buff_physical_airborne":
-        return event_key, "击飞"
-    if event_key == "buff_common_cryst_triggered_physical_break":
-        return event_key, "猛击"
-    if event_key == "buff_common_originum_frozen":
-        return event_key, "源石冻结"
-    if event_key == "buff_common_enemy_spell_status_do_frozen":
-        if "physical_res_down" in bb_values or "phy_resist_down" in bb_values:
-            return event_key, "碎甲" if source_key == "chr_0029_pograni" else "物理脆弱"
-        if "spell_resistance_decrease" in bb_values or "final_spell_resistance_decrease" in bb_values:
-            return event_key, "导电"
-        if (
-            "def_decrease" in bb_values
-            or "max_def_decrease" in bb_values
-            or "additional_def_decrease" in bb_values
-            or "all_resistance_decrease" in bb_values
-        ):
-            return event_key, "腐蚀"
-        return event_key, "冻结"
-    if event_key == "buff_physical_handle_cryst_break":
-        for other in nearby_buffs or []:
-            if other is buff:
-                continue
-            if str(other.get("source_character_key") or "") != source_key:
-                continue
-            if str(other.get("target_enemy_key") or "") != str(target_enemy_key or ""):
-                continue
-            other_key = str(other.get("event_key") or "")
-            other_bb_values = {str(key).lower(): value for key, value in (other.get("bb_values") or {}).items()}
-            if other_key == "buff_common_enemy_spell_status_do_frozen" and (
-                "physical_res_down" in other_bb_values or "phy_resist_down" in other_bb_values
-            ):
-                return other_key, "碎甲" if source_key == "chr_0029_pograni" else "物理脆弱"
-        return event_key, f"{element_label}触发伤害"
-
-    resolved_name = _resolve_skill_name(event_key) if event_key.startswith("buff_") else None
-    if resolved_name and resolved_name != "触发伤害":
-        return event_key, resolved_name
-    return f"numeric_buff_trigger_{raw_event_key}", f"{element_label}触发伤害"
 
 
 def _apply_same_frame_trigger_skill_mappings(
     hits: list[dict[str, Any]],
     buff_starts: list[dict[str, Any]],
 ) -> None:
-    confirmed_trigger_by_runtime_number: dict[str, tuple[str, str]] = {}
-    for hit in hits:
-        current_skill_key = str(hit.get("skill_key") or "")
-        raw_skill_key = str(hit.get("raw_skill_key") or current_skill_key)
-        if not re.search(r"_skill_\d+$", raw_skill_key):
-            continue
-        damage_buff_evidence = _same_frame_damage_buff_from_buff_starts(hit, buff_starts)
-        if damage_buff_evidence is not None:
-            buff = damage_buff_evidence["buff"]
-            delta_ms = int(damage_buff_evidence["delta_ms"])
-            action_element = str(damage_buff_evidence.get("action_element") or "")
-            canonical_skill_id, display_name = _trigger_damage_identity_from_buff(
-                buff,
-                damage_element=action_element,
-                target_enemy_key=str(hit.get("target_enemy_key") or ""),
-                nearby_buffs=buff_starts,
-            )
-            raw_skill_number = _runtime_skill_number(raw_skill_key)
-            hit["raw_skill_key"] = raw_skill_key
-            hit["skill_key"] = canonical_skill_id
-            hit["skill_name"] = display_name
-            hit["skill_group_type"] = None
-            hit["skill_family_key"] = canonical_skill_id
-            hit["damage_element"] = action_element or hit.get("damage_element")
-            hit["damage_school"] = _damage_school_from_element(action_element) or hit.get("damage_school")
-            if raw_skill_number:
-                confirmed_trigger_by_runtime_number[raw_skill_number] = (canonical_skill_id, display_name)
-            mapping = hit.get("skill_mapping")
-            if isinstance(mapping, dict):
-                mapping.update(
-                    {
-                        "status": "mapped",
-                        "status_label": "已映射",
-                        "canonical_skill_id": canonical_skill_id,
-                        "display_name": display_name,
-                        "confidence": "same_frame_damage_buff_action",
-                        "reason": "runtime hit shares the same timestamp with a same-source same-target damage BUFF_START whose static action damage unit matches this HP_V2 actionId/damageUnitIndex",
-                        "trigger_buff": {
-                            "raw_event_key": buff.get("raw_event_key"),
-                            "event_key": buff.get("event_key"),
-                            "line_no": buff.get("line_no"),
-                            "start_time": buff.get("time"),
-                            "delta_ms": delta_ms,
-                            "source_character_key": buff.get("source_character_key"),
-                            "target_enemy_key": buff.get("target_enemy_key"),
-                        },
-                    }
-                )
-            continue
-        if not re.search(r"_skill_\d+$", current_skill_key):
-            continue
-        mapping = hit.get("skill_mapping")
-        if isinstance(mapping, dict) and str(mapping.get("status") or "") not in {"unmapped", "candidate"}:
-            continue
-        evidence = _same_frame_trigger_buff_from_buff_starts(
-            raw_skill_key,
-            str(hit.get("character_key") or ""),
-            int(hit.get("ts_ms") or 0),
-            target_enemy_key=str(hit.get("target_enemy_key") or ""),
-            buff_starts=buff_starts,
-        )
-        if evidence is None:
-            continue
-        buff = evidence["buff"]
-        delta_ms = int(evidence["delta_ms"])
-        buff_number = str(buff.get("raw_event_key") or buff.get("event_key") or "")
-        canonical_skill_id, display_name = _trigger_damage_identity_from_buff(
-            buff,
-            damage_element=str(hit.get("damage_element") or ""),
-            target_enemy_key=str(hit.get("target_enemy_key") or ""),
-            nearby_buffs=buff_starts,
-        )
-        raw_skill_number = _runtime_skill_number(raw_skill_key)
-        hit["raw_skill_key"] = raw_skill_key
-        hit["skill_key"] = canonical_skill_id
-        hit["skill_name"] = display_name
-        hit["skill_group_type"] = None
-        hit["skill_family_key"] = canonical_skill_id
-        if raw_skill_number:
-            confirmed_trigger_by_runtime_number[raw_skill_number] = (canonical_skill_id, display_name)
-        if isinstance(mapping, dict):
-            mapping.update(
-                {
-                    "status": "mapped",
-                    "status_label": "已映射",
-                    "canonical_skill_id": canonical_skill_id,
-                    "display_name": display_name,
-                    "confidence": "same_frame_trigger_buff",
-                    "reason": "runtime hit shares the same timestamp with a same-source same-target trigger BUFF_START that has no blackboard or attr evidence; treated as triggered/status damage",
-                    "trigger_buff": {
-                        "raw_event_key": buff.get("raw_event_key"),
-                        "event_key": buff.get("event_key"),
-                        "line_no": buff.get("line_no"),
-                        "start_time": buff.get("time"),
-                        "delta_ms": delta_ms,
-                        "source_character_key": buff.get("source_character_key"),
-                        "target_enemy_key": buff.get("target_enemy_key"),
-                    },
-                }
-            )
-    for hit in hits:
-        current_skill_key = str(hit.get("skill_key") or "")
-        if not re.search(r"_skill_\d+$", current_skill_key):
-            continue
-        mapping = hit.get("skill_mapping")
-        if not isinstance(mapping, dict) or str(mapping.get("status") or "") not in {"unmapped", "candidate"}:
-            continue
-        raw_skill_key = str(hit.get("raw_skill_key") or current_skill_key)
-        runtime_number = _runtime_skill_number(raw_skill_key)
-        if not runtime_number:
-            continue
-        shared = confirmed_trigger_by_runtime_number.get(runtime_number)
-        if shared is None:
-            continue
-        synthetic_skill_key, display_name = shared
-        hit["raw_skill_key"] = raw_skill_key
-        hit["skill_key"] = synthetic_skill_key
-        hit["skill_name"] = display_name
-        hit["skill_group_type"] = None
-        hit["skill_family_key"] = synthetic_skill_key
-        action_element = _infer_skill_action_damage_element(
-            synthetic_skill_key,
-            hit.get("action_id"),
-            hit.get("damage_unit_index"),
-        )
-        if action_element:
-            hit["damage_element"] = action_element
-            hit["damage_school"] = _damage_school_from_element(action_element) or hit.get("damage_school")
-        mapping.update(
-            {
-                "status": "mapped",
-                "status_label": "已映射",
-                "canonical_skill_id": synthetic_skill_key,
-                "display_name": display_name,
-                "confidence": "shared_runtime_trigger_number",
-                "reason": "same runtime skill number was already confirmed elsewhere in this battle as triggered/status damage",
-            }
-        )
+    return
 
 
 def _canonical_hit_skill_id_from_cast_context(
@@ -3265,93 +3381,19 @@ def _canonical_hit_skill_id_from_cast_context(
     target_enemy_key: str | None,
     recent_skill_casts_by_char: dict[str, list[dict[str, Any]]],
     recent_numeric_buffs_by_source: dict[str, list[dict[str, Any]]],
+    action_id: int | None = None,
+    damage_unit_index: int | None = None,
+    template_type: str | None = None,
 ) -> str | None:
-    raw_skill_key = str(skill_key or "")
-    skill_number = _runtime_skill_number(raw_skill_key)
-    if not skill_number or not character_key:
-        return None
-    same_number_buff_delta_ms: int | None = None
-    for buff in reversed(recent_numeric_buffs_by_source.get(str(character_key), [])):
-        delta_ms = ts_ms - int(buff.get("ts_ms") or 0)
-        if delta_ms < -50:
-            continue
-        if delta_ms > 20000:
-            break
-        if str(buff.get("raw_event_key") or "") != skill_number:
-            continue
-        buff_target_enemy = str(buff.get("target_enemy_key") or "")
-        if target_enemy_key and buff_target_enemy != str(target_enemy_key):
-            continue
-        same_number_buff_delta_ms = delta_ms
-        break
-    trigger_chain = _runtime_skill_trigger_chain_mapping(
-        raw_skill_key,
-        character_key,
-        original_template_int_id=original_template_int_id,
-        target_enemy_key=target_enemy_key,
-        ts_ms=ts_ms,
-        recent_numeric_buffs_by_source=recent_numeric_buffs_by_source,
+    number = _runtime_skill_number(skill_key)
+    if number and template_type == "buff":
+        return _canonical_num_table_buff_number(number, character_key) or str(skill_key)
+    if number and template_type == "skill":
+        return _canonical_num_table_skill_id(skill_key, character_key) or str(skill_key)
+    # Runtime proximity/cast context is not identity evidence.
+    return _canonical_runtime_buff_skill_id(
+        skill_key, character_key, action_id=action_id, damage_unit_index=damage_unit_index,
     )
-    if trigger_chain is not None:
-        return str(trigger_chain.get("canonical_skill_id") or "")
-    runtime_buff_skill = _canonical_runtime_buff_skill_id(raw_skill_key, character_key)
-    if runtime_buff_skill:
-        return runtime_buff_skill
-    trigger_buff = _same_frame_trigger_buff_for_runtime_skill(
-        raw_skill_key,
-        character_key,
-        ts_ms,
-        target_enemy_key=target_enemy_key,
-        recent_numeric_buffs_by_source=recent_numeric_buffs_by_source,
-    )
-    if trigger_buff is not None:
-        buff = trigger_buff["buff"]
-        canonical_skill_id, _ = _trigger_damage_identity_from_buff(
-            buff,
-            damage_element=None,
-            target_enemy_key=target_enemy_key,
-        )
-        return canonical_skill_id
-    for cast in reversed(recent_skill_casts_by_char.get(str(character_key), [])):
-        delta_ms = ts_ms - int(cast.get("ts_ms") or 0)
-        if delta_ms < -50:
-            continue
-        if delta_ms > 12000:
-            break
-        cast_skill = str(cast.get("skill") or "")
-        if not cast_skill or _is_runtime_numeric_skill_id(cast_skill):
-            continue
-        if same_number_buff_delta_ms is None or same_number_buff_delta_ms <= 150:
-            return cast_skill
-    trigger_chain = _runtime_skill_trigger_chain_mapping(
-        raw_skill_key,
-        character_key,
-        original_template_int_id=original_template_int_id,
-        target_enemy_key=target_enemy_key,
-        ts_ms=ts_ms,
-        recent_numeric_buffs_by_source=recent_numeric_buffs_by_source,
-    )
-    if trigger_chain is not None:
-        return str(trigger_chain.get("canonical_skill_id") or "")
-    runtime_buff_skill = _canonical_runtime_buff_skill_id(raw_skill_key, character_key)
-    if runtime_buff_skill:
-        return runtime_buff_skill
-    trigger_buff = _same_frame_trigger_buff_for_runtime_skill(
-        raw_skill_key,
-        character_key,
-        ts_ms,
-        target_enemy_key=target_enemy_key,
-        recent_numeric_buffs_by_source=recent_numeric_buffs_by_source,
-    )
-    if trigger_buff is not None:
-        buff = trigger_buff["buff"]
-        canonical_skill_id, _ = _trigger_damage_identity_from_buff(
-            buff,
-            damage_element=None,
-            target_enemy_key=target_enemy_key,
-        )
-        return canonical_skill_id
-    return None
 
 
 def _recent_source_skill_context_for_buff(
@@ -3359,24 +3401,92 @@ def _recent_source_skill_context_for_buff(
     ts_ms: int,
     recent_skill_casts_by_char: dict[str, list[dict[str, Any]]],
 ) -> dict[str, str] | None:
-    if not source_key:
-        return None
-    for cast in reversed(recent_skill_casts_by_char.get(str(source_key), [])):
-        delta_ms = ts_ms - int(cast.get("ts_ms") or 0)
-        if delta_ms < -50:
-            continue
-        if delta_ms > 12000:
-            break
-        skill_key = str(cast.get("skill") or "")
-        if not skill_key:
-            continue
-        canonical_skill = _canonical_packet_skill_id(skill_key)
-        skill_profile = _resolve_skill_profile(canonical_skill)
-        return {
-            "source_skill_key": canonical_skill,
-            "source_skill_family_key": _resolve_skill_family_key(canonical_skill, skill_profile),
-        }
     return None
+
+
+@lru_cache(maxsize=1)
+def _load_current_buff_roots() -> dict[str, dict[str, Any]]:
+    global _BUFF_ACTION_TYPES_INDEX
+    _BUFF_ACTION_TYPES_INDEX = None
+    path = _repo_root() / 'data/local_static/buff/typed_roots.json.gz'
+    damage_path = _repo_root() / 'data/local_static/skill/damage_element_catalog.json'
+    try:
+        payload = json.loads(gzip.decompress(path.read_bytes()))
+        damage_catalog = json.loads(damage_path.read_text(encoding='utf-8'))
+    except (OSError, EOFError, ValueError):
+        return {}
+    if not isinstance(payload, dict) or not isinstance(damage_catalog, dict):
+        return {}
+    decoder = payload.get('decoder')
+    if not isinstance(decoder, dict):
+        return {}
+    if (payload.get('schemaVersion') != 1
+            or payload.get('source') != 'official_local_buffdata_memorypack'
+            or decoder.get('kind') != 'typed_root_deserialization'
+            or any(decoder.get(key) != value for key, value in _CURRENT_TYPED_RESOURCE_BINDING.items())
+            or payload.get('decoder') != damage_catalog.get('decoder')
+            or damage_catalog.get('schemaVersion') != 2
+            or damage_catalog.get('source') != 'official_local_skilldata_memorypack'):
+        return {}
+    summary = payload.get('summary') or {}
+    entries = payload.get('entries')
+    if (not isinstance(entries, dict) or summary.get('completeRootCount') != len(entries)
+            or summary.get('inputResourceCount') != len(entries)):
+        return {}
+    roots = {}
+    for key, entry in entries.items():
+        if not isinstance(entry, dict):
+            continue
+        root, proof = entry.get('root'), entry.get('proof') or {}
+        size = proof.get('sourceBytes')
+        if (not isinstance(root, dict) or root.get('id') != key
+                or root.get('$type') != 'Beyond.Gameplay.Core.BuffData'
+                or root.get('$offset') != 0
+                or type(size) is not int or size <= 0
+                or proof.get('consumedBytes') != size or root.get('$end') != size):
+            continue
+        roots[key] = root
+    action_type_index = {}
+    for key, root in roots.items():
+        types = set()
+        pending = [root]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, dict):
+                type_name = str(value.get('$type') or '')
+                if type_name:
+                    types.add(type_name.replace('+', '.'))
+                pending.extend(value.values())
+            elif isinstance(value, list):
+                pending.extend(value)
+        action_type_index[key] = frozenset(types)
+    _BUFF_ACTION_TYPES_INDEX = (roots, action_type_index)
+    return roots
+
+
+@lru_cache(maxsize=1)
+def _load_damage_zone_config() -> dict[str, dict[str, Any]]:
+    path = _repo_root() / 'data/local_static/damage_zone_config.json'
+    try:
+        payload = json.loads(path.read_text(encoding='utf8'))
+    except (OSError, ValueError):
+        return {}
+    decoder = payload.get('decoder') if isinstance(payload, dict) else None
+    zones = payload.get('zones') if isinstance(payload, dict) else None
+    if (payload.get('schemaVersion') != 1
+            or payload.get('source') != 'official_unity_typetree_damage_zone_config'
+            or not isinstance(decoder, dict)
+            or any(decoder.get(k) != v for k, v in _NATIVE_DAMAGE_SEMANTICS_BINDING.items())
+            or not isinstance(zones, list) or not zones):
+        return {}
+    result = {}
+    for index, zone in enumerate(zones):
+        if (not isinstance(zone, dict) or type(zone.get('name')) is not str
+                or type(zone.get('isMultiplyZone')) is not int
+                or type(zone.get('serverIndex')) is not int):
+            return {}
+        result[zone['name']] = {**zone, 'clientIndex': index}
+    return result
 
 
 @lru_cache(maxsize=1)
@@ -3530,44 +3640,109 @@ def _normalize_condition_damage_type(value: Any) -> str | None:
 
 @lru_cache(maxsize=4096)
 def _decoded_damage_modifier_condition_rows(buff_id: str) -> dict[int, dict[str, Any]]:
-    path = _buff_decoded_detail_path(buff_id)
-    if path is None:
-        return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    payload = _load_current_buff_roots().get(buff_id)
+    if not isinstance(payload, dict):
         return {}
     modifiers = payload.get("damageModifier")
     if not isinstance(modifiers, list):
         return {}
-
-    rows: dict[int, dict[str, Any]] = {}
+    rows = {}
     for index, modifier in enumerate(modifiers):
-        if not isinstance(modifier, dict):
+        conditions = []
+        errors = []
+        container = modifier.get("condition") if isinstance(modifier, dict) else None
+        actions = container.get("actionData") if isinstance(container, dict) else None
+        if not isinstance(actions, list):
+            rows[index] = {"conditions": [], "errors": ["missing_condition_actions"]}
             continue
-        condition = modifier.get("condition") if isinstance(modifier.get("condition"), dict) else {}
-        action_data = condition.get("actionData") if isinstance(condition, dict) else []
-        damage_types: set[str] = set()
-        condition_buff_ids: set[str] = set()
-        for action in action_data or []:
-            if not isinstance(action, dict):
+        if any(container.get(key) is not False for key in ("onlyExecuteWhenSourceIsMainChar", "onlyExecuteWhenSourceIsGuard")):
+            errors.append("unresolved_source_guard")
+        disabled = 0
+        for action in actions:
+            if not isinstance(action, dict) or not isinstance(action.get("isEnable"), bool):
+                errors.append("missing_condition_enabled_state")
                 continue
-            action_type = str(action.get("$type") or "")
-            if "CheckDamageType" in action_type:
-                damage_type = _normalize_condition_damage_type(action.get("damageType"))
-                if damage_type:
-                    damage_types.add(damage_type)
-            if "CheckBuffStackNumAdvanced" in action_type:
-                buff_settings = action.get("buffSettings") if isinstance(action.get("buffSettings"), dict) else {}
-                for buff_id_value in buff_settings.get("buffIdList") or []:
-                    normalized = _normalize_buff_id(buff_id_value)
-                    if normalized:
-                        condition_buff_ids.add(normalized)
-        if damage_types or condition_buff_ids:
-            rows[index] = {
-                "damage_types": tuple(sorted(damage_types)),
-                "condition_buff_ids": tuple(sorted(condition_buff_ids)),
-            }
+            if action["isEnable"] is False:
+                disabled += 1
+                continue
+            # C# nested-type notation differs between JSON.NET's old display
+            # JSON (+Data) and the fully qualified current metadata (.Data).
+            symbol = str(action.get('$type') or '').split(',', 1)[0].replace('+', '.')
+            action_type = {
+                'Beyond.Gameplay.Core.Conditions.CheckHp.Data': 'CheckHp',
+                'Beyond.Gameplay.Core.Conditions.CheckDamageType.Data': 'CheckDamageType',
+                'Beyond.Gameplay.Core.Conditions.CheckDamageTypeMask.Data': 'CheckDamageTypeMask',
+                'Beyond.Gameplay.Core.Conditions.CheckDamageDecorateMask.Data': 'CheckDamageDecorateMask',
+                'Beyond.Gameplay.Core.CheckBuffStackNumAdvanced.Data': 'CheckBuffStackNumAdvanced',
+            }.get(symbol, symbol)
+            if action_type not in {"CheckHp", "CheckDamageType", "CheckDamageTypeMask", "CheckDamageDecorateMask", "CheckBuffStackNumAdvanced"}:
+                errors.append("unsupported_action:" + action_type)
+                continue
+            if action_type in {"CheckHp", "CheckBuffStackNumAdvanced"}:
+                selector = action.get("hpOwner" if action_type == "CheckHp" else "checkTarget")
+                if not isinstance(selector, dict) or selector.get("targetSource") != "Target":
+                    errors.append("unsupported_condition_target")
+                    continue
+                selection = selector.get("selectorData") or {}
+                if (not isinstance(selection, dict) or selection.get("validatorData") or selection.get("postProcessorData")
+                        or any(selector.get(key) for key in ("targetGroupKey", "ownerContextKey", "targetContextKey"))):
+                    errors.append("unsupported_condition_selector")
+                    continue
+            if action_type == "CheckHp":
+                value = action.get("value")
+                compare = action.get("compare")
+                if (compare not in {"LT", "LE", "GT", "GE", "EQ", "NE"}
+                        or not isinstance(action.get("isRatio"), bool) or not isinstance(value, dict)
+                        or not isinstance(value.get("useBlackboardKey"), bool)
+                        or (value["useBlackboardKey"] and not value.get("blackboardKey"))):
+                    errors.append("unsupported_hp_comparison")
+                    continue
+                conditions.append({"type": "target_hp_compare", "source": action_type,
+                                   "compare": compare, "is_ratio": action["isRatio"], "value_config": dict(value)})
+            elif action_type == "CheckDamageType":
+                element = _normalize_condition_damage_type(action.get("damageType"))
+                if element is None:
+                    errors.append("unresolved_damage_type")
+                    continue
+                conditions.append({"type": "damage_type_in", "source": action_type, "elements": [element]})
+            elif action_type == 'CheckDamageTypeMask':
+                mask = action.get('damageTypeMask')
+                # A defined enum value is serialized as its exact name;
+                # combinations are integers. These names are version-bound
+                # DamageTypeMask declarations, not inferred from a Buff ID.
+                if type(mask) is str:
+                    mask = {'Physical': 1, 'Real': 2, 'Fire': 4, 'Pulse': 8,
+                            'Cryst': 16, 'LifeDrain': 32, 'Natural': 64, 'Ether': 128}.get(mask)
+                # Exact DamageTypeMask enum bits. Representing a condition
+                # does not grant an external effect whitelist approval.
+                bits = {1: 'physical', 2: 'real', 4: 'fire', 8: 'pulse', 16: 'cryst',
+                        32: 'lifedrain', 64: 'natural', 128: 'ether'}
+                if type(mask) is not int or mask <= 0 or mask & ~sum(bits):
+                    errors.append('unsupported_damage_type_mask')
+                    continue
+                conditions.append({'type': 'damage_type_in', 'source': action_type,
+                                   'elements': [element for bit, element in bits.items() if mask & bit]})
+            elif action_type == 'CheckDamageDecorateMask':
+                mask, check = action.get('mask'), action.get('checkType')
+                if type(mask) is not int or mask < 0 or check not in {'HasAll', 'HasAny'}:
+                    errors.append('unsupported_damage_decorate_check')
+                    continue
+                conditions.append({'type': 'damage_decorate_mask', 'source': action_type,
+                                   'mask': mask, 'check': check})
+            else:
+                settings = action.get("buffSettings") or {}
+                value = action.get("value") or {}
+                ids = settings.get("buffIdList") if isinstance(settings, dict) else None
+                if (not isinstance(ids, list) or not ids or any(not isinstance(key, str) or not key for key in ids)
+                        or settings.get("checkType") != "Id" or action.get("buffStackNumType") != "BuffCount"
+                        or action.get("compareType") != "GE" or action.get("limitSkillCastId") is not False
+                        or not isinstance(value, dict) or value.get("useBlackboardKey") is not False
+                        or _coerce_optional_float(value.get("value")) != 1.0):
+                    errors.append("unsupported_buff_count_comparison")
+                    continue
+                conditions.append({"type": "target_has_buff", "source": action_type, "buff_ids": sorted(set(ids))})
+        rows[index] = {"conditions": conditions, "errors": errors, "action_count": len(actions),
+                       "all_disabled": bool(actions) and disabled == len(actions)}
     return rows
 
 
@@ -3870,122 +4045,23 @@ def _classifier_hint_effect_pairs(hint: dict[str, Any]) -> set[tuple[str, str]]:
 
 
 def _packet_buff_semantic_candidates(record: dict[str, Any], *, limit: int = 5) -> list[dict[str, Any]]:
-    raw_buff_id = _normalize_buff_id(record.get("raw_event_key") or record.get("event_key"))
-    if not raw_buff_id.isdigit():
-        return []
-    bb_keys = {str(key) for key in record.get("bb_keys") or []}
-    bb_keys.update(str(key) for key in (record.get("bb_values") or {}).keys())
-    if not bb_keys:
-        return []
-    observed_effect_pairs = _packet_record_effect_pairs(record)
-    prefixes = {
-        _char_prefix(record.get("owner_raw")),
-        _char_prefix(record.get("raw_source")),
-        _char_prefix(record.get("target_character_key")),
-        _char_prefix(record.get("source_character_key")),
-    }
-    prefixes.discard(None)
-    precise_character_keys = {
-        str(value)
-        for value in (
-            record.get("owner_raw"),
-            record.get("raw_source"),
-            record.get("target_character_key"),
-            record.get("source_character_key"),
-        )
-        if str(value or "").startswith("chr_")
-    }
-    target_is_enemy = bool(record.get("target_enemy_key"))
-    candidates: list[tuple[int, str, dict[str, Any], set[str], set[str], dict[str, Any], set[tuple[str, str]]]] = []
-    for buff_id, entry in _load_local_buff_semantic_entries().items():
-        semantic_keys = _semantic_entry_bb_keys(entry)
-        if not semantic_keys:
-            continue
-        overlap = bb_keys & semantic_keys
-        if not overlap:
-            continue
-        missing_packet_keys = bb_keys - semantic_keys
-        score = len(overlap) * 10 - len(missing_packet_keys) * 2
-        hint = _buff_classifier_hint(buff_id) or {}
-        classification = str(hint.get("classification") or "")
-        hint_effect_pairs = _classifier_hint_effect_pairs(hint)
-        effect_pair_overlap = observed_effect_pairs & hint_effect_pairs
-
-        if any(buff_id.startswith(prefix or "") for prefix in prefixes):
-            score += 8
-        if any(buff_id.startswith(f"buff_{char_key}") for char_key in precise_character_keys):
-            score += 12
-        if _semantic_entry_has_rdps(entry):
-            score += 4
-        if classification == "effect_buff":
-            score += 8
-        elif classification == "indirect_buff":
-            score += 3
-        elif classification == "wrapper":
-            score += 2 if not observed_effect_pairs else -6
-        elif classification == "marker_or_utility":
-            score += 1 if not observed_effect_pairs else -12
-
-        if observed_effect_pairs and hint_effect_pairs:
-            if effect_pair_overlap:
-                score += len(effect_pair_overlap) * 18
-            else:
-                score -= min(12, len(observed_effect_pairs) * 4)
-
-            damage_side_pairs = {
-                pair for pair in hint_effect_pairs
-                if pair[0] in ({"fragile", "vuln_taken", "res"} if target_is_enemy else {"atk", "dmg_inc", "amp", "crit", "combo"})
-            }
-            if damage_side_pairs:
-                score += 4
-            else:
-                score -= 3
-        if score <= 0:
-            continue
-        candidates.append((score, buff_id, entry, overlap, missing_packet_keys, hint, effect_pair_overlap))
-    candidates.sort(key=lambda item: (-item[0], item[1]))
-    return [
-        {
-            "candidate_buff_id": buff_id,
-            "score": score,
-            "confidence": (
-                "static_bb_character_effect_match"
-                if effect_pair_overlap and any(buff_id.startswith(f"buff_{char_key}") for char_key in precise_character_keys)
-                else "static_bb_effect_match"
-                if effect_pair_overlap
-                else "static_bb_owner_match"
-                if any(buff_id.startswith(prefix or "") for prefix in prefixes)
-                else "static_bb_match"
-            ),
-            "overlap_keys": sorted(overlap),
-            "unknown_packet_keys": sorted(missing_packet_keys),
-            "rdps_semantics": _semantic_entry_has_rdps(entry),
-            "classification": hint.get("classification"),
-            "effect_overlap": [
-                {"zone": zone, "element": element}
-                for zone, element in sorted(effect_pair_overlap)
-            ],
-            "resolved_effect_hints": [
-                effect_hint
-                for effect_hint in (hint.get("resolvedEffectHints") or [])
-                if isinstance(effect_hint, dict)
-            ],
-        }
-        for score, buff_id, entry, overlap, missing_packet_keys, hint, effect_pair_overlap in candidates[:limit]
-    ]
+    return []
 
 
 @lru_cache(maxsize=1)
 def _load_character_names() -> dict[str, str]:
-    manifest_path = _repo_root() / "data" / "akedata" / "character" / "manifest.json"
-    if not manifest_path.exists():
-        return {}
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    return {
-        str(entry.get("charId")): str(entry.get("name"))
-        for entry in manifest
-        if entry.get("charId") and entry.get("name")
-    }
+    names = {}
+    for source in ('akedata', 'local_tables'):
+        manifest_path = _repo_root() / 'data' / source / 'character/manifest.json'
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding='utf8'))
+        except (OSError, ValueError):
+            continue
+        entries = manifest.get('entries', []) if isinstance(manifest, dict) else manifest
+        if isinstance(entries, list):
+            names.update({str(entry['charId']): str(entry['name']) for entry in entries
+                          if isinstance(entry, dict) and entry.get('charId') and entry.get('name')})
+    return names
 
 
 @lru_cache(maxsize=1)
@@ -4069,10 +4145,18 @@ def _load_dungeon_by_id() -> dict[str, tuple[str, str]]:
         series_key = str(data.get("dungeonSeriesId") or template_id)
         series_name = str(data.get("dungeonSeriesname") or entry.get("name") or UNKNOWN_DUNGEON_NAME)
         mapping.setdefault(series_key, (series_key, series_name))
-        for dungeon_id, dungeon in (data.get("dungeons") or {}).items():
+        child_dungeons = data.get("dungeons") or data.get("childDungeons") or {}
+        for dungeon_id, dungeon in child_dungeons.items():
             dungeon_key = str(dungeon_id)
             dungeon_name = str(dungeon.get("name") or series_name)
             if dungeon_key.startswith("indie_hard"):
+                mapping[dungeon_key] = (dungeon_key, dungeon_name)
+            elif series_name == UNKNOWN_DUNGEON_NAME and dungeon_name != UNKNOWN_DUNGEON_NAME:
+                # Activity groups such as dungeon_takestwo have no official
+                # series name. Preserve their official child gameId and the
+                # resolved DungeonTable name instead of reporting an unknown
+                # group. Ranked groups with a real series name keep their
+                # existing canonical grouping behavior.
                 mapping[dungeon_key] = (dungeon_key, dungeon_name)
             else:
                 mapping[dungeon_key] = (series_key, series_name)
@@ -4084,51 +4168,6 @@ def _load_dungeon_by_id() -> dict[str, tuple[str, str]]:
                 mapping.setdefault(dungeon_key, (dungeon_key, series_name))
             else:
                 mapping.setdefault(dungeon_key, (series_key, series_name))
-    return mapping
-
-
-@lru_cache(maxsize=1)
-def _load_dungeon_enemy_hints() -> dict[str, str]:
-    mapping = dict(_DUNGEON_ENEMY_HINT_ALIASES)
-    root = _repo_root()
-    item_root = root / "data" / "local_tables" / "dungeon" / "items"
-    if item_root.exists():
-        for item_path in item_root.glob("*.json"):
-            try:
-                item_payload = json.loads(item_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            pending = [item_payload]
-            while pending:
-                node = pending.pop()
-                if isinstance(node, dict):
-                    dungeon_id = str(node.get("dungeonId") or "").strip()
-                    enemy_ids = node.get("enemyIds")
-                    if dungeon_id and isinstance(enemy_ids, list):
-                        enemy_keys = {
-                            enemy_key
-                            for raw_enemy_id in enemy_ids
-                            if (enemy_key := _extract_enemy_key(str(raw_enemy_id)))
-                            and enemy_key != UNKNOWN_ENEMY_KEY
-                        }
-                        if len(enemy_keys) == 1:
-                            mapping.setdefault(dungeon_id, next(iter(enemy_keys)))
-                    pending.extend(node.values())
-                elif isinstance(node, list):
-                    pending.extend(node)
-    path = root / "jsondata" / "Dungeon.json"
-    if not path.exists():
-        return mapping
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return mapping
-    if not isinstance(payload, dict):
-        return mapping
-    for dungeon_id, raw_enemy_key in payload.items():
-        enemy_key = _extract_enemy_key(str(raw_enemy_key))
-        if enemy_key and enemy_key != UNKNOWN_ENEMY_KEY:
-            mapping[str(dungeon_id)] = enemy_key
     return mapping
 
 
@@ -4159,28 +4198,119 @@ def _load_skill_name_prefixes() -> list[tuple[str, str]]:
 
 @lru_cache(maxsize=1)
 def _load_skill_exact_names() -> dict[str, str]:
-    return {
+    names = {
         skill_key: skill_name
         for skill_key, skill_name in _load_skill_name_prefixes()
     }
+    # Display labels have their own exact, version-bound official relation.
+    # They must not change skill family, damage classification or attribution.
+    try:
+        catalog = json.loads((_repo_root() / 'data/local_static/skill/display_name_catalog.json')
+                             .read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return names
+    if (not isinstance(catalog, dict) or catalog.get('schemaVersion') != 1
+            or catalog.get('source') != 'official_CharGrowth_I18n_typed_skill_display'
+            or not isinstance(catalog.get('decoder'), dict)
+            or any(catalog['decoder'].get(key) != value
+                   for key, value in _CURRENT_TYPED_RESOURCE_BINDING.items())):
+        return names
+    entries = catalog.get('entries')
+    conflicts = catalog.get('conflicts', {})
+    if not isinstance(entries, dict) or not isinstance(conflicts, dict):
+        return names
+    for skill_key, entry in entries.items():
+        if (not isinstance(skill_key, str) or not skill_key or not isinstance(entry, dict)
+                or skill_key in conflicts
+                or entry.get('proofKind') not in {'official_char_growth_skill_list', 'typed_enabled_creation_path'}):
+            continue
+        display_name = entry.get('displayName')
+        if isinstance(display_name, str) and display_name.strip():
+            names[skill_key] = display_name.strip()
+    # An explicit official ambiguity must not select an older cached label.
+    for skill_key in conflicts:
+        names[skill_key] = ''
+    return names
 
 
 @lru_cache(maxsize=1)
 def _load_character_profiles() -> dict[str, dict[str, str]]:
-    manifest_path = _repo_root() / "data" / "akedata" / "character" / "manifest.json"
+    manifest_path = _repo_root() / "data" / "local_tables" / "character" / "manifest.json"
     if not manifest_path.exists():
         return {}
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    entries = manifest.get("entries") if isinstance(manifest, dict) else manifest
     return {
         str(entry.get("charId")): {
             "name": str(entry.get("name") or ""),
-            "char_type": str(entry.get("charType") or ""),
-            "profession": str(entry.get("profession") or ""),
-            "weapon_type": str(entry.get("weapontype") or ""),
+            "char_type": str(entry.get("charTypeId") or entry.get("charTypeName") or ""),
+            "profession": str(entry.get("professionName") or entry.get("profession") or ""),
+            "weapon_type": str(entry.get("weaponTypeName") or ""),
         }
-        for entry in manifest
+        for entry in (entries or [])
         if entry.get("charId")
     }
+
+
+@lru_cache(maxsize=1)
+def _load_official_skill_damage_catalog() -> dict[str, dict[str, Any]]:
+    path = _repo_root() / "data" / "local_static" / "skill" / "damage_element_catalog.json"
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict) or payload.get("source") != "official_local_skilldata_memorypack":
+        return {}
+    decoder = payload.get('decoder')
+    if not isinstance(decoder, dict):
+        return {}
+    if (payload.get('schemaVersion') != 2
+            or decoder.get('kind') != 'typed_root_deserialization'
+            or any(decoder.get(key) != value for key, value in _CURRENT_TYPED_RESOURCE_BINDING.items())
+            or payload.get('decodeErrors')):
+        return {}
+    summary = payload.get('summary') or {}
+    count = summary.get('inputResourceCount')
+    if type(count) is not int or count <= 0 or summary.get('completeRootCount') != count:
+        return {}
+    skills = payload.get("skills")
+    if not isinstance(skills, dict):
+        return {}
+    verified = {}
+    for key, profile in skills.items():
+        if not isinstance(profile, dict) or profile.get('derivedFrom'):
+            continue
+        proof = profile.get('proof') or {}
+        if (proof.get('actionBoundaries') != 'typed_root_deserialization'
+                or type(proof.get('sourceBytes')) is not int
+                or proof['sourceBytes'] <= 0
+                or proof.get('consumedBytes') != proof['sourceBytes']):
+            continue
+        actions = profile.get('actions')
+        if not isinstance(actions, dict) or any(
+            not isinstance(units, list) or any(
+                not isinstance(unit, dict) or unit.get('source') != 'typed_memorypack_full_object'
+                for unit in units
+            ) for units in actions.values()
+        ):
+            continue
+        verified[key] = profile
+    return verified
+
+
+@lru_cache(maxsize=1)
+def _load_official_skill_damage_prefixes() -> list[tuple[str, dict[str, Any]]]:
+    return sorted(_load_official_skill_damage_catalog().items(), key=lambda item: len(item[0]), reverse=True)
+
+
+def _resolve_official_skill_damage_profile(skill_key: str | None) -> dict[str, Any] | None:
+    if not skill_key:
+        return None
+    canonical = _canonical_packet_skill_id(skill_key)
+    exact = _load_official_skill_damage_catalog().get(canonical)
+    return exact
 
 
 @lru_cache(maxsize=1)
@@ -4255,10 +4385,26 @@ def _load_skill_item_metadata(skill_key: str) -> dict[str, Any]:
         return {}
     if not isinstance(payload, dict):
         return {}
+    dynamic_action_keys: dict[int, str] = {}
+    pending_nodes: list[Any] = [payload]
+    while pending_nodes:
+        node = pending_nodes.pop()
+        if isinstance(node, dict):
+            node_type = str(node.get("$type") or "").replace("+", ".")
+            if ("ModifyDynamicBlackboard.Data" in node_type
+                    or "SimpleCalcBBAction.Data" in node_type):
+                action_index = _coerce_optional_int(node.get("serverActionIndex"))
+                key = str(node.get("key") or "")
+                if action_index is not None and key:
+                    dynamic_action_keys[action_index] = key
+            pending_nodes.extend(node.values())
+        elif isinstance(node, list):
+            pending_nodes.extend(node)
     return {
         "skill_specification": str(payload.get("skillSpecification") or ""),
         "cast_type": str(payload.get("castType") or ""),
         "attack_range_type": str(payload.get("attackRangeType") or ""),
+        "dynamic_action_keys": dynamic_action_keys,
     }
 
 
@@ -4279,52 +4425,89 @@ def _load_skill_action_damage_units(skill_key: str) -> dict[int, list[dict[str, 
     if not skill_key:
         return {}
     canonical = _canonical_packet_skill_id(skill_key)
-    path = _repo_root() / "data" / "akedata" / "skill" / "items" / f"{canonical}.json"
-    if not path.exists():
-        path = _repo_root() / "data" / "akedata" / "buff" / "items" / f"{canonical}.json"
-    if not path.exists():
+    profile = _load_official_skill_damage_catalog().get(canonical)
+    if not isinstance(profile, dict):
         return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-
     actions: dict[int, list[dict[str, Any]]] = {}
-
-    def visit(node: Any) -> None:
-        if isinstance(node, dict):
-            raw_action_id = node.get("serverActionIndex")
-            raw_units = node.get("damageUnits")
-            if raw_action_id is not None and isinstance(raw_units, list):
-                try:
-                    action_id = int(raw_action_id)
-                except (TypeError, ValueError):
-                    action_id = -1
-                if action_id >= 0:
-                    units: list[dict[str, Any]] = []
-                    for index, unit in enumerate(raw_units):
-                        if not isinstance(unit, dict):
-                            continue
-                        element = _normalize_action_damage_type(unit.get("damageType"))
-                        if element is None:
-                            continue
-                        units.append(
-                            {
-                                "index": index,
-                                "damage_type": str(unit.get("damageType") or ""),
-                                "damage_attribute_type": str(unit.get("damageAttributeType") or ""),
-                                "element": element,
-                            }
-                        )
-                    if units:
-                        actions.setdefault(action_id, units)
-            for value in node.values():
-                visit(value)
-        elif isinstance(node, list):
-            for value in node:
-                visit(value)
-
-    visit(payload)
+    # Diagnostic masks come only from the version-bound current Buff root.
+    # They must not be promoted to observed hit masks until end-to-end native
+    # propagation through damage processors is established.
+    static_masks: dict[tuple[int, int], list[tuple[int, str, str]]] = {}
+    static_payload = _load_current_buff_roots().get(canonical)
+    if isinstance(static_payload, dict):
+        pending_nodes: list[Any] = [static_payload]
+        while pending_nodes:
+            node = pending_nodes.pop()
+            if isinstance(node, dict):
+                raw_units = node.get("damageUnits")
+                if isinstance(raw_units, list):
+                    action_index = _coerce_optional_int(node.get("serverActionIndex"))
+                    if action_index is not None:
+                        for index, unit in enumerate(raw_units):
+                            if not isinstance(unit, dict) or unit.get("ignoreDamageImmuneLevel") != "None":
+                                continue
+                            mask = _coerce_optional_int(unit.get("damageDecorateMask"))
+                            if mask is not None and mask >= 0:
+                                static_masks.setdefault((action_index, index), []).append((
+                                    mask,
+                                    str(unit.get("damageType") or "").strip().lower(),
+                                    str(unit.get("damageAttributeType") or "").strip().lower(),
+                                ))
+                pending_nodes.extend(node.values())
+            elif isinstance(node, list):
+                pending_nodes.extend(node)
+    for raw_action_id, raw_units in (profile.get("actions") or {}).items():
+        try:
+            action_id = int(raw_action_id)
+        except (TypeError, ValueError):
+            continue
+        units = []
+        for unit in raw_units:
+            unit_index = unit.get("index") if isinstance(unit, dict) else None
+            mask_candidates = static_masks.get((action_id, unit_index), []) if type(unit_index) is int else []
+            if (isinstance(unit, dict)
+                    and type(unit.get('damageDecorateMask')) is int
+                    and unit.get('ignoreDamageImmuneLevel') == 'None'):
+                mask_candidates = list(mask_candidates) + [(
+                    int(unit['damageDecorateMask']),
+                    str(unit.get('element') or '').lower(),
+                    str(unit.get('damageAttribute') or '').lower(),
+                )]
+            mask_candidates = list(dict.fromkeys(mask_candidates))
+            direct_mask = mask_candidates[0] if len(mask_candidates) == 1 else None
+            mask_source = None
+            if (direct_mask is not None
+                    and direct_mask[1] == str(unit.get("element") or "").lower()
+                    and direct_mask[2] == str(unit.get("damageAttribute") or "").lower()):
+                mask_value = direct_mask[0]
+                mask_source = "current_typed_skill_or_buff_exact_unit_generation_only"
+            else:
+                # An action/unit index mismatch has no protocol proof.
+                mask_value = None
+            if not isinstance(unit, dict):
+                continue
+            units.append({
+                "index": unit.get("index"),
+                "damage_type": str(unit.get("element") or ""),
+                "damage_attribute_type": str(unit.get("damageAttribute") or ""),
+                "element": str(unit.get("element") or ""),
+                "damage_decorate_mask": mask_value,
+                "damage_decorate_mask_source": mask_source,
+                "damage_calculation": ({**copy.deepcopy(unit['damageCalculation']),
+                    'source': 'current_typed_damage_unit',
+                    'sourceProof': {**_CURRENT_TYPED_RESOURCE_BINDING,
+                        'scope': 'typed_layout_and_exact_resource_only',
+                        'resourceId': canonical,
+                        'sourceSha256': (profile.get('proof') or {}).get('sourceSha256'),
+                        'sourceAsset': (profile.get('proof') or {}).get('sourceAsset'),
+                        'sourceBytes': (profile.get('proof') or {}).get('sourceBytes'),
+                        'consumedBytes': (profile.get('proof') or {}).get('consumedBytes'),
+                        'actionId': action_id, 'damageUnitIndex': unit.get('index'),
+                        'byteOffset': unit.get('byteOffset'), 'byteEnd': unit.get('byteEnd')}}
+                    if isinstance(unit.get('damageCalculation'), dict) else None),
+            })
+        if units:
+            actions[action_id] = units
     return actions
 
 
@@ -4333,34 +4516,19 @@ def _infer_skill_action_damage_element(
     action_id: int | str | None,
     damage_unit_index: int | str | None = None,
 ) -> str | None:
-    try:
-        action_id_int = int(action_id) if action_id is not None else None
-    except (TypeError, ValueError):
-        action_id_int = None
-    if not skill_key or action_id_int is None:
+    if not skill_key:
         return None
-    units = _load_skill_action_damage_units(str(skill_key)).get(action_id_int)
-    if not units:
+    # Missing, fractional, negative or boolean indices are not unit zero.
+    if any(isinstance(value, bool) or not re.fullmatch(r"\d+", str(value))
+           for value in (action_id, damage_unit_index)):
         return None
-
-    try:
-        unit_index = int(damage_unit_index) if damage_unit_index is not None else None
-    except (TypeError, ValueError):
-        unit_index = None
-    if unit_index is not None:
-        for unit in units:
-            if unit.get("index") == unit_index:
-                return str(unit.get("element") or "") or None
-
-    for unit in units:
-        if str(unit.get("damage_attribute_type") or "").lower() == "hp":
-            return str(unit.get("element") or "") or None
-    return str(units[0].get("element") or "") or None
-
-
-@lru_cache(maxsize=1)
-def _load_skill_profile_prefixes() -> list[tuple[str, dict[str, Any]]]:
-    return sorted(_load_skill_profiles().items(), key=lambda item: len(item[0]), reverse=True)
+    units = _load_skill_action_damage_units(str(skill_key)).get(int(action_id), [])
+    matches = [unit for unit in units if type(unit.get("index")) is int
+               and unit["index"] == int(damage_unit_index)]
+    if len(matches) != 1 or matches[0].get("damage_attribute_type") != "hp":
+        return None
+    element = matches[0].get("element")
+    return element if element in {"physical", "fire", "pulse", "cryst", "natural"} else None
 
 
 def _resolve_skill_profile(skill_key: str | None) -> dict[str, Any] | None:
@@ -4368,13 +4536,7 @@ def _resolve_skill_profile(skill_key: str | None) -> dict[str, Any] | None:
         return None
     skill_key = _canonical_packet_skill_id(skill_key)
     mapping = _load_skill_profiles()
-    exact = mapping.get(skill_key)
-    if exact is not None:
-        return exact
-    for prefix, profile in _load_skill_profile_prefixes():
-        if skill_key.startswith(prefix):
-            return profile
-    return None
+    return mapping.get(skill_key)
 
 
 def _resolve_combo_consume_context(hit: dict[str, Any]) -> tuple[int, str] | None:
@@ -4390,13 +4552,6 @@ def _resolve_combo_consume_context(hit: dict[str, Any]) -> tuple[int, str] | Non
     family_key = str(hit.get("skill_family_key") or skill_key)
     if group_type in {1, 2} and family_key:
         return group_type, family_key
-
-    if "_normal_skill" in skill_key:
-        return 1, re.sub(r"(_normal_skill).*", r"\1", skill_key)
-    if "_ultimate_skill" in skill_key:
-        match = re.search(r"(chr_\d{4}_[a-z0-9]+_ultimate_skill)", skill_key)
-        if match:
-            return 2, match.group(1)
 
     return None
 
@@ -4418,22 +4573,10 @@ def _resolve_skill_family_key(skill_key: str | None, skill_profile: dict[str, An
     if not skill_key:
         return ""
     skill_key = _canonical_packet_skill_id(skill_key)
-    ultimate_match = re.match(r"^(chr_\d{4}_[a-z0-9]+)_ult_attack", skill_key.lower())
-    if ultimate_match:
-        return f"{ultimate_match.group(1)}_ultimate_skill"
-
     if skill_profile is not None:
         family_skill_key = str(skill_profile.get("family_skill_key") or skill_key)
         if family_skill_key:
             return family_skill_key
-
-    combo_damage_match = _COMBO_DAMAGE_SKILL_KEY_RE.match(skill_key.lower())
-    if combo_damage_match:
-        combo_skill_key = f"{combo_damage_match.group(1)}skill"
-        combo_profile = _resolve_skill_profile(combo_skill_key)
-        if combo_profile is not None:
-            return str(combo_profile.get("family_skill_key") or combo_skill_key)
-        return combo_skill_key
 
     return skill_key
 
@@ -4460,11 +4603,7 @@ def _cast_skill_family_key(cast: dict[str, Any]) -> str:
 
     skill_profile = _resolve_skill_profile(canonical_skill)
     family_key = _resolve_skill_family_key(canonical_skill, skill_profile)
-    family_match = re.match(
-        r"^(.*?_(?:ultimate_skill|normal_skill|combo(?:_\d+)?_skill))",
-        family_key.lower(),
-    )
-    return family_match.group(1) if family_match else family_key
+    return family_key
 
 
 def _build_cast_start_index(skill_casts: list[dict[str, Any]]) -> dict[tuple[str, str], list[dict[str, Any]]]:
@@ -4917,57 +5056,22 @@ def _humanize_generic_skill_name(skill_key: str) -> str | None:
 def _resolve_skill_name(skill_key: str | None) -> str | None:
     if not skill_key:
         return None
-    runtime_override = _RUNTIME_SKILL_NAME_OVERRIDES.get(str(skill_key))
-    if runtime_override:
-        return runtime_override
-    skill_hint = _packet_numeric_skill_hint(skill_key)
-    display_name = skill_hint.get("display_name")
-    if display_name:
-        return str(display_name)
-    skill_key = _canonical_packet_skill_id(skill_key)
-    canonical_display_name = _load_canonical_skill_display_names().get(skill_key)
-    if canonical_display_name:
-        return canonical_display_name
-    lowered = skill_key.lower()
-    if skill_key.startswith("buff_"):
-        humanized_buff_name = _humanize_buff_damage_name(skill_key)
-        if humanized_buff_name is not None:
-            return humanized_buff_name
-    if skill_key.startswith("chr_"):
-        character_skill_name = _humanize_character_skill_name(skill_key)
-        if character_skill_name is not None:
-            return character_skill_name
-    generic_skill_name = _humanize_generic_skill_name(skill_key)
-    if generic_skill_name is not None:
-        return generic_skill_name
-    if lowered.startswith("numeric_buff_trigger_"):
-        return "触发伤害"
-
-    if any(token in lowered for token in ("execute", "execution")):
-        return "处决"
-    if "_ult_attack" in lowered or "_ultimate_skill" in lowered:
-        return "终结技"
-    if _COMBO_SKILL_RE.search(lowered):
-        for prefix, skill_name in _load_skill_name_prefixes():
-            if skill_key.startswith(prefix):
-                return skill_name
-        return "连携技"
-    if "_normal_skill" in lowered:
-        return "战技"
-    if "power_attack" in lowered or "plunging_attack" in lowered or "heavy_attack" in lowered:
-        return "重击"
-
-    attack_match = _ATTACK_INDEX_RE.search(lowered)
-    if attack_match:
-        attack_index = int(attack_match.group(1))
-        if 1 <= attack_index <= 4:
-            return f"A{attack_index}"
-        return "重击"
-
-    for prefix, skill_name in _load_skill_name_prefixes():
-        if skill_key.startswith(prefix):
-            return skill_name
-    return skill_key
+    exact_names = _load_skill_exact_names()
+    if str(skill_key) in exact_names and not exact_names[str(skill_key)]:
+        return None
+    override = _RUNTIME_SKILL_NAME_OVERRIDES.get(str(skill_key))
+    if override:
+        return override
+    hint = _packet_numeric_skill_hint(skill_key)
+    if hint.get("display_name"):
+        return str(hint["display_name"])
+    exact = exact_names.get(str(skill_key))
+    if exact:
+        return exact
+    canonical = _canonical_packet_skill_id(skill_key)
+    if canonical in exact_names:
+        return exact_names[canonical] or None
+    return _load_canonical_skill_display_names().get(canonical)
 
 
 def _element_from_text(value: str | None) -> str | None:
@@ -5073,299 +5177,529 @@ def _element_filter_debug_fields(
     }
 
 
-def _description_line_for_bb_key(description: str, key: str) -> str:
-    lines = [part.strip() for part in str(description or "").replace("\r", "\n").split("\n") if part.strip()]
-    placeholder = "{" + key
-    for line in lines:
-        if placeholder in line:
-            return line
-    return lines[0] if lines else ""
-
-
-def _condition_text_for_line(line: str) -> str:
-    text = str(line or "").strip()
-    if not text:
-        return ""
-    condition_markers = (
-        "施放",
-        "释放",
-        "造成",
-        "命中",
-        "触发",
-        "获得",
-        "时，",
-        "时 ",
-        "后，",
-        "期间",
-    )
-    if any(marker in text for marker in condition_markers):
-        return text
-    return ""
-
-
-def _skill_groups_from_text(text: str) -> list[str]:
-    groups: list[str] = []
-    value = str(text or "")
-    if "普通攻击" in value:
-        groups.append("normal")
-    if "战技" in value:
-        groups.append("skill")
-    if "连携技" in value:
-        groups.append("combo")
-    if "终结技" in value:
-        groups.append("ultimate")
-    if "所有技能" in value or "全技能" in value:
-        groups.extend(["skill", "combo", "ultimate"])
-    return list(dict.fromkeys(groups))
-
-
-def _elements_from_text(text: str) -> list[str]:
-    elements: list[str] = []
-    mapping = (
-        ("物理", "physical"),
-        ("灼热", "fire"),
-        ("电磁", "pulse"),
-        ("寒冷", "cryst"),
-        ("自然", "natural"),
-        ("法术", "spell"),
-    )
-    for token, normalized in mapping:
-        if token in str(text or ""):
-            elements.append(normalized)
-    return list(dict.fromkeys(elements))
-
-
-def _static_multiplier_entry(
-    *,
-    source_type: str,
-    source_name: str,
-    label: str,
-    zone: str,
-    element: str,
-    rate: float,
-    note: str = "",
-    skill_groups: list[str] | None = None,
-    condition_text: str = "",
-) -> dict[str, Any] | None:
-    if zone not in _RDPS_ALLOCATABLE_ZONES or abs(rate) <= 1e-9:
-        return None
-    return {
-        "source_type": source_type,
-        "source_name": source_name,
-        "label": label,
-        "zone": zone,
-        "zone_label": _RDPS_DEBUG_ZONE_LABELS.get(zone, zone),
-        "element": element,
-        "rate": rate,
-        "note": note,
-        "skill_groups": skill_groups or [],
-        "condition_text": condition_text,
-    }
-
-
-def _derive_static_entries_from_desc(
-    *,
-    source_type: str,
-    source_name: str,
-    desc: str,
-    value: Any,
-    note: str = "",
-) -> list[dict[str, Any]]:
-    text = str(desc or "").strip()
-    rate = _safe_positive_rate(value)
-    if not text or rate is None:
-        return []
-    if any(token in text for token in ("终结技充能效率", "治疗", "力量", "敏捷", "智识", "意志", "防御力", "生命值", "主能力", "副能力", "源石技艺强度")):
-        return []
-    if "连携技冷却缩减" in text:
-        return []
-
-    if "承伤易伤" in text or "受到的法术伤害" in text or "受到的物理伤害" in text or "受到伤害提高" in text:
-        zone = "vuln_taken"
-    elif "减抗" in text or "抗性降低" in text:
-        zone = "res"
-    elif "连击增伤" in text:
-        zone = "combo"
-    elif "脆弱" in text or ("易伤" in text and "受到" not in text):
-        zone = "fragile"
-    elif "攻击提升" in text or "攻击力提升" in text:
-        zone = "atk"
-    elif "伤害提升" in text or "伤害加成" in text or "所有技能伤害" in text or "全技能伤害" in text:
-        zone = "dmg_inc"
-    else:
-        return []
-
-    condition_text = _condition_text_for_line(text)
-    skill_groups = _skill_groups_from_text(text)
-    entries: list[dict[str, Any]] = []
-    for element in _elements_from_text(text) or ["all"]:
-        entry = _static_multiplier_entry(
-            source_type=source_type,
-            source_name=source_name,
-            label=text,
-            zone=zone,
-            element=element,
-            rate=rate,
-            note=note,
-            skill_groups=skill_groups,
-            condition_text=condition_text,
-        )
-        if entry is not None:
-            entries.append(entry)
-    return entries
-
-
-def _derive_static_entries_from_weapon_bb(
-    *,
-    source_name: str,
-    skill_id: str,
-    bb: dict[str, Any],
-    description_by_key: dict[str, str],
-) -> list[dict[str, Any]]:
-    entries: list[dict[str, Any]] = []
-    for raw_key, raw_value in (bb or {}).items():
-        key = str(raw_key or "").lower()
-        rate = _safe_positive_rate(raw_value)
-        if rate is None:
+def _derive_static_arts_strength_entries(row: dict[str, Any]) -> list[dict[str, Any]]:
+    # Baseline points belong to exact equipment slots or exact card properties,
+    # never to a matching number or an arbitrary BB field name.
+    candidates: defaultdict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
+    for attribute in row.get('equipment_baseline_attributes') or []:
+        if (not isinstance(attribute, dict) or attribute.get('source_type') != 'equip_baseline'
+                or attribute.get('attr_type') != 87
+                or attribute.get('evidence_kind') != 'official_EquipTable_attribute_zero_or_exact'
+                or not isinstance(attribute.get('source_id'), str) or not attribute['source_id']
+                or any(type(attribute.get(key)) is not int or attribute[key] < 0
+                       for key in ('source_slot', 'attr_index', 'enhance_level'))
+                or not re.fullmatch(r'[0-9a-f]{64}', str(attribute.get('source_table_sha256') or ''))):
             continue
-        zone = ""
-        element = "all"
-        skill_groups: list[str] = []
-        if key in {"spell_damage_taken_up", "spell_dmg_taken_up"}:
-            zone = "vuln_taken"
-            element = "spell"
-        elif key == "dmg_taken_up":
-            zone = "vuln_taken"
-        elif key in {"spell_dmg_up", "spelldam"}:
-            zone = "dmg_inc"
-            element = "spell"
-        elif key == "spell_up":
-            zone = "dmg_inc"
-            skill_groups = ["skill", "combo", "ultimate"]
-        elif key == "normal_atk_up":
-            zone = "dmg_inc"
-            skill_groups = ["normal"]
-        elif key.endswith("_dmg_up"):
-            zone = "dmg_inc"
-            prefix = key.removesuffix("_dmg_up")
-            element = {
-                "fire": "fire",
-                "pulse": "pulse",
-                "cryst": "cryst",
-                "natural": "natural",
-                "physical": "physical",
-                "spell": "spell",
-            }.get(prefix, "all")
-        elif key.startswith("damage_taken_up_"):
-            zone = "vuln_taken"
-            suffix = key.removeprefix("damage_taken_up_")
-            element = {
-                "fire": "fire",
-                "pulse": "pulse",
-                "cryst": "cryst",
-                "natural": "natural",
-                "physical": "physical",
-                "spell": "spell",
-            }.get(suffix, "all")
-        else:
+        value = _coerce_optional_float(attribute.get('value'))
+        if value is None or value < 0:
             continue
-
-        description_line = str(description_by_key.get(key) or "")
-        entry = _static_multiplier_entry(
-            source_type="weapon",
-            source_name=source_name,
-            label=f"武器效果 {skill_id} / {raw_key}",
-            zone=zone,
-            element=element,
-            rate=rate,
-            note=f"blackboard: {raw_key}={raw_value}",
-            skill_groups=skill_groups,
-            condition_text=_condition_text_for_line(description_line),
-        )
-        if entry is not None:
-            entries.append(entry)
+        identity = ('equip', attribute['source_slot'], attribute['source_id'], attribute['attr_index'])
+        candidates[identity].append({
+            'source_type': 'equip', 'source_name': attribute['source_id'], 'source_id': attribute['source_id'],
+            'source_slot': attribute['source_slot'], 'attr_index': attribute['attr_index'],
+            'enhance_level': attribute['enhance_level'], 'rate': value,
+            'source_table_sha256': attribute['source_table_sha256'],
+            'evidence_kind': attribute['evidence_kind'],
+        })
+    try:
+        catalog = json.loads((_repo_root() / 'data/local_static/skill/item_arts_strength_catalog.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        catalog = {}
+    decoder = catalog.get('decoder') if isinstance(catalog, dict) else None
+    if (not isinstance(catalog, dict) or catalog.get('schemaVersion') != 1
+            or catalog.get('source') != 'current_official_item_skill_card_attribute'
+            or not isinstance(decoder, dict)
+            or any(decoder.get(key) != value for key, value in _NATIVE_DAMAGE_SEMANTICS_BINDING.items())):
+        catalog = {}
+    weapon_id = str(row.get('weapon_template') or '')
+    declared_skills = (_load_weapon_catalog().get(weapon_id) or {}).get('weapon_skill_ids') or []
+    for category, definitions in (('suit', catalog.get('suitEntries') or []),
+                                  ('weapon', catalog.get('weaponEntries') or [])):
+        for definition in definitions:
+            if not isinstance(definition, dict):
+                continue
+            modifier = definition.get('modifier') or {}
+            param = modifier.get('param') or {}
+            if (modifier.get('$type') != 'Beyond.Gameplay.AttributeModifierData.AttributeModifier'
+                    or modifier.get('attributeType') != 'PhysicalAndSpellInflictionEnhance'
+                    or modifier.get('formulaItem') != 'BaseAddition' or modifier.get('modifyAttributeType') != 'Specific'
+                    or param.get('useBlackboardKey') is not True
+                    or param.get('blackboardKey') != definition.get('bbKey')
+                    or not isinstance(definition.get('bbKey'), str) or not definition['bbKey']
+                    or type(definition.get('attributeIndex')) is not int or definition['attributeIndex'] < 0
+                    or type(definition.get('sourceBytes')) is not int or definition['sourceBytes'] <= 0
+                    or definition.get('consumedBytes') != definition['sourceBytes']
+                    or not re.fullmatch(r'[0-9a-f]{64}', str(definition.get('sourceSha256') or ''))):
+                continue
+            source_rows = []
+            if category == 'weapon':
+                bindings = [binding for binding in definition.get('weaponBindings') or []
+                            if isinstance(binding, dict) and binding.get('weaponId') == weapon_id
+                            and type(binding.get('skillSlot')) is int and 0 <= binding['skillSlot'] < len(declared_skills)
+                            and declared_skills[binding['skillSlot']] == definition.get('skillId')]
+                if (len(bindings) != 1 or _load_num_id_str_skill_map().get(str(definition.get('numericSkillId')))
+                        != definition.get('skillId')):
+                    continue
+                for skill in row.get('weapon_source_skills') or row.get('weapon_refine_stats') or []:
+                    if not isinstance(skill, dict):
+                        continue
+                    skill_id = str(skill.get('skill_id') or '')
+                    canonical = _load_num_id_str_skill_map().get(skill_id) if skill_id.isdigit() else skill_id
+                    if canonical == definition['skillId'] and isinstance(skill.get('bb'), dict):
+                        source_rows.append((weapon_id, 'weapon_skill', weapon_id, skill['bb']))
+            else:
+                for effect in row.get('suit_effects') or []:
+                    if (isinstance(effect, dict) and effect.get('suit_id') == definition.get('suitId')
+                            and effect.get('active') is True and isinstance(effect.get('value'), dict)):
+                        source_rows.append((effect['suit_id'], 'equip_suit',
+                                            str(effect.get('suit_name') or effect['suit_id']), effect['value']))
+            for item_id, source_type, source_name, bb in source_rows:
+                value = _coerce_optional_float(bb.get(definition['bbKey']))
+                if value is None or value < 0:
+                    continue
+                identity = (category, item_id, definition['skillId'], definition['attributeIndex'])
+                candidates[identity].append({
+                    'source_type': source_type, 'source_name': source_name,
+                    'source_id': definition['skillId'], 'item_id': item_id,
+                    'attr_index': definition['attributeIndex'], 'bb_key': definition['bbKey'], 'rate': value,
+                    'source_resource_sha256': definition['sourceSha256'],
+                    'evidence_kind': 'current_official_item_skill_card_attribute',
+                })
+    entries = []
+    for identity, values in candidates.items():
+        signatures = {json.dumps({key: field for key, field in value.items() if key != 'source_name'},
+                                 sort_keys=True, ensure_ascii=False) for value in values}
+        if len(signatures) != 1:
+            row.setdefault('rdps_unresolved_static_multiplier_sources', []).append({
+                'reason': 'conflicting_static_arts_strength_source', 'identity': list(identity)})
+            continue
+        entry = dict(values[0])  # One proven source with identical numeric/provenance observations.
+        if len({value['source_name'] for value in values}) != 1:
+            entry['source_name'] = str(entry.get('item_id') or entry['source_id'])
+        if entry['rate'] > 0:
+            entries.append({**entry, 'attr_type': 87, 'zone': 'arts_strength',
+                            'zone_label': _RDPS_DEBUG_ZONE_LABELS['arts_strength'], 'element': 'all',
+                            'condition_text': ''})
     return entries
 
 
 def _derive_static_self_multiplier_entries(row: dict[str, Any]) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
 
+    row['rdps_unresolved_static_multiplier_sources'] = []
+    if row.get('unresolved_equip_inst_ids'):
+        row['rdps_unresolved_static_multiplier_sources'].append({
+            'reason': 'unresolved_equipment_slot', 'equip_inst_ids': list(row['unresolved_equip_inst_ids'])})
+    equip_slots = Counter(equip.get('slot') for equip in row.get('equips') or [] if isinstance(equip, dict))
+    baseline_attributes: list[dict[str, Any]] = []
+    allocatable_attr_types = {2, 17, 28, 32, 33, 50, 51, 52, 53, 54}
     for equip in row.get("equips") or []:
         if not isinstance(equip, dict):
             continue
-        equip_name = str(equip.get("piece_name") or equip.get("item_name") or equip.get("item_id") or "装备")
-        for stat in equip.get("stats") or []:
-            if not isinstance(stat, dict):
-                continue
-            entries.extend(
-                _derive_static_entries_from_desc(
-                    source_type="equip",
-                    source_name=equip_name,
-                    desc=str(stat.get("name") or ""),
-                    value=stat.get("value"),
-                    note=f"{equip.get('part_name') or ''} / {stat.get('slot') or ''}",
-                )
-            )
-
-    for suit in row.get("suit_effects") or []:
-        if not isinstance(suit, dict) or not suit.get("active"):
+        item_id, slot = str(equip.get('item_id') or ''), equip.get('slot')
+        meta = _load_equip_item_catalog().get(item_id, {})
+        modifiers, proof = meta.get('attribute_modifiers'), meta.get('attribute_source_sha256')
+        if (type(slot) is not int or equip_slots[slot] != 1 or not isinstance(modifiers, list)
+                or not isinstance(proof, str) or not re.fullmatch(r'[0-9a-f]{64}', proof)):
+            row['rdps_unresolved_static_multiplier_sources'].append({'item_id': item_id, 'slot': slot,
+                'reason': 'missing_or_conflicting_equipment_attribute_evidence'})
             continue
-        suit_name = str(suit.get("suit_name") or suit.get("suit_id") or "套装")
-        description = str(suit.get("description") or "")
-        for key, value in (suit.get("value") or {}).items():
-            line = _description_line_for_bb_key(description, str(key))
-            entries.extend(
-                _derive_static_entries_from_desc(
-                    source_type="suit",
-                    source_name=suit_name,
-                    desc=line or description,
-                    value=value,
-                    note=f"{key}={value}",
-                )
-            )
+        levels = defaultdict(set)
+        for level in equip.get('enhance_levels') or []:
+            if (isinstance(level, dict) and type(level.get('index')) is int
+                    and type(level.get('level')) is int):
+                levels[level['index']].add(level['level'])
+        if row.get('equipment_snapshot_complete') is True:
+            for modifier in modifiers:
+                if (isinstance(modifier, dict) and type(modifier.get('attrIndex')) is int
+                        and not levels.get(modifier['attrIndex'])):
+                    # A protobuf map omits only the entries at their default
+                    # value; each absent attribute index is therefore level 0.
+                    levels[modifier['attrIndex']].add(0)
+        for modifier in modifiers:
+            if not isinstance(modifier, dict):
+                row['rdps_unresolved_static_multiplier_sources'].append({'item_id': item_id, 'reason': 'invalid_attribute_row'})
+                continue
+            attr_type, formula, target = modifier.get('attrType'), modifier.get('modifierType'), modifier.get('modifyAttributeType')
+            if any(type(value) is not int for value in (attr_type, formula, target)):
+                row['rdps_unresolved_static_multiplier_sources'].append({'item_id': item_id, 'reason': 'invalid_attribute_enum'})
+                continue
+            if (row.get('equipment_snapshot_complete') is True
+                    and attr_type not in allocatable_attr_types
+                    and attr_type not in {39, 40, 41, 42, 87}):
+                index = modifier.get('attrIndex')
+                raw_values = modifier.get('attrValues')
+                values = [_coerce_optional_float(value) for value in raw_values] if isinstance(raw_values, list) else []
+                candidates = levels.get(index, set())
+                level = next(iter(candidates)) if len(candidates) == 1 else None
+                value = (values[level] if level is not None and 0 <= level < len(values)
+                         and all(v is not None for v in values) else None)
+                if value is not None and value >= 0:
+                    baseline_attributes.append({
+                        'source_type': 'equip_baseline', 'source_id': item_id,
+                        'source_slot': slot, 'attr_type': attr_type,
+                        'attr_index': index, 'value': value, 'enhance_level': level,
+                        'modifier_type': formula, 'modify_attribute_type': target,
+                        'evidence_kind': 'official_EquipTable_attribute_zero_or_exact',
+                        'source_table_sha256': proof,
+                    })
+                    stats = equip.get('stats')
+                    if isinstance(stats, list) and type(index) is int and 0 <= index < len(stats):
+                        stat = stats[index]
+                        if isinstance(stat, dict) and stat.get('value') == 'unknown':
+                            stat['value'] = value
+                            stat['level'] = level
+                            stat['value_source'] = 'official_EquipTable_attribute_zero_or_exact'
+                    continue
+            # This path handles percentage attack and additive damage bonuses.
+            # Main/sub ability, flat stats and other mechanisms are separate.
+            if (row.get('equipment_snapshot_complete') is True
+                    and target == 0 and attr_type in {39, 40, 41, 42, 87} and formula == 5):
+                index = modifier.get('attrIndex')
+                raw_values = modifier.get('attrValues')
+                values = [_coerce_optional_float(value) for value in raw_values] if isinstance(raw_values, list) else []
+                candidates = levels.get(index, set())
+                level = next(iter(candidates)) if len(candidates) == 1 else None
+                value = values[level] if (level is not None and 0 <= level < len(values)
+                                          and all(v is not None for v in values)) else None
+                if value is not None and value >= 0:
+                    baseline_attributes.append({
+                        'source_type': 'equip_baseline', 'source_id': item_id,
+                        'source_slot': slot, 'attr_type': attr_type,
+                        'attr_index': index, 'value': value, 'enhance_level': level,
+                        'evidence_kind': 'official_EquipTable_attribute_zero_or_exact',
+                        'source_table_sha256': proof,
+                    })
+                    stats = equip.get('stats')
+                    if isinstance(stats, list) and type(index) is int and 0 <= index < len(stats):
+                        stat = stats[index]
+                        if isinstance(stat, dict) and stat.get('value') == 'unknown':
+                            stat['value'] = value
+                            stat['level'] = level
+                            stat['value_source'] = 'official_EquipTable_attribute_zero_or_exact'
+                    continue
+            if target != 0 or attr_type in {39, 40, 41, 42, 61, 87} or (attr_type == 2 and formula not in {6, 7}):
+                row['rdps_unresolved_static_multiplier_sources'].append({'item_id': item_id, 'slot': slot,
+                    'attr_type': attr_type, 'modifier_type': formula, 'modify_attribute_type': target,
+                    'reason': 'unmodeled_static_attribute_mechanism'})
+                continue
+            if target != 0 or attr_type not in {2, 17, 28, 32, 33, 50, 51, 52, 53, 54}:
+                continue
+            if (attr_type == 2 and formula not in {6, 7}) or (attr_type != 2 and formula != 5):
+                continue
+            index = modifier.get('attrIndex')
+            raw_values = modifier.get('attrValues')
+            values = [_coerce_optional_float(value) for value in raw_values] if isinstance(raw_values, list) else []
+            candidates = levels.get(index, set())
+            level = next(iter(candidates)) if len(candidates) == 1 else None
+            value = None
+            if values and all(v is not None for v in values) and type(index) is int:
+                if len(candidates) == 1 and 0 <= level < len(values):
+                    value = values[level]
+                elif not candidates and len(set(values)) == 1:
+                    # No level is invented: every legal level has this value.
+                    value = values[0]
+            if value is None or value < 0:
+                row['rdps_unresolved_static_multiplier_sources'].append({'item_id': item_id,
+                    'slot': slot, 'attr_index': index, 'attr_type': attr_type,
+                    'reason': 'missing_or_conflicting_equipment_enhancement'})
+                continue
+            stats = equip.get('stats')
+            if isinstance(stats, list) and type(index) is int and 0 <= index < len(stats):
+                stat = stats[index]
+                if isinstance(stat, dict) and stat.get('value') == 'unknown':
+                    stat['value'] = value
+                    stat['level'] = level
+                    stat['value_source'] = 'official_EquipTable_attribute_zero_or_exact'
+            if attr_type == 2 and formula == 7:
+                baseline_attributes.append({'source_type': 'equip_baseline', 'source_id': item_id,
+                    'source_slot': slot, 'attr_type': 2, 'attr_index': index, 'value': value,
+                    'modifier_type': 7, 'modify_attribute_type': target, 'enhance_level': level,
+                    'evidence_kind': 'official_EquipTable_flat_attack', 'source_table_sha256': proof})
+                continue
+            zone, element = _ATTR_TYPE_TO_EFFECT[attr_type]
+            entries.append({'source_type': 'equip', 'source_name': str(meta.get('item_name') or item_id),
+                'source_id': item_id, 'source_slot': slot, 'label': f'attribute_type_{attr_type}',
+                'zone': zone, 'zone_label': _RDPS_DEBUG_ZONE_LABELS[zone], 'element': element,
+                'rate': value, 'attr_type': attr_type, 'modifier_type': formula, 'attr_index': index,
+                'enhance_level': level, 'skill_groups': [], 'condition_text': '',
+                'evidence_kind': 'official_EquipTable_attribute', 'source_table_sha256': proof})
 
-    weapon_name = str(row.get("weapon_name") or row.get("weapon_template") or "武器")
-    description_by_key: dict[str, str] = {}
-    for skill in row.get("weapon_catalog_skilllist") or []:
+    row['equipment_baseline_attributes'] = baseline_attributes
+    weapon_skills = row.get('weapon_source_skills') or row.get('weapon_refine_stats') or []
+    weapon_meta = _load_weapon_catalog().get(str(row.get('weapon_template') or ''), {})
+    declared_weapon_skills = set(weapon_meta.get('weapon_skill_ids') or [])
+    basic_attack_skills = {'wpn_sp_attr_atk_high', 'wpn_sp_attr_atk_mid', 'wpn_sp_attr_atk_low'}
+    attack_specs = {(key, 'atk'): 'BaseMultiplier' for key in basic_attack_skills & declared_weapon_skills}
+    attack_specs.update({(field['skillId'], field['bbKey']): field['formulaItem']
+                         for field in weapon_meta.get('static_attack_fields') or []})
+    weapon_attack_values: dict[tuple[str, str], set[float | None]] = defaultdict(set)
+    for skill in weapon_skills:
         if not isinstance(skill, dict):
             continue
-        description = str(skill.get("description") or "")
-        for bb in skill.get("blackboard") or []:
-            if not isinstance(bb, dict):
+        canonical_skill = _canonical_num_table_skill_number(str(skill.get('skill_id') or ''), None)
+        if canonical_skill is None and skill.get('skill_id') in declared_weapon_skills:
+            canonical_skill = skill['skill_id']
+        for (skill_id, key), formula in attack_specs.items():
+            if canonical_skill == skill_id:
+                weapon_attack_values[(skill_id, key)].add(_coerce_optional_float((skill.get('bb') or {}).get(key)))
+    for (skill_id, key), values in weapon_attack_values.items():
+        value = next(iter(values)) if len(values) == 1 else None
+        if value is None or value < 0:
+            row['rdps_unresolved_static_multiplier_sources'].append({
+                'reason': 'missing_or_conflicting_weapon_basic_attack', 'source_id': skill_id})
+            continue
+        if attack_specs[(skill_id, key)] == 'BaseFinalAddition':
+            baseline_attributes.append({'source_type': 'weapon_skill', 'source_id': skill_id,
+                'attr_type': 2, 'modifier_type': 7, 'modify_attribute_type': 0, 'value': value,
+                'bb_key': key, 'evidence_kind': 'official_WeaponSkill_card_flat_attack'})
+            continue
+        entries.append({'source_type': 'weapon_skill', 'source_name': str(row.get('weapon_template') or ''),
+            'source_id': skill_id, 'zone': 'atk', 'zone_label': _RDPS_DEBUG_ZONE_LABELS['atk'],
+            'element': 'all', 'attr_type': 2, 'modifier_type': 6, 'bb_key': key, 'rate': value,
+            'evidence_kind': 'official_WeaponSkill_text_basic_atk',
+            'source_table_sha256': weapon_meta.get('weapon_definition_sha256'), 'condition_text': ''})
+    try:
+        damage_catalog = json.loads((_repo_root() / 'data/local_static/skill/item_damage_baseline_catalog.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        damage_catalog = {}
+    decoder = damage_catalog.get('decoder') if isinstance(damage_catalog, dict) else None
+    if (not isinstance(damage_catalog, dict) or damage_catalog.get('schemaVersion') != 1
+            or damage_catalog.get('source') != 'current_official_item_skill_card_attribute'
+            or not isinstance(decoder, dict)
+            or any(decoder.get(key) != value for key, value in _CURRENT_TYPED_RESOURCE_BINDING.items())):
+        damage_catalog = {}
+    damage_attributes = {
+        'NormalAttackDamageIncrease': 17, 'UltimateSkillDamageIncrease': 28,
+        'NormalSkillDamageIncrease': 32, 'ComboSkillDamageIncrease': 33,
+        'PhysicalDamageIncrease': 50, 'FireDamageIncrease': 51,
+        'PulseDamageIncrease': 52, 'CrystDamageIncrease': 53,
+        'NaturalDamageIncrease': 54, 'EtherDamageIncrease': 55,
+    }
+    damage_static_keys: dict[str, set[str]] = defaultdict(set)
+    reviewed_damage_suits: set[str] = set()
+    for category, definitions in (('weapon', damage_catalog.get('weaponEntries') or []),
+                                  ('suit', damage_catalog.get('suitEntries') or [])):
+        for definition in definitions:
+            if not isinstance(definition, dict):
                 continue
-            key = str(bb.get("key") or "").lower()
-            if key:
-                description_by_key[key] = _description_line_for_bb_key(description, key)
-    for skill in row.get("weapon_source_skills") or row.get("weapon_refine_stats") or []:
+            modifier = definition.get('modifier') or {}
+            param = modifier.get('param') or {}
+            attr_type = definition.get('attributeType')
+            if (modifier.get('$type') != 'Beyond.Gameplay.AttributeModifierData.AttributeModifier'
+                    or damage_attributes.get(modifier.get('attributeType')) != attr_type
+                    or attr_type not in _ATTR_TYPE_TO_EFFECT
+                    or modifier.get('modifyAttributeType') != 'Specific'
+                    or param.get('useBlackboardKey') is not True
+                    or param.get('blackboardKey') != definition.get('bbKey')
+                    or not isinstance(definition.get('bbKey'), str) or not definition['bbKey']
+                    or type(definition.get('attributeIndex')) is not int or definition['attributeIndex'] < 0
+                    or type(definition.get('sourceBytes')) is not int or definition['sourceBytes'] <= 0
+                    or definition.get('consumedBytes') != definition['sourceBytes']
+                    or not re.fullmatch(r'[0-9a-f]{64}', str(definition.get('sourceSha256') or ''))
+                    or _load_num_id_str_skill_map().get(str(definition.get('numericSkillId'))) != definition.get('skillId')):
+                continue
+            observations = []
+            if category == 'weapon':
+                declared_list = weapon_meta.get('weapon_skill_ids') or []
+                bindings = [binding for binding in definition.get('weaponBindings') or []
+                            if isinstance(binding, dict) and binding.get('weaponId') == row.get('weapon_template')
+                            and type(binding.get('skillSlot')) is int and 0 <= binding['skillSlot'] < len(declared_list)
+                            and declared_list[binding['skillSlot']] == definition['skillId']]
+                if len(bindings) != 1:
+                    continue
+                damage_static_keys[definition['skillId']].add(definition['bbKey'])
+                for skill in weapon_skills:
+                    if not isinstance(skill, dict):
+                        continue
+                    skill_id = str(skill.get('skill_id') or '')
+                    canonical = _load_num_id_str_skill_map().get(skill_id) if skill_id.isdigit() else skill_id
+                    if canonical == definition['skillId'] and isinstance(skill.get('bb'), dict):
+                        observations.append((str(row['weapon_template']), 'weapon_skill', skill['bb']))
+            else:
+                for effect in row.get('suit_effects') or []:
+                    if (isinstance(effect, dict) and effect.get('suit_id') == definition.get('suitId')
+                            and effect.get('active') is True and isinstance(effect.get('value'), dict)
+                            and definition.get('requiredPieces') == 3 and definition.get('skillLevel') == 1):
+                        observations.append((effect['suit_id'], 'equip_suit', effect['value']))
+                        reviewed_damage_suits.add(effect['suit_id'])
+            for item_id, source_type, bb in observations:
+                value = _coerce_optional_float(bb.get(definition['bbKey']))
+                if value is None or value < 0 or modifier.get('formulaItem') not in {'BaseAddition', 'Addition'}:
+                    row['rdps_unresolved_static_multiplier_sources'].append({
+                        'reason': ('missing_item_damage_baseline_value' if value is None or value < 0
+                                   else 'unmodeled_item_damage_attribute_stage'),
+                        'source_id': definition['skillId'], 'bb_key': definition['bbKey'],
+                        'formula_item': modifier.get('formulaItem')})
+                    continue
+                zone, element = _ATTR_TYPE_TO_EFFECT[attr_type]
+                entries.append({'source_type': source_type, 'source_name': item_id, 'item_id': item_id,
+                    'source_id': definition['skillId'], 'attr_index': definition['attributeIndex'],
+                    'zone': zone, 'zone_label': _RDPS_DEBUG_ZONE_LABELS[zone], 'element': element,
+                    'attr_type': attr_type, 'modifier_type': {'BaseAddition': 5, 'Addition': 0}[modifier['formulaItem']],
+                    'formula_item': modifier['formulaItem'], 'bb_key': definition['bbKey'], 'rate': value,
+                    'source_resource_sha256': definition['sourceSha256'],
+                    'evidence_kind': 'current_official_item_skill_card_attribute', 'condition_text': ''})
+
+    suit_definitions = {
+        'suit_expend_spell01': ({'atk_up'}, {'spell_dmg_up', 'duration', 'max_stack'}),
+        'suit_atb01': ({'comboskill_cooldown'}, {'dmg_up', 'duration'}),
+        'suit_heal01': ({'heal_up'}, {'dmg_taken_down', 'dmg_taken_down2', 'duration'}),
+        'suit_combo_cd01': ({'comboskill_cooldown'}, {'spell_up', 'duration', 'max_stack'}),
+        'suit_fire_natr01': ({'phy_spell_up'}, {'fire_dmg_up', 'nature_dmg_up', 'duration', 'duration2'}),
+        'suit_usp02': ({'hp_up'}, {'dmg_up', 'duration'}),
+    }
+    suit_ids = {
+        str(effect.get('suit_id') or '') for effect in row.get('suit_effects') or []
+        if isinstance(effect, dict) and effect.get('suit_id')
+    }
+    for effect in row.get('suit_effects') or []:
+        if not isinstance(effect, dict):
+            continue
+        suit_id = str(effect.get('suit_id') or '')
+        values = effect.get('value')
+        if suit_id not in suit_definitions:
+            continue
+        base_fields, trigger_fields = suit_definitions[suit_id]
+        if not isinstance(values, dict) or not set(values).issubset(base_fields | trigger_fields):
+            row['rdps_unresolved_static_multiplier_sources'].append({
+                'reason': 'unmodeled_suit_static_semantics', 'suit_ids': [suit_id],
+                'unknown_fields': sorted(set(values or {}) - base_fields - trigger_fields)
+                if isinstance(values, dict) else [],
+            })
+            continue
+        for field in base_fields:
+            value = _coerce_optional_float(values.get(field))
+            if value is not None and value >= 0:
+                baseline_attributes.append({
+                    'source_type': 'equip_suit_baseline', 'source_id': suit_id,
+                    'field': field, 'value': value,
+                    'evidence_kind': 'official_EquipSuit_text',
+                })
+    if suit_ids - set(suit_definitions) - reviewed_damage_suits:
+        row['rdps_unresolved_static_multiplier_sources'].append({
+            'reason': 'unmodeled_suit_static_semantics',
+            'suit_ids': sorted(suit_ids - set(suit_definitions) - reviewed_damage_suits),
+        })
+    # Reviewed fields include card baselines and separately implemented trigger
+    # parameters. Knowing a trigger's semantics does not make it a static bonus:
+    # its Buff UID/lifetime still decides allocation. Scope every field to the
+    # current weapon's declared skill identity, never to a shared BB name.
+    basic_fields = {
+        'wpn_sword_0006': {
+            'wpn_attr_wisd_high': {'wisd'}, 'wpn_sp_attr_atk_high': {'atk'},
+            'sk_wpn_sword_0006': {'fire_dmg_up', 'duration', 'normal_atk_up'},
+        },
+        'wpn_sword_0007': {
+            'wpn_attr_wisd_mid': {'wisd'}, 'wpn_sp_attr_usgs_mid': {'usgs'},
+            'sk_wpn_sword_0007': {'atk_up', 'phy_spell_up'},
+        },
+        'wpn_pistol_0012': {
+            'wpn_attr_agi_mid': {'agi'}, 'wpn_sp_attr_usgs_mid': {'usgs'},
+            'sk_wpn_pistol_0012': {'atk_up', 'duration', 'count', 'nature_dmg_up', 'nature_dmg_up_mult'},
+        },
+        'wpn_funnel_0008': {
+            'wpn_attr_main_high': {'mainattr'},
+            'wpn_sp_attr_phy_spell_high': {'physpell'},
+            'sk_wpn_funnel_0008': {'second_attr_up', 'duration', 'lv', 'spell_damage_taken_up'},
+        },
+        'wpn_funnel_0013': {
+            'wpn_attr_wisd_high': {'wisd'}, 'wpn_sp_attr_heal_high': {'heal'},
+            'sk_wpn_funnel_0013': {'second_attr_up', 'duration', 'lv', 'spell_dmg_taken_up'},
+        },
+        'wpn_funnel_0017': {
+            'wpn_attr_will_high': {'will'}, 'wpn_sp_attr_electrondam_high': {'electrondam'},
+            'sk_wpn_funnel_0017': {'atk_up', 'duration', 'max_stack', 'pulse_dmg_up2'},
+        },
+        'wpn_sword_0012': {
+            'wpn_attr_will_high': {'will'}, 'wpn_sp_attr_atk_high': {'atk'},
+            'sk_wpn_sword_0012': {'atk_up', 'atk_up2', 'duration', 'max_stack', 'lv'},
+        },
+        'wpn_lance_0014': {
+            'wpn_attr_will_high': {'will'}, 'wpn_sp_attr_heal_high': {'heal'},
+            'sk_wpn_lance_0014': {'atk_up', 'duration', 'max_stack', 'primary_attr_up'},
+        },
+        'wpn_funnel_0004': {
+            'wpn_attr_wisd_mid': {'wisd'}, 'wpn_sp_attr_electrondam_mid': {'electrondam'},
+            'sk_wpn_funnel_0004': {'phy_spell_up', 'dmg_up', 'duration'},
+        },
+    }.get(str(row.get('weapon_template') or ''), {})
+    weapon_trigger_keys = []
+    for skill in weapon_skills:
         if not isinstance(skill, dict):
             continue
-        entries.extend(
-            _derive_static_entries_from_weapon_bb(
-                source_name=weapon_name,
-                skill_id=str(skill.get("skill_id") or ""),
-                bb=dict(skill.get("bb") or {}),
-                description_by_key=description_by_key,
-            )
-        )
+        canonical_skill = _canonical_num_table_skill_number(str(skill.get('skill_id') or ''), None)
+        reviewed_fields = basic_fields.get(canonical_skill)
+        if canonical_skill is None and skill.get('skill_id') in declared_weapon_skills:
+            canonical_skill = skill['skill_id']
+            reviewed_fields = basic_fields.get(canonical_skill)
+        if canonical_skill not in declared_weapon_skills:
+            reviewed_fields = None
+        if (str(row.get('weapon_template') or '') == 'wpn_funnel_0008'
+                and canonical_skill == 'wpn_sp_attr_phy_spell_high'
+                and canonical_skill in declared_weapon_skills
+                and _coerce_optional_float((skill.get('bb') or {}).get('atk')) == 0.0):
+            # Current typed card modifies arts strength only; its exported zero
+            # atk placeholder is inert. A nonzero/new field stays unresolved.
+            reviewed_fields = set(reviewed_fields or []) | {'atk'}
+        if canonical_skill in basic_attack_skills and canonical_skill in declared_weapon_skills:
+            reviewed_fields = {'atk'}
+        static_attack_keys = {key for skill_id, key in attack_specs if skill_id == canonical_skill}
+        if static_attack_keys or damage_static_keys.get(canonical_skill):
+            reviewed_fields = set(reviewed_fields or []) | static_attack_keys | damage_static_keys.get(canonical_skill, set())
+        if reviewed_fields is None:
+            weapon_trigger_keys.append('unreviewed_skill:' + str(skill.get('skill_id') or 'unknown'))
+        for key in (skill.get('bb') or {}):
+            if reviewed_fields is not None and key in reviewed_fields:
+                continue
+            weapon_trigger_keys.append(str(key))
+    if weapon_trigger_keys:
+        row['rdps_unresolved_static_multiplier_sources'].append({
+            'reason': 'unmodeled_weapon_static_semantics',
+            'weapon_template': row.get('weapon_template'),
+            'weapon_source_skill_ids': [
+                skill.get('skill_id') for skill in weapon_skills
+                if isinstance(skill, dict) and skill.get('skill_id') is not None
+            ],
+            'trigger_blackboard_keys': sorted(set(weapon_trigger_keys)),
+        })
 
     deduped: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str, str, float, str]] = set()
+    seen: dict[tuple[Any, ...], dict[str, Any]] = {}
+    conflicting_sources: set[tuple[Any, ...]] = set()
     for entry in entries:
+        if entry.get('evidence_kind') == 'official_EquipTable_attribute':
+            deduped.append(entry)
+            continue
         # Conditional entries should be represented by live packet buff windows;
         # adding them here would double count transient weapon/suit effects.
         if entry.get("condition_text"):
             continue
+        source_id = str(entry.get('source_id') or '')
+        source_id = _canonical_num_table_skill_number(source_id, None) or source_id
         key = (
             str(entry.get("source_type") or ""),
-            str(entry.get("source_name") or ""),
-            str(entry.get("label") or ""),
+            str(entry.get("item_id") or ""),
+            source_id,
+            str(entry.get("attr_index") or ""),
+            str(entry.get('bb_key') or ''),
+            str(entry.get('attr_type') or ''),
+            str(entry.get('modifier_type') or ''),
             str(entry.get("element") or ""),
-            round(float(entry.get("rate") or 0.0), 6),
             ",".join(entry.get("skill_groups") or []),
         )
-        if key in seen:
+        if key in conflicting_sources:
             continue
-        seen.add(key)
+        if key in seen:
+            if seen[key].get('rate') != entry.get('rate'):
+                prior = seen.pop(key)
+                deduped = [existing for existing in deduped if existing is not prior]
+                conflicting_sources.add(key)
+                row['rdps_unresolved_static_multiplier_sources'].append({
+                    'reason': 'conflicting_static_multiplier_source', 'source_id': source_id,
+                    'bb_key': entry.get('bb_key')})
+            continue
+        seen[key] = entry
         deduped.append(entry)
     return deduped
 
@@ -5405,130 +5739,43 @@ def _arts_strength_entry(
     }
 
 
-def _derive_static_arts_strength_entries(row: dict[str, Any]) -> list[dict[str, Any]]:
-    """Collect always-on source-strength points from the selected battle loadout.
-
-    Transient effects stay packet-window driven.  This baseline is only the
-    denominator for the dedicated anomaly formula; it is never converted into
-    an ordinary damage-increase percentage.
-    """
-
-    entries: list[dict[str, Any]] = []
-    for equip in row.get("equips") or []:
-        if not isinstance(equip, dict):
-            continue
-        equip_name = str(equip.get("piece_name") or equip.get("item_name") or equip.get("item_id") or "装备")
-        for stat in equip.get("stats") or []:
-            if not isinstance(stat, dict) or "源石技艺强度" not in str(stat.get("name") or ""):
-                continue
-            entry = _arts_strength_entry(
-                source_type="equip",
-                source_name=equip_name,
-                label=str(stat.get("name") or "源石技艺强度"),
-                value=stat.get("value"),
-                note=f"{equip.get('part_name') or ''} / {stat.get('slot') or ''}",
-            )
-            if entry is not None:
-                entries.append(entry)
-
-    for suit in row.get("suit_effects") or []:
-        if not isinstance(suit, dict) or not suit.get("active"):
-            continue
-        description = str(suit.get("description") or "")
-        for key, value in (suit.get("value") or {}).items():
-            line = _description_line_for_bb_key(description, str(key))
-            if "源石技艺强度" not in line or _condition_text_for_line(line):
-                continue
-            entry = _arts_strength_entry(
-                source_type="suit",
-                source_name=str(suit.get("suit_name") or suit.get("suit_id") or "套装"),
-                label=line,
-                value=value,
-                note=f"{key}={value}",
-            )
-            if entry is not None:
-                entries.append(entry)
-
-    weapon_name = str(row.get("weapon_name") or row.get("weapon_template") or "武器")
-    description_by_key: dict[str, str] = {}
-    for skill in row.get("weapon_catalog_skilllist") or []:
-        if not isinstance(skill, dict):
-            continue
-        description = str(skill.get("description") or "")
-        for bb in skill.get("blackboard") or []:
-            if not isinstance(bb, dict):
-                continue
-            key = str(bb.get("key") or "").lower()
-            if key:
-                description_by_key[key] = _description_line_for_bb_key(description, key)
-    for skill in row.get("weapon_source_skills") or row.get("weapon_refine_stats") or []:
-        if not isinstance(skill, dict):
-            continue
-        for raw_key, value in (skill.get("bb") or {}).items():
-            key = str(raw_key or "").lower()
-            line = description_by_key.get(key, "")
-            if key not in _ARTS_STRENGTH_BB_KEYS and "源石技艺强度" not in line:
-                continue
-            if line and _condition_text_for_line(line):
-                continue
-            entry = _arts_strength_entry(
-                source_type="weapon",
-                source_name=weapon_name,
-                label=line or f"武器效果 {skill.get('skill_id') or ''} / {raw_key}",
-                value=value,
-                note=f"blackboard: {raw_key}={value}",
-            )
-            if entry is not None:
-                entries.append(entry)
-
-    character_key = str(row.get("character_key") or "")
-    potential = max(int(row.get("potential") or 0), 0)
-    for index, potential_row in enumerate(_load_character_potential_rows(character_key), start=1):
-        if index > potential:
-            break
-        description = str(potential_row.get("description") or "")
-        for raw_key, value in (potential_row.get("values") or {}).items():
-            key = str(raw_key or "").lower()
-            line = _description_line_for_bb_key(description, str(raw_key))
-            if key not in _ARTS_STRENGTH_BB_KEYS and "源石技艺强度" not in line:
-                continue
-            entry = _arts_strength_entry(
-                source_type="potential",
-                source_name=str(potential_row.get("name") or f"潜能 {index}"),
-                label=line or "源石技艺强度",
-                value=value,
-                note=f"potential={index}; {raw_key}={value}",
-            )
-            if entry is not None:
-                entries.append(entry)
-
-    deduped: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str, float]] = set()
-    for entry in entries:
-        signature = (
-            str(entry.get("source_type") or ""),
-            str(entry.get("source_name") or ""),
-            str(entry.get("label") or ""),
-            round(float(entry.get("rate") or 0.0), 6),
-        )
-        if signature in seen:
-            continue
-        seen.add(signature)
-        deduped.append(entry)
-    return deduped
-
-
 def _is_arts_strength_damage_hit(hit: dict[str, Any]) -> bool:
-    skill_key = str(hit.get("skill_key") or "").lower()
-    skill_name = str(hit.get("skill_name") or "")
-    if re.match(r"^buff_common_(?:fire|pulse|cryst|natural)_[a-z0-9_]*triggered", skill_key):
-        return True
-    if skill_key in _ARTS_STRENGTH_PHYSICAL_ANOMALY_DAMAGE_IDS:
-        return True
-    return skill_key.startswith("buff_common_") and any(
-        token in skill_name
-        for token in ("物理异常", "法术异常", "法术爆发", "燃烧", "导电", "腐蚀", "冻结", "碎甲", "猛击", "击倒", "击飞")
-    )
+    # Current native DamageDecorateMask values, matched to the version-bound
+    # exact HP action/unit. Shatter is physical damage but a spell anomaly;
+    # damage_element and damage_school must not be repurposed for this lane.
+    mask = hit.get('damage_decorate_mask')
+    source = 'observed_damage_decorate_mask'
+    runtime_mask_present = mask is not None
+    if not runtime_mask_present:
+        mask = hit.get('static_damage_decorate_mask')
+        source = hit.get('static_damage_decorate_mask_source')
+        if source != 'current_typed_skill_or_buff_exact_unit_generation_only':
+            mask = None
+    if type(mask) is int and 0 <= mask < 2**64:
+        kinds = []
+        if mask & 0x4001C000:  # Crush, Airborne, KnockDown, Fracture.
+            kinds.append('physical_anomaly')
+        if mask & 0x0C100038:  # Four initial anomalies, Burning and Shatter.
+            kinds.append('spell_anomaly')
+        if mask & 0x03C00000:  # Fire/Crystal/Pulse/Natural Burst.
+            kinds.append('spell_burst')
+        hit['arts_strength_damage_observed'] = bool(kinds)
+        hit['arts_strength_damage_kind'] = kinds[0] if len(kinds) == 1 else 'mixed_anomaly' if kinds else None
+        hit['arts_strength_damage_source'] = source
+        # The native formula independently multiplies spell-scaling attr49
+        # and physical-scaling attr25. Several spell bits still mean one
+        # factor, while an explicit physical+spell mask uses both factors.
+        hit['arts_strength_damage_factor_count'] = int(bool(mask & 0x4001C000)) + int(bool(mask & 0x0FD00038))
+        return bool(kinds)
+    # Existing explicit mathematical fixtures can supply their classification.
+    # A real but invalid mask, or a stale derived flag, is not that contract.
+    explicit = (not runtime_mask_present and hit.get('arts_strength_damage_observed') is True
+                and hit.get('arts_strength_damage_source') in (None, 'caller_supplied_classification'))
+    hit['arts_strength_damage_observed'] = explicit
+    hit['arts_strength_damage_kind'] = 'caller_classified_anomaly' if explicit else None
+    hit['arts_strength_damage_source'] = 'caller_supplied_classification' if explicit else None
+    hit['arts_strength_damage_factor_count'] = 1 if explicit else 0
+    return explicit
 
 
 def _arts_strength_damage_multiplier(points: float) -> float:
@@ -5541,44 +5788,14 @@ def _arts_strength_effect_multiplier(points: float) -> float:
 
 
 def _infer_skill_damage_element(skill_key: str | None, character_key: str | None) -> str | None:
+    """Use only an exact official skill profile with one element."""
     if not skill_key:
         return None
-    skill_key = _canonical_packet_skill_id(skill_key)
-
-    if skill_key == "buff_common_cryst_triggered_physical_break":
-        return "physical"
-
-    direct = _element_from_text(skill_key)
-    if direct:
-        return direct
-    if "burning_status" in skill_key:
-        return "fire"
-
-    profile = _resolve_skill_profile(skill_key)
-    if profile is None and character_key:
-        char_type = _load_character_profiles().get(character_key, {}).get("char_type")
-        return _CHAR_TYPE_TO_ELEMENT.get(char_type)
-    if profile is None:
+    profile = _resolve_official_skill_damage_profile(skill_key)
+    if profile is None or not profile.get("resolved"):
         return None
-
-    elements = list(profile.get("elements") or [])
-    if len(elements) == 1:
-        return elements[0]
-
-    char_type = str(profile.get("char_type") or "")
-    default_element = _CHAR_TYPE_TO_ELEMENT.get(char_type)
-    group_type = int(profile.get("group_type") or 0)
-    skill_lower = skill_key.lower()
-
-    if len(elements) > 1:
-        if "attack" in skill_lower or "power_attack" in skill_lower or "plunging" in skill_lower:
-            return "physical" if "physical" in elements else default_element
-        if "combo" in skill_lower and "physical" in elements:
-            return "physical"
-        if group_type in {1, 2} and default_element in elements:
-            return default_element
-
-    return default_element or (elements[0] if elements else None)
+    elements = [str(value) for value in (profile.get("elements") or []) if value]
+    return elements[0] if len(set(elements)) == 1 else None
 
 
 def _infer_skill_damage_school(
@@ -5603,27 +5820,11 @@ def _infer_skill_damage_school(
             spec = str(item_meta.get("skill_specification") or "")
         school = _DAMAGE_SCHOOL_BY_SPEC.get(spec)
         inferred_element = _infer_skill_damage_element(canonical, character_key)
-        lowered = canonical.lower()
-        if school == "physical" and inferred_element in _ELEMENTAL_ELEMENTS and any(
-            token in lowered for token in ("_ultimate_skill", "_ult_attack", "_normal_skill", "_combo_skill")
-        ):
-            return "spell"
         if school:
             return school
-        if inferred_element in _ELEMENTAL_ELEMENTS and any(
-            token in lowered for token in ("_attack", "_projhit", "_power_attack", "_dash_attack", "_plunging_attack")
-        ):
-            return "spell"
-        if any(token in lowered for token in ("_ultimate_skill", "_ult_attack", "_normal_skill", "_combo_skill")):
-            return "spell"
-        if "remain_loop_sheep" in lowered:
-            return "physical"
-        if any(token in lowered for token in ("_attack", "_projhit", "_power_attack", "_dash_attack", "_plunging_attack")):
-            return "physical"
+        if inferred_element:
+            return _damage_school_from_element(inferred_element)
 
-    damage_element = _infer_skill_damage_element(skill_key or raw_skill_key, character_key)
-    if damage_element == "physical":
-        return "physical"
     return None
 
 
@@ -5857,22 +6058,6 @@ def _short_actor_number(value: str | None) -> str | None:
 
 
 @lru_cache(maxsize=1)
-def _load_actor_fingerprint_map() -> dict[str, dict[str, Any]]:
-    map_path = _repo_root() / "data" / "packet_semantics" / "actor_fingerprint_map.json"
-    if not map_path.exists():
-        return {}
-    try:
-        payload = json.loads(map_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    characters = payload.get("characters")
-    if not isinstance(characters, dict):
-        return {}
-    return {
-        str(character_key): fingerprint
-        for character_key, fingerprint in characters.items()
-        if isinstance(fingerprint, dict)
-    }
 
 
 def _parse_loadout_skill_ids(raw: str) -> set[str]:
@@ -5882,242 +6067,22 @@ def _parse_loadout_skill_ids(raw: str) -> set[str]:
     return set(re.findall(r"\d+", match.group(1)))
 
 
-def _collect_loadout_skill_fingerprints(text: str) -> tuple[set[str], dict[str, set[str]]]:
-    roster: set[str] = set()
-    skill_ids_by_char: dict[str, set[str]] = {}
-    for raw_line in text.splitlines():
-        if "LOADOUT slot=" not in raw_line:
-            continue
-        char_match = re.search(r"\bchar=(chr_\d{4}_[a-z0-9]+)\b", raw_line)
-        if not char_match:
-            continue
-        char_key = char_match.group(1)
-        roster.add(char_key)
-        skill_ids_by_char.setdefault(char_key, set()).update(_parse_loadout_skill_ids(raw_line))
-    return roster, skill_ids_by_char
 
 
-def _collect_short_actor_observations(text: str) -> dict[str, dict[str, Counter[str]]]:
-    observations: dict[str, dict[str, Counter[str]]] = defaultdict(
-        lambda: {"skills": Counter(), "self_buffs": Counter()}
-    )
-    for raw_line in text.splitlines():
-        if " HP_V2 " in raw_line:
-            fields = _extract_fields(raw_line)
-            actor_id = fields.get("src") or fields.get("atk")
-            if not _short_actor_number(actor_id):
-                continue
-            skill_number = _runtime_skill_number(fields.get("skill"))
-            if skill_number:
-                observations[actor_id]["skills"][skill_number] += 1
-            continue
-
-        if " BUFF_START " in raw_line:
-            fields = _extract_fields(raw_line)
-            owner = fields.get("owner")
-            src = fields.get("src")
-            if not owner or owner != src or not _short_actor_number(owner):
-                continue
-            buff_number = _runtime_skill_number(_normalize_buff_id(fields.get("id")))
-            if buff_number:
-                observations[owner]["self_buffs"][buff_number] += 1
-    return observations
 
 
-def _score_actor_fingerprint(
-    *,
-    actor_observation: dict[str, Counter[str]],
-    character_key: str,
-    loadout_skill_ids: set[str],
-    fingerprint: dict[str, Any],
-) -> int:
-    skills = set(actor_observation.get("skills") or {})
-    self_buffs = set(actor_observation.get("self_buffs") or {})
-    if not skills and not self_buffs:
-        return 0
-
-    score = 0
-    score += 5 * len(skills & loadout_skill_ids)
-    score += 4 * len(skills & {str(value) for value in fingerprint.get("strong_skill_ids") or []})
-    score += 1 * len(skills & {str(value) for value in fingerprint.get("weak_skill_ids") or []})
-    score += 2 * len(self_buffs & {str(value) for value in fingerprint.get("self_buff_ids") or []})
-    return score
 
 
-def _infer_short_actor_aliases_from_fingerprints(text: str) -> dict[str, str]:
-    roster, loadout_skill_ids_by_char = _collect_loadout_skill_fingerprints(text)
-    configured_fingerprints = _load_actor_fingerprint_map()
-    observations = _collect_short_actor_observations(text)
-    if not observations:
-        return {}
-
-    candidate_chars = set(configured_fingerprints)
-    candidate_chars.update(loadout_skill_ids_by_char)
-    if roster:
-        candidate_chars &= roster
-    if not candidate_chars:
-        return {}
-
-    scored: list[tuple[str, str, int, int]] = []
-    for actor_id, observation in observations.items():
-        actor_scores: list[tuple[str, int]] = []
-        for char_key in candidate_chars:
-            score = _score_actor_fingerprint(
-                actor_observation=observation,
-                character_key=char_key,
-                loadout_skill_ids=loadout_skill_ids_by_char.get(char_key, set()),
-                fingerprint=configured_fingerprints.get(char_key, {}),
-            )
-            if score > 0:
-                actor_scores.append((char_key, score))
-        if not actor_scores:
-            continue
-        actor_scores.sort(key=lambda item: item[1], reverse=True)
-        top_char, top_score = actor_scores[0]
-        runner_up = actor_scores[1][1] if len(actor_scores) > 1 else 0
-        scored.append((actor_id, top_char, top_score, runner_up))
-
-    aliases: dict[str, str] = {}
-    claimed_chars: set[str] = set()
-    min_score = 4 if roster else 8
-    deferred: list[tuple[str, str, int, int]] = []
-    for actor_id, char_key, top_score, runner_up in sorted(scored, key=lambda item: item[2], reverse=True):
-        if char_key in claimed_chars:
-            continue
-        if top_score < min_score or top_score - runner_up < 2:
-            deferred.append((actor_id, char_key, top_score, runner_up))
-            continue
-        aliases[actor_id] = char_key
-        claimed_chars.add(char_key)
-
-    remaining_chars = roster - claimed_chars
-    if len(remaining_chars) == 1:
-        remaining_char = next(iter(remaining_chars))
-        weak_matches = [
-            (actor_id, top_score)
-            for actor_id, char_key, top_score, runner_up in deferred
-            if char_key == remaining_char and top_score > runner_up and top_score > 0 and actor_id not in aliases
-        ]
-        if len(weak_matches) == 1:
-            aliases[weak_matches[0][0]] = remaining_char
-    return aliases
 
 
-def _infer_short_actor_aliases_from_loadout(text: str) -> dict[str, str]:
-    """Recover packet runtime actor ids when ACTOR_MAP was not emitted."""
-    if "LOADOUT reason=SC_SELF_SCENE_INFO" not in text:
-        return {}
-    roster: list[str] = []
-    roster_seen: set[str] = set()
-    for raw_line in text.splitlines():
-        if "LOADOUT slot=" not in raw_line:
-            continue
-        match = _LOADOUT_SLOT_RE.search(raw_line)
-        if not match:
-            continue
-        char_key = match.group("char")
-        if char_key and char_key not in roster_seen:
-            roster_seen.add(char_key)
-            roster.append(char_key)
-
-    if len(roster) < 2:
-        return {}
-
-    groups: list[list[str]] = []
-    group: list[str] = []
-    group_seen: set[str] = set()
-    group_ts_ms: int | None = None
-    for raw_line in text.splitlines():
-        if _GAME_TIMER_START_RE.search(raw_line):
-            break
-        if " BUFF_START " not in raw_line:
-            continue
-        ts_ms = _parse_prefixed_timestamp_ms(raw_line)
-        fields = _extract_fields(raw_line)
-        owner_id = _short_actor_number(fields.get("owner"))
-        src_id = _short_actor_number(fields.get("src"))
-        if not owner_id or owner_id != src_id:
-            continue
-        if group and ts_ms is not None and group_ts_ms is not None and ts_ms - group_ts_ms > 1000:
-            groups.append(group)
-            group = []
-            group_seen = set()
-        if not group:
-            group_ts_ms = ts_ms
-        if owner_id in group_seen:
-            continue
-        group_seen.add(owner_id)
-        group.append(owner_id)
-    if group:
-        groups.append(group)
-
-    player_ids = next((candidate for candidate in reversed(groups) if len(candidate) >= len(roster)), [])
-    if len(player_ids) < len(roster):
-        return {}
-    return {f"id_{actor_id}": roster[index] for index, actor_id in enumerate(player_ids[: len(roster)])}
 
 
-def _infer_context_enemy_hint(text: str) -> str | None:
-    dungeon_enemy_hints = _load_dungeon_enemy_hints()
-    if dungeon_enemy_hints:
-        for raw_line in text.splitlines():
-            if (
-                " DUNGEON_CONTEXT " not in raw_line
-                and not _OFFICIAL_TIMER_START_RE.search(raw_line)
-                and not _OFFICIAL_TIMER_END_RE.search(raw_line)
-            ):
-                continue
-            fields = _extract_fields(raw_line)
-            for field_name in ("dungeonId", "dungeon_id", "gameId", "game_id"):
-                enemy_key = dungeon_enemy_hints.get(str(fields.get(field_name) or ""))
-                if enemy_key:
-                    return enemy_key
-
-    enemy_hints: set[str] = set()
-    for raw_line in text.splitlines():
-        if " HP_V2 " in raw_line:
-            continue
-        for enemy_key in _ENEMY_KEY_RE.findall(raw_line):
-            if enemy_key != UNKNOWN_ENEMY_KEY:
-                enemy_hints.add(enemy_key)
-                if len(enemy_hints) > 1:
-                    return None
-    return next(iter(enemy_hints)) if len(enemy_hints) == 1 else None
 
 
-def _infer_short_enemy_aliases(text: str, player_aliases: dict[str, str]) -> dict[str, str]:
-    if not player_aliases:
-        return {}
-    player_ids = set(player_aliases)
-    counts: Counter[str] = Counter()
-    for raw_line in text.splitlines():
-        if " HP_V2 " not in raw_line:
-            continue
-        fields = _extract_fields(raw_line)
-        src = fields.get("src") or fields.get("atk")
-        target = fields.get("tgt")
-        if src in player_ids and target and _short_actor_number(target) and target not in player_ids:
-            counts[target] += 1
-    enemy_alias = _infer_context_enemy_hint(text) or UNKNOWN_ENEMY_KEY
-    return {actor_id: enemy_alias for actor_id, _count in counts.most_common()}
 
 
 def _apply_short_actor_aliases(text: str) -> str:
-    player_aliases = _infer_short_actor_aliases_from_loadout(text)
-    if not player_aliases:
-        player_aliases = _infer_short_actor_aliases_from_fingerprints(text)
-    if not player_aliases:
-        return text
-    aliases = {**player_aliases, **_infer_short_enemy_aliases(text, player_aliases)}
-    if not aliases:
-        return text
-    lines: list[str] = []
-    for raw_line in text.splitlines():
-        line = raw_line
-        for short_id, alias in aliases.items():
-            line = line.replace(short_id, alias)
-        lines.append(line)
-    return "\n".join(lines)
+    return text
 
 
 def _extract_character_key(*values: str | None) -> str | None:
@@ -6156,22 +6121,138 @@ def _collect_party_actor_ids(raw_line: str) -> set[str]:
     return actor_ids
 
 
+def _parse_entity_stats_snapshot(raw_line: str) -> tuple[str, dict[str, Any]] | None:
+    if " ENTITY_STATS " not in raw_line:
+        return None
+    fields = _extract_fields(raw_line)
+    entity_id = str(fields.get("id") or "")
+    if not re.fullmatch(r"[1-9]\d*", entity_id):
+        return None
+    attrs: dict[int, float] = {}
+    basic_attrs: dict[int, float] = {}
+    seen_attr_types: set[int] = set()
+    invalid_attr_types: set[int] = set()
+    invalid_attr_tokens: list[str] = []
+    attrs_match = re.search(r"\battrs=\[(?P<attrs>[^\]]*)\]", raw_line)
+    attrs_blob = attrs_match.group("attrs") if attrs_match else ""
+    for token in attrs_blob.split():
+        attr_type_text, separator, raw_values = token.partition(":")
+        if not separator:
+            invalid_attr_tokens.append(token)
+            continue
+        attr_type = _coerce_optional_int(attr_type_text)
+        raw_value, basic_separator, raw_basic = raw_values.partition('/')
+        value = _coerce_optional_float(raw_value)
+        if attr_type is None:
+            invalid_attr_tokens.append(token)
+            continue
+        if attr_type in seen_attr_types or value is None:
+            invalid_attr_types.add(attr_type)
+            attrs.pop(attr_type, None)
+            basic_attrs.pop(attr_type, None)
+        elif attr_type not in invalid_attr_types:
+            attrs[attr_type] = value
+            basic_value = _coerce_optional_float(raw_basic) if basic_separator else None
+            if basic_value is not None:
+                basic_attrs[attr_type] = basic_value
+        seen_attr_types.add(attr_type)
+    return entity_id, {
+        "template": fields.get("template"),
+        "kind": fields.get("kind"),
+        "level": _coerce_optional_int(fields.get("level")),
+        "attrs": attrs,
+        "basic_attrs": basic_attrs,
+        "ts_ms": _parse_prefixed_timestamp_ms(raw_line),
+        "invalid_attr_types": sorted(invalid_attr_types),
+        "invalid_attr_tokens": invalid_attr_tokens,
+        "attribute_list_present": attrs_match is not None,
+    }
+
+
+def _entity_stats_snapshot_at(
+    timelines: dict[str, list[tuple[int, dict[str, Any]]]],
+    entity_id: str | None,
+    ts_ms: int,
+) -> dict[str, Any] | None:
+    rows = timelines.get(str(entity_id or ""))
+    if not rows:
+        return None
+    chosen: dict[str, Any] | None = None
+    chosen_ts: int | None = None
+    for row_ts, row in rows:
+        if row_ts <= ts_ms and (chosen_ts is None or row_ts >= chosen_ts):
+            chosen, chosen_ts = row, row_ts
+    return chosen
+
+
+def _attach_target_entity_stats(hit: dict[str, Any], snapshot: dict[str, Any] | None) -> None:
+    if not isinstance(snapshot, dict):
+        return
+    if not hit.get("target_enemy_key") or snapshot.get("template") != hit.get("target_enemy_key"):
+        hit["rdps_unresolved_target_binding"] = True
+        return
+    attrs = snapshot.get("attrs") if isinstance(snapshot.get("attrs"), dict) else {}
+    hit["target_stats_snapshot_ts_ms"] = snapshot.get("ts_ms")
+    hit["target_stats_snapshot_line_no"] = snapshot.get("line_no")
+    hit["target_stats_invalid_attr_types"] = list(snapshot.get("invalid_attr_types") or [])
+    defense = attrs.get(3)
+    if defense is not None:
+        hit["target_defense"] = defense
+        hit["target_defense_source"] = "ENTITY_STATS.attr3"
+    resistance_scalar_attrs = {
+        # Native BattleFormula._GetDamageTypeResistanceValue multiplies the
+        # resistance-point factor by DamageTakenScalar (enum 4-7, 48, 60).
+        "physical": 4,
+        "fire": 5,
+        "pulse": 6,
+        "cryst": 7,
+        "natural": 48,
+        "ether": 60,
+    }
+    resistance_point_attrs = {
+        "physical": 94,
+        "natural": 95,
+        "cryst": 96,
+        "pulse": 97,
+        "fire": 98,
+        "ether": 99,
+    }
+    scalars = {element: attrs[attr_type] for element, attr_type in resistance_scalar_attrs.items() if attrs.get(attr_type) is not None}
+    points = {element: attrs[attr_type] for element, attr_type in resistance_point_attrs.items() if attrs.get(attr_type) is not None}
+    if scalars:
+        hit["target_resistance_scalars"] = scalars
+        hit["target_resistance_source"] = "ENTITY_STATS.attr4_7_48_60"
+    if points:
+        hit["target_resistance_points"] = points
+        hit["target_resistance_points_source"] = "ENTITY_STATS.attr94_99"
+
+
+def _attach_attacker_entity_stats(hit: dict[str, Any], snapshot: dict[str, Any] | None) -> None:
+    if not isinstance(snapshot, dict):
+        return
+    if snapshot.get("template") != hit.get("character_key") or snapshot.get("kind") != "character":
+        hit["rdps_unresolved_attacker_binding"] = True
+        return
+    attrs = snapshot.get("attrs") if isinstance(snapshot.get("attrs"), dict) else {}
+    if not attrs:
+        return
+    hit["attacker_stats_attrs"] = dict(attrs)
+    hit['attacker_stats_basic_attrs'] = dict(snapshot.get('basic_attrs') or {})
+    hit['attacker_stats_level'] = snapshot.get('level')
+    hit["attacker_stats_source"] = "ENTITY_STATS"
+    hit["attacker_stats_snapshot_ts_ms"] = snapshot.get("ts_ms")
+    hit["attacker_stats_snapshot_line_no"] = snapshot.get("line_no")
+    hit["attacker_stats_observed_attr_count"] = len(attrs)
+    hit["attacker_stats_invalid_attr_types"] = list(snapshot.get("invalid_attr_types") or [])
+
+
 def _recover_enemy_target_from_mislabeled_actor(
     fields: dict[str, str],
     *,
     context_enemy_hint: str | None,
     party_actor_ids: set[str],
 ) -> str | None:
-    if not party_actor_ids:
-        return None
-    target_id = fields.get("tgtId") or fields.get("targetId")
-    if not target_id or target_id in party_actor_ids:
-        return None
-    if fields.get("eHP") is None:
-        return None
-    if not _extract_character_key(fields.get("tgt")):
-        return None
-    return context_enemy_hint or UNKNOWN_ENEMY_KEY
+    return None
 
 
 _ENEMY_DEFENSE_EFFECT_BB_KEYS = {
@@ -6248,32 +6329,34 @@ def _apply_enemy_status_bb_overrides(
     *,
     context_enemy_hint: str | None,
 ) -> None:
-    bb_values = {str(key).lower(): value for key, value in (record.get("bb_values") or {}).items()}
-    if not _record_has_enemy_defense_effect(record, bb_values):
+    root = _load_current_buff_roots().get(_normalize_buff_id(record.get('event_key')))
+    if not isinstance(root, dict) or root.get('lifeType') not in {'Limited', 'Infinity'}:
         return
-
-    if record.get("target_character_key") and not record.get("target_enemy_key"):
-        enemy_key = context_enemy_hint or UNKNOWN_ENEMY_KEY
-        record["target_enemy_key"] = enemy_key
-        record["target_enemy_name"] = _resolve_enemy_name(enemy_key) or enemy_key
-        record["target_character_key"] = None
-        record["target_character_name"] = None
-
-    duration_ms = _bb_duration_ms_for_enemy_defense_effect(bb_values)
-    if duration_ms is not None:
-        raw_duration_ms = record.get("raw_duration_ms")
-        if raw_duration_ms is None or duration_ms < int(raw_duration_ms or 0):
-            record["raw_duration_ms"] = duration_ms
-            record["raw_duration_source"] = "bb"
+    record['lifetime_mode'] = root['lifeType']
+    record['lifetime_source'] = 'typed_current_BuffData'
+    if record.get("raw_duration_ms") is not None:
+        return
+    # Infinity ignores the duration configuration. It remains an open interval
+    # until a concrete finish event; battle-end clipping is only for display.
+    if root['lifeType'] == 'Infinity':
+        return
+    duration = root.get('duration')
+    if not isinstance(duration, dict):
+        return
+    use_key = duration.get('useBlackboardKey')
+    key = str(duration.get("blackboardKey") or "")
+    values = record.get("bb_values") or {}
+    seconds = (_coerce_optional_float(values.get(key)) if use_key is True and key else
+               _coerce_optional_float(duration.get('value')) if use_key is False else None)
+    if seconds is None or seconds < 0:
+        return
+    record["raw_duration_ms"] = int(round(seconds * 1000))
+    record["raw_duration_source"] = "official_duration_blackboard" if use_key is True else "official_duration_constant"
 
 
 def _coerce_int(value: str | None, default: int = 0) -> int:
-    if value is None:
-        return default
-    try:
-        return int(float(value))
-    except ValueError:
-        return default
+    parsed = _coerce_optional_int(value)
+    return default if parsed is None else parsed
 
 
 def _cap_enemy_overkill_damage(
@@ -6291,12 +6374,31 @@ def _cap_enemy_overkill_damage(
     return hit_value
 
 
+def _enemy_hp_state_key(target_enemy_key: Any, target_actor_id: Any = None) -> str:
+    """Use the packet entity identity when present; template keys are only a fallback."""
+    actor_id = str(target_actor_id or "")
+    if re.fullmatch(r"[1-9]\d*", actor_id):
+        return f"actor:{actor_id}"
+    return f"template:{str(target_enemy_key or '')}"
+
+
 def _coerce_optional_int(value: Any) -> int | None:
-    if value is None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if isfinite(value) and value.is_integer() and abs(value) <= 2**53 else None
+    if not isinstance(value, str):
         return None
     try:
-        return int(float(value))
-    except (TypeError, ValueError):
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        exact = Decimal(value)
+        return int(exact) if exact.is_finite() and exact == exact.to_integral_value() else None
+    except (ValueError, InvalidOperation, OverflowError):
         return None
 
 
@@ -6306,11 +6408,12 @@ def _annotate_hit_enemy_hp_state(hits: list[dict[str, Any]]) -> None:
 
     for hit in hits:
         target_enemy_key = str(hit.get("target_enemy_key") or "")
+        hp_state_key = _enemy_hp_state_key(target_enemy_key, hit.get("target_actor_id"))
         enemy_hp_after = _coerce_optional_int(hit.get("enemy_hp_after"))
         if not target_enemy_key or enemy_hp_after is None:
             continue
 
-        previous_enemy_hp = previous_enemy_hp_by_target.get(target_enemy_key)
+        previous_enemy_hp = previous_enemy_hp_by_target.get(hp_state_key)
         hit_value = max(0, _coerce_optional_int(hit.get("hit_value")) or 0)
         if previous_enemy_hp is not None and previous_enemy_hp >= enemy_hp_after:
             enemy_hp_before = previous_enemy_hp
@@ -6321,22 +6424,27 @@ def _annotate_hit_enemy_hp_state(hits: list[dict[str, Any]]) -> None:
 
         hit["enemy_hp_before"] = enemy_hp_before
         hit["enemy_hp_before_source"] = source
-        observed_max_hp_by_target[target_enemy_key] = max(
-            observed_max_hp_by_target.get(target_enemy_key, 0),
+        observed_max_hp_by_target[hp_state_key] = max(
+            observed_max_hp_by_target.get(hp_state_key, 0),
             enemy_hp_before,
             enemy_hp_after,
         )
-        previous_enemy_hp_by_target[target_enemy_key] = enemy_hp_after
+        previous_enemy_hp_by_target[hp_state_key] = enemy_hp_after
 
     for hit in hits:
         target_enemy_key = str(hit.get("target_enemy_key") or "")
-        observed_max_hp = observed_max_hp_by_target.get(target_enemy_key)
+        hp_state_key = _enemy_hp_state_key(target_enemy_key, hit.get("target_actor_id"))
+        observed_max_hp = observed_max_hp_by_target.get(hp_state_key)
         enemy_hp_before = _coerce_optional_int(hit.get("enemy_hp_before"))
         if observed_max_hp is None or observed_max_hp <= 0:
             continue
         hit["target_enemy_observed_max_hp"] = observed_max_hp
-        if enemy_hp_before is not None:
-            hit["target_enemy_hp_ratio_before"] = enemy_hp_before / observed_max_hp
+        # The highest observed HP may be an already-damaged enemy, so it is
+        # not the maximum HP required by CheckHp. Only an explicit maximum
+        # from the packet can establish a percentage condition.
+        explicit_max_hp = _coerce_optional_int(hit.get("target_enemy_max_hp"))
+        if enemy_hp_before is not None and explicit_max_hp is not None and explicit_max_hp > 0:
+            hit["target_enemy_hp_ratio_before"] = enemy_hp_before / explicit_max_hp
 
 
 def _new_participant_totals() -> defaultdict[str, dict[str, Any]]:
@@ -6475,22 +6583,7 @@ def _retarget_unknown_enemy_hits(
     buff_starts: list[dict[str, Any]],
     enemy_key: str | None,
 ) -> bool:
-    if not enemy_key or enemy_key == UNKNOWN_ENEMY_KEY:
-        return False
-    changed = False
-    enemy_name = _resolve_enemy_name(enemy_key) or enemy_key
-    for hit in hits:
-        if hit.get("target_enemy_key") != UNKNOWN_ENEMY_KEY:
-            continue
-        hit["target_enemy_key"] = enemy_key
-        hit["target_enemy_name"] = enemy_name
-        changed = True
-    for buff_record in buff_starts:
-        if buff_record.get("target_enemy_key") != UNKNOWN_ENEMY_KEY:
-            continue
-        buff_record["target_enemy_key"] = enemy_key
-        buff_record["target_enemy_name"] = enemy_name
-    return changed
+    return False
 
 
 def _filter_buff_starts_for_timer_window(
@@ -6534,25 +6627,21 @@ def _coerce_float(value: str | None, default: float = 0.0) -> float:
 
 
 def _coerce_optional_float(value: str | None) -> float | None:
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     try:
-        return float(value)
-    except ValueError:
+        number = float(value)
+        return number if isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
-def _parse_zone_values(blob: str | None) -> list[float]:
-    values: list[float] = []
-    for part in (blob or "").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        try:
-            values.append(float(part))
-        except ValueError:
-            values.append(1.0)
-    return values
+def _parse_zone_values(blob: str | None) -> list[float | None]:
+    if blob is None or not blob.strip():
+        return []
+    # Array position is the client-side zone identity. Preserve a missing
+    # value in place; dropping it would relabel every subsequent zone.
+    return [_coerce_optional_float(part.strip()) for part in blob.split(',')]
 
 
 def _parse_dpd_raw_line(line: str) -> dict[str, Any] | None:
@@ -6561,9 +6650,9 @@ def _parse_dpd_raw_line(line: str) -> dict[str, Any] | None:
         return None
     return {
         "seq": int(match.group("seq")),
-        "calc": _coerce_float(match.group("calc")),
-        "atk_scale": _coerce_float(match.group("atk_scale")),
-        "blocked": _coerce_int(match.group("blocked")),
+        "calc": _coerce_optional_float(match.group("calc")),
+        "atk_scale": _coerce_optional_float(match.group("atk_scale")),
+        "blocked": _coerce_optional_int(match.group("blocked")),
         "damage_type_raw": match.group("damage_type"),
         "decorate_mask_raw": match.group("decorate_mask"),
         "collider": match.group("collider"),
@@ -6573,18 +6662,7 @@ def _parse_dpd_raw_line(line: str) -> dict[str, Any] | None:
 
 
 def _damage_element_from_dpd_raw(dpd_raw: dict[str, Any] | None) -> str | None:
-    if not isinstance(dpd_raw, dict):
-        return None
-    raw_value = dpd_raw.get("damage_type", dpd_raw.get("damageType"))
-    if raw_value is None:
-        raw_value = dpd_raw.get("damage_type_raw", dpd_raw.get("damageTypeRaw"))
-    if raw_value is None:
-        return None
-    try:
-        damage_type = int(str(raw_value), 16) if str(raw_value).lower().startswith("0x") else int(raw_value)
-    except (TypeError, ValueError):
-        return None
-    return _DPD_DAMAGE_TYPE_TO_ELEMENT.get(damage_type)
+    return None
 
 
 def _parse_baseline_line(line: str) -> tuple[int, dict[int, float]] | None:
@@ -6710,6 +6788,9 @@ def _rdps_debug_record_applicable_effect(
     condition = effect.get("condition")
     if isinstance(condition, dict):
         row["condition"] = dict(condition)
+    for key in ('rdps_whitelist_keys', 'external_rdps_allowed', 'keyword_origin', 'recipient_side', 'converted_attribute'):
+        if key in effect:
+            row[key] = copy.deepcopy(effect[key])
     return row
 
 
@@ -6823,131 +6904,97 @@ def _rdps_debug_record_static_self(
 
 
 def _effect_condition_failure(effect: dict[str, Any], hit: dict[str, Any]) -> dict[str, Any] | None:
+    if "condition" not in effect:
+        return None
     condition = effect.get("condition")
+    missing = {"reason": "condition_state_missing", "reason_group": "condition_unobservable"}
     if not isinstance(condition, dict):
-        return None
-
+        return {**missing, "detail": "malformed_condition"}
     condition_type = str(condition.get("type") or "")
-    if condition_type == "all":
-        for child in condition.get("conditions") or []:
-            if not isinstance(child, dict):
-                continue
-            failure = _effect_condition_failure({"condition": child}, hit)
-            if failure:
-                return {
-                    **failure,
-                    "compound_condition_type": condition_type,
-                    "compound_condition_source": condition.get("source"),
-                }
+    missing.update({"condition_type": condition_type, "condition_source": condition.get("source")})
+    if condition_type == "always":
         return None
-
-    if condition_type == "target_hp_ratio_lte":
-        threshold = _safe_positive_rate(condition.get("threshold"))
-        hp_before = _coerce_optional_int(hit.get("enemy_hp_before"))
-        observed_max_hp = _coerce_optional_int(hit.get("target_enemy_observed_max_hp"))
-        ratio = None
-        try:
-            if hit.get("target_enemy_hp_ratio_before") is not None:
-                ratio = float(hit.get("target_enemy_hp_ratio_before"))
-        except (TypeError, ValueError):
-            ratio = None
-        if ratio is None and hp_before is not None and observed_max_hp and observed_max_hp > 0:
-            ratio = hp_before / observed_max_hp
-        if threshold is None or ratio is None or hp_before is None or not observed_max_hp or observed_max_hp <= 0:
-            return {
-                "reason": "condition_state_missing",
-                "reason_group": "condition_unobservable",
-                "condition_type": condition_type,
-                "condition_source": condition.get("source"),
-                "condition_threshold": _round4(threshold),
-                "target_hp_before": hp_before,
-                "target_observed_max_hp": observed_max_hp,
-                "target_hp_ratio_before": _round4(ratio),
-            }
-        if ratio > threshold + 0.000001:
-            return {
-                "reason": "target_hp_above_threshold",
-                "reason_group": "condition_unsatisfied",
-                "condition_type": condition_type,
-                "condition_source": condition.get("source"),
-                "condition_threshold": _round4(threshold),
-                "target_hp_before": hp_before,
-                "target_observed_max_hp": observed_max_hp,
-                "target_hp_ratio_before": _round4(ratio),
-            }
-        return None
-
+    if condition_type == 'damage_decorate_mask':
+        required, check = condition.get('mask'), condition.get('check')
+        actual = hit.get('damage_decorate_mask')
+        if type(required) is not int or not 0 <= required < 2**64 or check not in {'HasAll', 'HasAny'}:
+            return {**missing, 'detail': 'missing_or_invalid_damage_decorate_mask'}
+        if actual is None:
+            static = hit.get('static_damage_decorate_mask')
+            if (hit.get('static_damage_decorate_mask_source') == 'current_typed_skill_or_buff_exact_unit_generation_only'
+                    and type(static) is int and 0 <= static < 2**64):
+                # The same exact unit proves positive skill categories and
+                # physical/spell anomaly bits used by arts-strength eligibility.
+                # It does not prove absent bits, crit or other runtime state.
+                positive = static & (0x22784 | 0x4001C000 | 0x0FD00038)
+                overlap = positive & required
+                if (check == 'HasAny' and overlap) or (check == 'HasAll' and overlap == required):
+                    return None
+            return {**missing, 'detail': 'missing_or_invalid_damage_decorate_mask'}
+        if type(actual) is not int or not 0 <= actual < 2**64:
+            return {**missing, 'detail': 'missing_or_invalid_damage_decorate_mask'}
+        overlap = actual & required
+        passed = overlap == required if check == 'HasAll' else overlap != 0
+        return None if passed else {'reason': 'damage_decorate_mask_filtered', 'reason_group': 'condition_unsatisfied'}
+    if condition_type in {"all", "any"}:
+        children = condition.get("conditions")
+        if not isinstance(children, list) or not children or any(not isinstance(child, dict) for child in children):
+            return {**missing, "detail": "malformed_compound_condition"}
+        failures = [_effect_condition_failure({"condition": child}, hit) for child in children]
+        if condition_type == 'any' and any(failure is None for failure in failures):
+            return None
+        failures = [failure for failure in failures if failure is not None]
+        if not failures:
+            return None
+        return next((failure for failure in failures if failure.get("reason_group") == "condition_unobservable"), failures[0])
+    if condition_type in {"target_hp_compare", "target_hp_ratio_lte"}:
+        compare = condition.get("compare") if condition_type == "target_hp_compare" else "LE"
+        is_ratio = condition.get("is_ratio") if condition_type == "target_hp_compare" else True
+        threshold = _coerce_optional_float(condition.get("threshold"))
+        subject = condition.get('subject_side', 'defender')
+        if subject not in {'attacker', 'defender'}:
+            return {**missing, 'detail': 'invalid_condition_subject'}
+        hp_before = _coerce_optional_float(hit.get('attacker_hp_before' if subject == 'attacker' else 'enemy_hp_before'))
+        maximum = _coerce_optional_float(hit.get('attacker_max_hp' if subject == 'attacker' else 'target_enemy_max_hp'))
+        if (compare not in {"LT", "LE", "GT", "GE", "EQ", "NE"} or not isinstance(is_ratio, bool)
+                or threshold is None or threshold < 0 or hp_before is None or hp_before < 0):
+            return {**missing, "detail": "invalid_hp_comparison"}
+        if is_ratio and (maximum is None or maximum <= 0 or hp_before > maximum or threshold > 1):
+            return {**missing, "detail": "missing_explicit_maximum_hp"}
+        value = hp_before / maximum if is_ratio else hp_before
+        passed = {"LT": value < threshold, "LE": value <= threshold, "GT": value > threshold,
+                  "GE": value >= threshold, "EQ": value == threshold, "NE": value != threshold}[compare]
+        if passed:
+            return None
+        return {"reason": "target_hp_condition_unsatisfied", "reason_group": "condition_unsatisfied",
+                "condition_type": condition_type, "condition_compare": compare, "condition_threshold": threshold,
+                "target_hp_before": hp_before, "target_max_hp": maximum, "compared_value": value}
     if condition_type == "target_has_buff":
-        required = {
-            _normalize_buff_id(buff_id)
-            for buff_id in condition.get("buff_ids") or []
-            if _normalize_buff_id(buff_id)
-        }
-        active = {
-            _normalize_buff_id(buff_id)
-            for buff_id in hit.get("_active_target_buff_ids") or []
-            if _normalize_buff_id(buff_id)
-        }
-        if not required:
-            return {
-                "reason": "condition_state_missing",
-                "reason_group": "condition_unobservable",
-                "condition_type": condition_type,
-                "condition_source": condition.get("source"),
-            }
-        if not active or not (required & active):
-            return {
-                "reason": "target_buff_missing",
-                "reason_group": "condition_unsatisfied",
-                "condition_type": condition_type,
-                "condition_source": condition.get("source"),
-                "condition_buff_ids": sorted(required),
-                "active_target_buff_ids": sorted(active),
-            }
-        return None
-
+        ids = condition.get("buff_ids")
+        if not isinstance(ids, list) or not ids or any(not isinstance(key, str) or not key for key in ids):
+            return {**missing, "detail": "invalid_required_buff_ids"}
+        subject = condition.get('subject_side', 'defender')
+        if subject not in {'attacker', 'defender'}:
+            return {**missing, 'detail': 'invalid_condition_subject'}
+        active = hit.get('_active_attacker_buff_ids' if subject == 'attacker' else '_active_target_buff_ids')
+        if not isinstance(active, (list, set, tuple)):
+            return {**missing, "detail": "missing_target_buff_state"}
+        if set(ids).intersection(active):
+            return None
+        if hit.get('attacker_buff_state_complete' if subject == 'attacker' else 'target_buff_state_complete') is not True:
+            return {**missing, "detail": "incomplete_target_buff_state", "condition_buff_ids": ids}
+        return {"reason": "target_buff_missing", "reason_group": "condition_unsatisfied", "condition_buff_ids": ids}
     if condition_type == "damage_type_in":
-        elements = [
-            str(element)
-            for element in condition.get("elements") or []
-            if str(element or "")
-        ]
-        damage_element = str(hit.get("damage_element") or "")
-        damage_school = str(hit.get("damage_school") or "")
-        if not elements or (not damage_element and not damage_school):
-            return {
-                "reason": "condition_state_missing",
-                "reason_group": "condition_unobservable",
-                "condition_type": condition_type,
-                "condition_source": condition.get("source"),
-                "condition_elements": elements,
-                "damage_element": damage_element or None,
-                "damage_school": damage_school or None,
-            }
-
-        def matches(required: str) -> bool:
-            if required == "physical":
-                return damage_element == "physical" or (not damage_element and damage_school == "physical")
-            return damage_element == required
-
-        if not any(matches(element) for element in elements):
-            return {
-                "reason": "damage_type_filtered",
-                "reason_group": "condition_unsatisfied",
-                "condition_type": condition_type,
-                "condition_source": condition.get("source"),
-                "condition_elements": elements,
-                "damage_element": damage_element or None,
-                "damage_school": damage_school or None,
-            }
-        return None
-
-    return {
-        "reason": "condition_type_unsupported",
-        "reason_group": "condition_unobservable",
-        "condition_type": condition_type,
-        "condition_source": condition.get("source"),
-    }
+        elements = condition.get("elements")
+        valid = {"physical", "fire", "pulse", "cryst", "natural"}
+        actual = hit.get("damage_element")
+        if not isinstance(elements, list) or not elements or any(value not in valid for value in elements) or actual not in valid:
+            return {**missing, "detail": "unresolved_damage_type"}
+        if actual in elements:
+            return None
+        return {"reason": "damage_type_filtered", "reason_group": "condition_unsatisfied",
+                "condition_type": condition_type, "condition_elements": elements, "damage_element": actual}
+    return {**missing, "reason": "condition_type_unsupported", "detail": "unsupported_condition"}
 
 
 def _rdps_contribution_rows(
@@ -6963,10 +7010,10 @@ def _rdps_contribution_rows(
         {
             "character_key": character_key,
             "character_name": _resolve_character_name(character_key) or character_key,
-            "value": _round4(value),
+            "value": value,
         }
         for character_key, value in items
-        if value > 0.0001
+        if value > 0.0
     ]
 
 
@@ -7216,12 +7263,12 @@ def _buff_effect_bb_key_ignored(buff_id: str, bb_key: str) -> bool:
     return ignored_keys is not None and str(bb_key or "").lower() in ignored_keys
 
 
-def _collect_buff_labels(record: dict[str, Any]) -> list[str]:
+def _collect_buff_labels(record: dict[str, Any], *, root_lookup_cache: dict | None = None) -> list[str]:
     buff_id = _normalize_buff_id(record.get("event_key"))
     target_is_enemy = bool(record.get("target_enemy_key"))
     source_key = str(record.get("source_character_key") or "")
     bb_values = {str(key).lower(): value for key, value in (record.get("bb_values") or {}).items()}
-    semantic_condition_effects = _collect_semantic_condition_zone_effects(record)
+    semantic_condition_effects = _collect_semantic_condition_zone_effects(record, root_lookup_cache=root_lookup_cache)
     anomaly_labels = _anomaly_status_labels(
         buff_id,
         source_key=source_key,
@@ -7230,7 +7277,7 @@ def _collect_buff_labels(record: dict[str, Any]) -> list[str]:
     )
     if _should_ignore_record_rate_effects(record):
         return sorted(anomaly_labels, key=lambda item: (_BUFF_LABEL_PRIORITY.get(item, 99), item))
-    if _is_noise_buff(buff_id) or _should_ignore_rate_buff(buff_id):
+    if (_is_noise_buff(buff_id) or _should_ignore_rate_buff(buff_id)) and not semantic_condition_effects:
         return sorted(anomaly_labels, key=lambda item: (_BUFF_LABEL_PRIORITY.get(item, 99), item))
     if _is_effectless_wrapper_record(record) and anomaly_labels and not semantic_condition_effects:
         return sorted(anomaly_labels, key=lambda item: (_BUFF_LABEL_PRIORITY.get(item, 99), item))
@@ -7278,7 +7325,7 @@ def _collect_buff_labels(record: dict[str, Any]) -> list[str]:
             labels.add(label)
     for effect in semantic_condition_effects:
         zone = str(effect.get("zone") or "")
-        label = _EFFECT_ZONE_LABELS.get(zone)
+        label = '承伤易伤' if zone == 'vuln_taken' else _EFFECT_ZONE_LABELS.get(zone)
         if label:
             labels.add(label)
     for bb_key in record.get("bb_keys") or []:
@@ -7338,57 +7385,26 @@ def _normalize_buff_duration_ms(
     raw_duration_ms: int | None,
     battle_end_ms: int,
 ) -> int:
-    remaining_ms = max(battle_end_ms - start_ts_ms, 1)
-    if _is_food_potion_buff(event_key) and raw_duration_ms is not None and raw_duration_ms > 0:
-        return max(min(raw_duration_ms, remaining_ms), 1)
-
-    candidates: list[int] = []
+    remaining = max(battle_end_ms - start_ts_ms, 0)
     if end_ts_ms is not None and end_ts_ms >= start_ts_ms:
-        candidates.append(max(end_ts_ms - start_ts_ms, 1))
-    if raw_duration_ms is not None and raw_duration_ms > 0:
-        candidates.append(raw_duration_ms)
-    if candidates:
-        return max(min(min(candidates), remaining_ms), 1)
-
-    if raw_duration_ms is None:
-        return remaining_ms
-    if raw_duration_ms <= 0:
-        return min(remaining_ms, 1000)
-    if raw_duration_ms > remaining_ms:
-        return remaining_ms
-    return raw_duration_ms
+        # Packet end timestamps include pauses. A nominal game-time duration
+        # must not shorten the explicitly observed lifetime.
+        return min(remaining, end_ts_ms - start_ts_ms)
+    if raw_duration_ms is not None and raw_duration_ms >= 0:
+        return min(remaining, raw_duration_ms)
+    root = _load_current_buff_roots().get(_normalize_buff_id(event_key), {})
+    return remaining if root.get('lifeType') == 'Infinity' else 0
 
 
 def _extend_buff_records_from_packet_modifiers(
     buff_starts: list[dict[str, Any]],
     packet_modifier_last_seen_by_uid: dict[str, int],
 ) -> None:
+    # UID occurrence proves participation in that hit, not an interval end.
     for record in buff_starts:
         uid = str(record.get("uid") or "")
-        if not uid:
-            continue
-        last_seen_ts_ms = packet_modifier_last_seen_by_uid.get(uid)
-        if last_seen_ts_ms is None:
-            continue
-        start_ts_ms = int(record.get("ts_ms") or 0)
-        if last_seen_ts_ms < start_ts_ms:
-            continue
-
-        seen_duration_ms = max(last_seen_ts_ms - start_ts_ms, 1)
-        record["packet_modifier_last_seen_ts_ms"] = last_seen_ts_ms
-
-        raw_duration_ms = record.get("raw_duration_ms")
-        if raw_duration_ms is None or int(raw_duration_ms or 0) < seen_duration_ms:
-            record["raw_duration_ms"] = seen_duration_ms
-            record["raw_duration_source"] = "packet_modifier"
-            if record.get("end_ts_ms") is None or int(record.get("end_ts_ms") or 0) < last_seen_ts_ms:
-                record["end_ts_ms"] = last_seen_ts_ms
-                record["inferred_end_source_type"] = "packet_modifier"
-                record["inferred_end_source_key"] = uid
-        elif record.get("end_ts_ms") is not None and int(record.get("end_ts_ms") or 0) < last_seen_ts_ms:
-            record["end_ts_ms"] = last_seen_ts_ms
-            record["inferred_end_source_type"] = "packet_modifier"
-            record["inferred_end_source_key"] = uid
+        if uid in packet_modifier_last_seen_by_uid:
+            record["packet_modifier_last_seen_ts_ms"] = packet_modifier_last_seen_by_uid[uid]
 
 
 _RELATED_BUFF_LIFECYCLE_START_TOLERANCE_MS = 250
@@ -7469,134 +7485,14 @@ def _infer_related_buff_end_times(
     buff_starts: list[dict[str, Any]],
     skill_casts: list[dict[str, Any]],
 ) -> None:
-    ended_buff_records = [
-        record
-        for record in buff_starts
-        if record.get("end_ts_ms") is not None
-        and int(record.get("end_ts_ms") or 0) >= int(record.get("ts_ms") or 0)
-    ]
-    ended_skill_casts = [
-        cast
-        for cast in skill_casts
-        if cast.get("end_ts_ms") is not None
-        and int(cast.get("end_ts_ms") or 0) >= int(cast.get("ts_ms") or 0)
-    ]
-    if not ended_buff_records and not ended_skill_casts:
-        return
-
-    for record in buff_starts:
-        if record.get("end_ts_ms") is not None:
-            continue
-        if _record_has_authoritative_bb_duration(record):
-            continue
-        event_key = str(record.get("event_key") or "")
-        source_key = str(record.get("source_character_key") or "")
-        start_ts_ms = int(record.get("ts_ms") or 0)
-        if not event_key or not source_key:
-            continue
-        inferred_ends: list[tuple[int, str, str]] = []
-        for sibling in ended_buff_records:
-            if sibling is record or not _buff_record_lifecycle_lane_matches(record, sibling):
-                continue
-            if _buff_records_lifecycle_related(record, sibling):
-                inferred_ends.append(
-                    (
-                        int(sibling.get("end_ts_ms") or 0),
-                        "related_buff",
-                        str(sibling.get("event_key") or ""),
-                    )
-                )
-        for cast in ended_skill_casts:
-            if str(cast.get("source_character_key") or "") != source_key:
-                continue
-            if (
-                abs(start_ts_ms - int(cast.get("ts_ms") or 0))
-                > _RELATED_BUFF_LIFECYCLE_START_TOLERANCE_MS
-            ):
-                continue
-            cast_skill = str(cast.get("skill") or "")
-            if _skill_semantically_reaches_buff(cast_skill, event_key):
-                inferred_ends.append((int(cast.get("end_ts_ms") or 0), "related_skill", cast_skill))
-        valid_ends = [
-            (end_ts_ms, source_type, source_key)
-            for end_ts_ms, source_type, source_key in inferred_ends
-            if end_ts_ms >= start_ts_ms
-        ]
-        if not valid_ends:
-            continue
-        packet_last_seen_ts_ms = record.get("packet_modifier_last_seen_ts_ms")
-        if packet_last_seen_ts_ms is not None:
-            try:
-                packet_last_seen_int = int(packet_last_seen_ts_ms)
-            except (TypeError, ValueError):
-                packet_last_seen_int = 0
-            if packet_last_seen_int >= start_ts_ms:
-                ends_after_packet_evidence = [
-                    (end_ts_ms, source_type, source_key)
-                    for end_ts_ms, source_type, source_key in valid_ends
-                    if end_ts_ms >= packet_last_seen_int
-                ]
-                if ends_after_packet_evidence:
-                    valid_ends = ends_after_packet_evidence
-                else:
-                    record["end_ts_ms"] = packet_last_seen_int
-                    record["inferred_end_source_type"] = "packet_modifier"
-                    record["inferred_end_source_key"] = str(record.get("uid") or "")
-                    continue
-        end_ts_ms, source_type, inferred_from = min(valid_ends, key=lambda item: item[0])
-        record["end_ts_ms"] = end_ts_ms
-        record["inferred_end_source_type"] = source_type
-        record["inferred_end_source_key"] = inferred_from
+    return
 
 
 def _merge_buff_windows(buff_windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not buff_windows:
-        return []
-
-    buff_windows.sort(
-        key=lambda item: (
-            item["source_character_key"] or "",
-            item["target_character_key"] or "",
-            item["event_key"],
-            item["start_ts_ms"],
-        )
-    )
-    merged: list[dict[str, Any]] = []
-    for window in buff_windows:
-        if not merged:
-            merged.append(window)
-            continue
-        previous = merged[-1]
-        same_lane = (
-            previous["source_character_key"] == window["source_character_key"]
-            and previous["target_character_key"] == window["target_character_key"]
-            and previous["event_key"] == window["event_key"]
-            and previous.get("skill_family_key") == window.get("skill_family_key")
-        )
-        if (
-            same_lane
-            and not _window_allows_stacking(previous)
-            and not _window_allows_stacking(window)
-            and int(window.get("start_ts_ms") or 0) <= int(previous.get("end_ts_ms") or 0) + _BUFF_MERGE_GAP_MS
-            and _same_event_window_signature_matches(previous, window)
-        ):
-            _merge_window_content(previous, window)
-            continue
-        if (
-            same_lane
-            and _is_nonstacking_refresh_event(str(window.get("event_key") or ""))
-            and previous["start_ts_ms"] <= window["start_ts_ms"] <= previous["end_ts_ms"] + _BUFF_MERGE_GAP_MS
-        ):
-            _merge_window_content(previous, window)
-            continue
-        if (
-            same_lane
-            and previous["end_ts_ms"] <= window["start_ts_ms"] <= previous["end_ts_ms"] + _BUFF_MERGE_GAP_MS
-        ):
-            _merge_window_content(previous, window)
-            continue
-        merged.append(window)
-    return merged
+    # Temporal proximity does not prove refresh or shared instance identity.
+    return sorted(buff_windows, key=lambda row: (
+        int(row.get("start_ts_ms") or 0), int(row.get("line_no") or 0),
+    ))
 
 
 def _window_uid_aliases(window: dict[str, Any]) -> set[str]:
@@ -7636,6 +7532,9 @@ def _effect_row_signature(effect: dict[str, Any]) -> tuple[Any, ...]:
             str(effect.get("bb_key") or ""),
             int(effect.get("attr_type")) if effect.get("attr_type") is not None else None,
             _effect_condition_signature(effect),
+            effect.get('recipient_side'),
+            effect.get('external_rdps_allowed'),
+            tuple(sorted(effect.get('rdps_whitelist_keys') or [])),
         )
     return (
         "dynamic",
@@ -7650,6 +7549,9 @@ def _effect_row_signature(effect: dict[str, Any]) -> tuple[Any, ...]:
         str(effect.get("add_bb_key") or ""),
         str(effect.get("delay_bb_key") or ""),
         _effect_condition_signature(effect),
+        effect.get('recipient_side'),
+        effect.get('external_rdps_allowed'),
+        tuple(sorted(effect.get('rdps_whitelist_keys') or [])),
     )
 
 
@@ -7706,70 +7608,48 @@ def _window_matches_packet_uids(window: dict[str, Any], packet_uids: set[str]) -
     return bool(aliases & packet_uids)
 
 
-def _buff_window_stack_sort_key(window: dict[str, Any]) -> tuple[int, int, str]:
-    uid = str(window.get("uid") or "")
-    return (
-        int(window.get("start_ts_ms") or 0),
-        int(uid) if uid.isdigit() else 0,
-        uid,
-    )
-
-
 def _buff_window_stack_group_key(window: dict[str, Any]) -> tuple[str, str, str, str]:
+    event_key = str(window.get('event_key') or '')
+    root = _load_current_buff_roots().get(event_key)
+    settings = root.get('stackingSettings') if isinstance(root, dict) else None
+    key = event_key
+    if isinstance(settings, dict) and settings.get('identifierType') == 'StackingKey':
+        key = str(settings.get('stackingKey') or '')
+    # BuffContainer owns the dictionary; BuffData.get_stackingKey supplies its
+    # key. Source and skill family are not part of the native grouping rule.
+    actor_id = str(window.get('target_actor_id') or '')
     return (
-        str(window.get("event_key") or ""),
-        str(window.get("source_character_key") or ""),
-        str(window.get("target_character_key") or ""),
-        str(window.get("skill_family_key") or ""),
+        'actor' if actor_id else 'unresolved_actor',
+        actor_id or str(window.get('target_character_key') or ''),
+        key,
+        '',
     )
-
-
-def _window_allows_stacking(window: dict[str, Any]) -> bool:
-    stack_limit = _positive_int(window.get("stack_limit"))
-    if stack_limit is not None and stack_limit > 1:
-        return True
-    return bool(_STACKABLE_EVENT_NAME_RE.search(str(window.get("event_key") or "")))
 
 
 def _apply_buff_stack_limits(buff_windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    if not buff_windows:
-        return []
-
-    uncapped: list[dict[str, Any]] = []
-    grouped: defaultdict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    # A stack limit constrains the enabled set, not instance lifetime. A lower
+    # priority instance can remain alive while disabled and later be enabled.
+    # Never invent BUFF_END by dropping the oldest UID. Resolve competing
+    # instances at each hit, after applying the observed enable timeline.
+    limited: list[dict[str, Any]] = []
     for window in buff_windows:
-        limit = _positive_int(window.get("stack_limit"))
-        if limit is None:
-            limit = _buff_stack_limit(str(window.get("event_key") or ""))
-        if limit is None:
-            uncapped.append(window)
+        window = dict(window)
+        root = _load_current_buff_roots().get(str(window.get('event_key') or ''))
+        stacking = root.get('stackingSettings') if isinstance(root, dict) else None
+        if isinstance(stacking, dict):
+            window['stacking_type'] = stacking.get('stackingType')
+            limit = _buff_stack_limit(str(window.get("event_key") or ""), window.get('bb_values'))
+            if window['stacking_type'] == 'Unlimited':
+                limit = None
+            elif limit is None:
+                window['rdps_unresolved_stack_evidence'] = True
+        else:
+            limit = _positive_int(window.get('stack_limit'))
+        window['stack_limit'] = limit
+        if int(window.get('end_ts_ms') or 0) < int(window.get('start_ts_ms') or 0):
             continue
-        capped_window = dict(window)
-        capped_window["stack_limit"] = limit
-        grouped[_buff_window_stack_group_key(capped_window)].append(capped_window)
-
-    capped: list[dict[str, Any]] = []
-    for windows in grouped.values():
-        active: list[dict[str, Any]] = []
-        for window in sorted(windows, key=_buff_window_stack_sort_key):
-            start_ts_ms = int(window.get("start_ts_ms") or 0)
-            active = [item for item in active if int(item.get("end_ts_ms") or 0) >= start_ts_ms]
-            active.append(window)
-            active.sort(key=_buff_window_stack_sort_key)
-            limit = int(window["stack_limit"])
-            while len(active) > limit:
-                expired = active.pop(0)
-                old_end_ts_ms = int(expired.get("end_ts_ms") or 0)
-                expired["end_ts_ms"] = min(old_end_ts_ms, start_ts_ms - 1)
-        capped.extend(windows)
-
-    limited = [
-        window
-        for window in [*uncapped, *capped]
-        if int(window.get("end_ts_ms") or 0) >= int(window.get("start_ts_ms") or 0)
-    ]
-    for window in limited:
         window["duration_ms"] = max(int(window["end_ts_ms"]) - int(window["start_ts_ms"]), 1)
+        limited.append(window)
     return sorted(limited, key=lambda item: (int(item.get("start_ts_ms") or 0), str(item.get("event_key") or "")))
 
 
@@ -8034,73 +7914,25 @@ def _parent_window_covers_specific_siblings(parent: dict[str, Any], siblings: li
 
 
 def _dedupe_mirrored_buff_windows(buff_windows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    deduped: list[dict[str, Any]] = []
+    # Remove only repeated observations of the same instance with identical
+    # boundaries and effect data. Never select a richer-looking sibling.
+    seen = set()
+    result = []
     for window in buff_windows:
-        if _parent_window_covers_created_children(window, deduped) or _parent_window_covers_specific_siblings(window, deduped):
+        uid = str(window.get("uid") or "")
+        if not uid:
+            result.append(window)
             continue
-        parent_event_key = _event_key_parent_of_default_child(window.get("event_key"))
-        if parent_event_key is not None:
-            parent_index = None
-            for index, other in enumerate(deduped):
-                if other.get("event_key") != parent_event_key:
-                    continue
-                if other.get("source_character_key") != window.get("source_character_key"):
-                    continue
-                if other.get("target_character_key") != window.get("target_character_key"):
-                    continue
-                if abs(int(other.get("start_ts_ms") or 0) - int(window.get("start_ts_ms") or 0)) > _BUFF_MIRROR_DEDUPE_WINDOW_MS:
-                    continue
-                if _parent_window_covers_default_child(other, window):
-                    parent_index = index
-                    break
-            if parent_index is not None:
-                _merge_window_uid_aliases(deduped[parent_index], window)
-                continue
-
-        signature = _static_effect_signature(window)
-        if signature is None:
-            deduped.append(window)
-            continue
-
-        mirror_index = None
-        for index, other in enumerate(deduped):
-            if other.get("event_key") == window.get("event_key"):
-                if _window_allows_stacking(other) or _window_allows_stacking(window):
-                    continue
-                if _window_matches_same_lane(other, window) and _same_event_window_signature_matches(other, window):
-                    mirror_index = index
-                    break
-                continue
-            if other.get("source_character_key") != window.get("source_character_key"):
-                continue
-            if other.get("target_character_key") != window.get("target_character_key"):
-                continue
-            if _static_effect_signature(other) != signature:
-                continue
-            if abs(int(other.get("start_ts_ms") or 0) - int(window.get("start_ts_ms") or 0)) > _BUFF_MIRROR_DEDUPE_WINDOW_MS:
-                continue
-            mirror_index = index
-            break
-
-        if mirror_index is None:
-            deduped.append(window)
-            continue
-
-        other = deduped[mirror_index]
-        same_event_duplicate = other.get("event_key") == window.get("event_key")
-        current_score = _mirror_preference_score(window)
-        other_score = _mirror_preference_score(other)
-        if same_event_duplicate:
-            current_score += _window_detail_count(window)
-            other_score += _window_detail_count(other)
-        if current_score > other_score:
-            _merge_window_uid_aliases(window, other)
-            deduped[mirror_index] = window
-        elif current_score == other_score and not same_event_duplicate:
-            deduped.append(window)
-        else:
-            _merge_window_uid_aliases(other, window)
-    return deduped
+        identity = json.dumps({key: window.get(key) for key in (
+            "uid", "uid_aliases", "source_character_key", "target_character_key", "event_key", "target_actor_id", "source_actor_id",
+            "start_ts_ms", "end_ts_ms", "zone_effects", "dynamic_effects", "effect_segments",
+            "start_line_no", "end_line_no", "snapshot_end_ts_ms", "snapshot_end_line_no",
+            "enable_observations", "snapshot_update",
+        )}, sort_keys=True, ensure_ascii=False)
+        if identity not in seen:
+            seen.add(identity)
+            result.append(window)
+    return result
 
 
 def _assign_skill_timeline_group_keys(hits: list[dict[str, Any]]) -> None:
@@ -8136,65 +7968,7 @@ def _infer_missing_hit_damage_schools(
     hits: list[dict[str, Any]],
     buff_windows: list[dict[str, Any]],
 ) -> None:
-    for hit in hits:
-        if hit.get("damage_school"):
-            continue
-        packet_modifier_uids = hit.get("packet_modifier_uids") if isinstance(hit.get("packet_modifier_uids"), dict) else {}
-        attacker_modifier_uids = {str(item) for item in packet_modifier_uids.get("attacker") or [] if str(item)}
-        defender_modifier_uids = {str(item) for item in packet_modifier_uids.get("defender") or [] if str(item)}
-        attacker_key = str(hit.get("character_key") or "")
-        target_enemy_key = str(hit.get("target_enemy_key") or "")
-        hit_ts_ms = int(hit.get("ts_ms") or 0)
-        skill_key = str(hit.get("skill_key") or "")
-        skill_family_key = str(hit.get("skill_family_key") or "")
-
-        packet_candidates: set[str] = set()
-        generic_candidates: set[str] = set()
-        for window in buff_windows:
-            if not (int(window.get("start_ts_ms") or 0) <= hit_ts_ms <= int(window.get("end_ts_ms") or 0)):
-                continue
-            window_skill_family_key = str(window.get("skill_family_key") or "")
-            if window_skill_family_key and skill_family_key != window_skill_family_key:
-                continue
-            skill_filter = _BUFF_SKILL_FILTER.get(str(window.get("event_key") or ""))
-            if skill_filter and not skill_filter.search(skill_key):
-                continue
-
-            applies_to_attacker = str(window.get("target_character_key") or "") == attacker_key
-            applies_to_enemy = bool(target_enemy_key) and str(window.get("target_character_key") or "") == target_enemy_key
-            if not applies_to_attacker and not applies_to_enemy:
-                continue
-
-            packet_match = False
-            if applies_to_attacker and attacker_modifier_uids and _window_matches_packet_uids(window, attacker_modifier_uids):
-                packet_match = True
-            if applies_to_enemy and defender_modifier_uids and _window_matches_packet_uids(window, defender_modifier_uids):
-                packet_match = True
-
-            for effect in _window_effects_at_ts(window, hit_ts_ms):
-                effect_skill_filter = _BUFF_EFFECT_SKILL_FILTER.get((str(window.get("event_key") or ""), str(effect.get("zone") or "")))
-                if effect_skill_filter and not effect_skill_filter.search(skill_key):
-                    continue
-                attr_type = effect.get("attr_type")
-                if isinstance(attr_type, int) and not _attr_type_applies_to_skill(attr_type, skill_key):
-                    continue
-                try:
-                    rate = float(effect.get("rate") or 0.0)
-                except (TypeError, ValueError):
-                    continue
-                if rate <= 0:
-                    continue
-                school = _normalize_effect_element(effect.get("element"))
-                if school not in {"physical", "spell"}:
-                    continue
-                generic_candidates.add(school)
-                if packet_match:
-                    packet_candidates.add(school)
-
-        if len(packet_candidates) == 1:
-            hit["damage_school"] = next(iter(packet_candidates))
-        elif len(generic_candidates) == 1:
-            hit["damage_school"] = next(iter(generic_candidates))
+        return
 
 
 def _build_role_skill_stats_from_timeline_groups(
@@ -8278,13 +8052,8 @@ def _zone_from_label(label: str) -> str | None:
 
 
 def _safe_positive_rate(value: Any) -> float | None:
-    try:
-        rate = float(value)
-    except (TypeError, ValueError):
-        return None
-    if rate <= 0:
-        return None
-    return rate
+    rate = _coerce_optional_float(value)
+    return rate if rate is not None and rate > 0 else None
 
 
 def _semantic_blackboard_defaults(entry: dict[str, Any]) -> dict[str, Any]:
@@ -8305,9 +8074,19 @@ def _semantic_blackboard_defaults(entry: dict[str, Any]) -> dict[str, Any]:
 def _semantic_damage_effect_zone(effect: dict[str, Any]) -> tuple[str, str] | None:
     if str(effect.get("processorType") or "") != "DamageScaleProcessor":
         return None
-    if str(effect.get("zoneName") or "") != "NormalCalcZone":
+    zone_name = str(effect.get('zoneName') or '')
+    config = _load_damage_zone_config().get(zone_name)
+    if not isinstance(config, dict):
         return None
     side = str(effect.get("side") or effect.get("enableSide") or "")
+    if zone_name == 'ProdCalcZone':
+        if side == 'Attacker':
+            return 'prod_dmg_inc', 'all'
+        if side == 'Defender':
+            return 'prod_vuln_taken', 'all'
+        return None
+    if zone_name != 'NormalCalcZone':
+        return None
     if side == "Attacker":
         return "dmg_inc", "all"
     if side == "Defender":
@@ -8322,103 +8101,161 @@ def _semantic_damage_effect_condition(
     defaults: dict[str, Any],
     bb_values: dict[str, Any],
 ) -> dict[str, Any] | None:
-    condition_actions = {
-        str(action)
-        for action in effect.get("conditionActionTypes") or []
-        if str(action or "")
-    }
-    if not condition_actions:
-        return None
-    conditions: list[dict[str, Any]] = []
-    if "CheckHp" in condition_actions:
-        threshold = _safe_positive_rate(bb_values.get("hp_remain"))
-        if threshold is None:
-            threshold = _safe_positive_rate(defaults.get("hp_remain"))
-        if threshold is None:
-            return None
-        conditions.append({
-            "type": "target_hp_ratio_lte",
-            "source": "CheckHp",
-            "threshold": threshold,
-            "threshold_key": "hp_remain",
-        })
-    if "CheckDamageType" in condition_actions or "CheckBuffStackNumAdvanced" in condition_actions:
-        try:
-            group_index = int(effect.get("groupIndex"))
-        except (TypeError, ValueError):
-            return None
-        decoded_conditions = _decoded_damage_modifier_condition_rows(buff_id).get(group_index) or {}
-        damage_types = [
-            str(element)
-            for element in decoded_conditions.get("damage_types") or []
-            if str(element or "")
-        ]
-        if damage_types:
-            conditions.append({
-                "type": "damage_type_in",
-                "source": "CheckDamageType",
-                "elements": damage_types,
-            })
-        condition_buff_ids = [
-            _normalize_buff_id(buff_id_value)
-            for buff_id_value in decoded_conditions.get("condition_buff_ids") or effect.get("conditionBuffIds") or []
-            if _normalize_buff_id(buff_id_value)
-        ]
-        if "CheckBuffStackNumAdvanced" in condition_actions and condition_buff_ids:
-            conditions.append({
-                "type": "target_has_buff",
-                "source": "CheckBuffStackNumAdvanced",
-                "buff_ids": sorted(set(condition_buff_ids)),
-            })
-    unsupported = condition_actions - {"CheckHp", "CheckDamageType", "CheckBuffStackNumAdvanced"}
-    if unsupported or not conditions:
-        return None
+    group_index = effect.get("groupIndex")
+    if isinstance(group_index, bool) or not re.fullmatch(r"\d+", str(group_index)):
+        return {"type": "unresolved", "errors": ["missing_condition_group_index"]}
+    decoded = _decoded_damage_modifier_condition_rows(buff_id).get(int(group_index))
+    if not decoded:
+        return {"type": "unresolved", "errors": ["missing_decoded_condition"]}
+    if decoded.get("errors"):
+        return {"type": "unresolved", "errors": list(decoded["errors"])}
+    if decoded.get("all_disabled"):
+        return {"type": "always", "source": "decoded_disabled_conditions"}
+    if decoded.get("action_count") == 0:
+        return {"type": "always", "source": "decoded_empty_conditions"}
+    conditions = []
+    for raw in decoded.get("conditions") or []:
+        condition = dict(raw)
+        if condition.get('type') in {'target_hp_compare', 'target_has_buff'} and effect.get('enableSide') in {'Attacker', 'Defender'}:
+            # ApplyModifier sets TargetHandle to the opposite participant
+            # of the modifier's enabled/owning side, independently of the
+            # processor's destination damage zone.
+            condition['subject_side'] = 'defender' if effect['enableSide'] == 'Attacker' else 'attacker'
+        if condition.get("type") == "target_hp_compare":
+            config = condition.pop("value_config")
+            key = str(config.get("blackboardKey") or "")
+            value = bb_values.get(key) if config["useBlackboardKey"] else config.get("value")
+            threshold = _coerce_optional_float(value)
+            if threshold is None or threshold < 0 or (condition["is_ratio"] and threshold > 1):
+                return {"type": "unresolved", "errors": ["missing_or_invalid_hp_threshold"], "bb_key": key}
+            condition["threshold"] = threshold
+            if config["useBlackboardKey"]:
+                condition["threshold_key"] = key
+        conditions.append(condition)
+    if not conditions:
+        return {"type": "unresolved", "errors": ["empty_decoded_condition"]}
     if len(conditions) == 1:
         return conditions[0]
-    return {
-        "type": "all",
-        "source": "+".join(sorted(condition_actions)),
-        "conditions": conditions,
-    }
+    return {"type": "all", "source": "decoded_conditions", "conditions": conditions}
 
 
-def _collect_semantic_condition_zone_effects(record: dict[str, Any]) -> list[dict[str, Any]]:
+def _collect_semantic_condition_zone_effects(record: dict[str, Any], *, root_lookup_cache: dict | None = None) -> list[dict[str, Any]]:
     buff_id = _normalize_buff_id(record.get("event_key"))
-    entry = _load_local_buff_semantic_entries().get(buff_id)
-    if not isinstance(entry, dict):
+    root = _load_current_buff_roots().get(buff_id)
+    record.pop('rdps_unresolved_semantic_condition', None)
+    record.pop('rdps_unapproved_typed_branches', None)
+    if not isinstance(root, dict):
+        record['rdps_unresolved_semantic_condition'] = ['missing_current_buff_root']
         return []
-
     bb_values = {str(key): value for key, value in (record.get("bb_values") or {}).items()}
-    defaults = _semantic_blackboard_defaults(entry)
     effects: list[dict[str, Any]] = []
-    for damage_effect in entry.get("damageEffects") or []:
-        if not isinstance(damage_effect, dict):
-            continue
+    modifiers = root.get('damageModifier')
+    if not isinstance(modifiers, list):
+        record['rdps_unresolved_semantic_condition'] = ['unspecified_damage_modifiers']
+        return []
+    declared = []
+    for group_index, modifier in enumerate(modifiers):
+        if not isinstance(modifier, dict) or not isinstance(modifier.get('damageProcessors'), list):
+            record['rdps_unresolved_semantic_condition'] = ['unspecified_damage_processors']
+            return []
+        if modifier.get('enableSide') not in {'Attacker', 'Defender'}:
+            record['rdps_unresolved_semantic_condition'] = ['unsupported_modifier_entry_side']
+            return []
+        for processor in modifier['damageProcessors']:
+            if not isinstance(processor, dict):
+                record['rdps_unresolved_semantic_condition'] = ['unsupported_damage_processor_or_side']
+                return []
+            processor_type = processor.get('$type')
+            if processor_type == 'Beyond.Gameplay.Core.DamageScaleProcessor':
+                if processor.get('side') not in {'Attacker', 'Defender'}:
+                    record['rdps_unresolved_semantic_condition'] = ['unsupported_damage_processor_or_side']
+                    return []
+                declared.append({**processor, 'groupIndex': group_index, 'processorType': 'DamageScaleProcessor',
+                                 'enableSide': modifier['enableSide']})
+                continue
+            # InstantModifyAttribute is the native processor used by
+            # resistance-ignore windows. Only accept the fully typed fire
+            # resistance form; other attributes remain unknown.
+            if processor_type == 'Beyond.Gameplay.Core.InstantModifyAttribute':
+                typed_modifier = processor.get('modifier')
+                if (not isinstance(typed_modifier, dict)
+                        or typed_modifier.get('attributeType') != 'FireResistance'
+                        or typed_modifier.get('formulaItem') != 'BaseAddition'
+                        or typed_modifier.get('modifyAttributeType') != 'Specific'
+                        or processor.get('modifyTargetSide') != 'Defender'):
+                    record['rdps_unresolved_semantic_condition'] = ['unsupported_damage_processor_or_side']
+                    return []
+                declared.append({
+                    'groupIndex': group_index,
+                    'processorType': 'InstantModifyAttribute',
+                    'side': 'Defender',
+                    'enableSide': modifier['enableSide'],
+                    'addition': typed_modifier.get('param') or {},
+                    'attributeType': 'FireResistance',
+                })
+                continue
+            record['rdps_unresolved_semantic_condition'] = ['unsupported_damage_processor_or_side']
+            return []
+    approval = _rdps_registry_candidate_effect_entry(record, root_lookup_cache=root_lookup_cache)
+    approved_specs = (approval.get('effects') or []) if isinstance(approval, dict) else []
+    for damage_effect in declared:
+        # A newly added typed branch cannot expand an existing element-specific
+        # whitelist. An enabled AND condition with disjoint damage types proves
+        # it is outside that approval, even when another action in the branch
+        # is not supported. Preserve the boundary without guessing that action.
+        decoded = _decoded_damage_modifier_condition_rows(buff_id).get(damage_effect['groupIndex']) or {}
+        addition = damage_effect.get('addition') if isinstance(damage_effect.get('addition'), dict) else {}
+        bb_key = addition.get('blackboardKey') if addition.get('useBlackboardKey') is True else None
+        scopes = [spec.get('element', 'all') for spec in approved_specs if isinstance(spec, dict)
+                  and bb_key and bb_key in {spec.get('bb_key'), *(spec.get('bb_keys') or [])}]
+        if (scopes and all(scope in {'physical', 'spell', 'fire', 'pulse', 'cryst', 'natural',
+                                     'real', 'lifedrain', 'ether'} for scope in scopes)
+                and 'unresolved_source_guard' not in decoded.get('errors', [])):
+            allowed = set().union(*({'fire', 'pulse', 'cryst', 'natural'} if scope == 'spell' else {scope}
+                                    for scope in scopes))
+            restrictions = [set(condition['elements']) for condition in decoded.get('conditions') or []
+                            if condition.get('type') == 'damage_type_in' and condition.get('elements')]
+            if any(not allowed.intersection(elements) for elements in restrictions):
+                record.setdefault('rdps_unapproved_typed_branches', []).append({
+                    'group_index': damage_effect['groupIndex'], 'bb_key': bb_key,
+                    'reason': 'typed_damage_types_disjoint_from_whitelist',
+                    'whitelist_elements': sorted(allowed),
+                    'typed_damage_types': sorted(set.union(*restrictions)),
+                    'unsupported_conditions': list(decoded.get('errors') or []),
+                })
+                continue
         condition = _semantic_damage_effect_condition(
             buff_id,
             damage_effect,
-            defaults=defaults,
+            defaults={},
             bb_values=bb_values,
         )
         if condition is None:
             continue
-        zone_element = _semantic_damage_effect_zone(damage_effect)
+        if condition.get("type") == "unresolved":
+            record["rdps_unresolved_semantic_condition"] = condition.get("errors") or ["unresolved_condition"]
+            continue
+        if damage_effect.get('processorType') == 'InstantModifyAttribute':
+            zone_element = ('res', 'fire')
+        else:
+            zone_element = _semantic_damage_effect_zone(damage_effect)
         if zone_element is None:
+            record['rdps_unresolved_semantic_condition'] = ['unsupported_damage_zone']
             continue
         zone, element = zone_element
         addition = damage_effect.get("addition") if isinstance(damage_effect.get("addition"), dict) else {}
         bb_key = str(addition.get("blackboardKey") or "")
-        rate = _safe_positive_rate(bb_values.get(bb_key)) if bb_key else None
-        if rate is None:
-            rate = _safe_positive_rate(addition.get("value"))
-        if rate is None and bb_key:
-            rate = _safe_positive_rate(defaults.get(bb_key))
-        if rate is None:
+        use_key = addition.get('useBlackboardKey')
+        rate = (_coerce_optional_float(bb_values.get(bb_key)) if use_key is True and bb_key else
+                _coerce_optional_float(addition.get('value')) if use_key is False else None)
+        if damage_effect.get('processorType') == 'InstantModifyAttribute' and rate is not None:
+            # FireResistance BaseAddition is encoded as a signed decrease
+            # (e.g. -20); the rDPS res lane stores the corresponding positive
+            # amount removed from resistance.
+            rate = -rate
+        if rate is None or rate < 0:
+            record["rdps_unresolved_semantic_condition"] = ["missing_or_invalid_effect_rate"]
             continue
-        if zone == "dmg_inc" and bb_key:
-            element = _damage_increase_element_from_bb_key(bb_key) or element
-        elif bb_key:
-            element = _element_from_text(bb_key) or element
         condition_elements = _condition_damage_type_elements(condition)
         if element == "all" and len(condition_elements) == 1:
             element = next(iter(condition_elements))
@@ -8427,305 +8264,462 @@ def _collect_semantic_condition_zone_effects(record: dict[str, Any]) -> list[dic
             "element": _normalize_effect_element(element),
             "rate": rate,
             "condition": condition,
-            "semantic_source": "damageEffects",
+            "semantic_source": "typed_current_damageModifier",
+            'recipient_side': damage_effect['enableSide'].lower(),
         }
+        if zone.startswith('prod_'):
+            effect['multiplicative'] = True
         if bb_key:
             effect["bb_key"] = bb_key
-            _attach_bb_key_damage_type_condition(effect, bb_key)
+        effects.append(effect)
+    attributes = root.get('attributeModifier')
+    if isinstance(attributes, dict):
+        typed_attribute_types = {
+            'Atk': (2, 'BaseMultiplier'),
+            'NormalAttackDamageIncrease': (17, 'BaseAddition'),
+            'UltimateSkillDamageIncrease': (28, 'BaseAddition'),
+            'NormalSkillDamageIncrease': (32, 'BaseAddition'),
+            'ComboSkillDamageIncrease': (33, 'BaseAddition'),
+            'FireDamageIncrease': (51, 'BaseAddition'),
+            'PhysicalDamageIncrease': (50, 'BaseAddition'),
+            'PulseDamageIncrease': (52, 'BaseAddition'),
+            'CrystDamageIncrease': (53, 'BaseAddition'),
+            'NaturalDamageIncrease': (54, 'BaseAddition'),
+            'PulseEnhancedDmgIncrease': (66, 'BaseAddition'),
+            'FireEnhancedDmgIncrease': (65, 'BaseAddition'),
+            'CrystEnhancedDmgIncrease': (67, 'BaseAddition'),
+            'NaturalEnhancedDmgIncrease': (68, 'BaseAddition'),
+            'PhysicalAndSpellInflictionEnhance': (87, 'BaseAddition'),
+        }
+        typed_vulnerability_types = {
+            'PhysicalVulnerableDmgIncrease': ('fragile', 'physical'),
+            'FireVulnerableDmgIncrease': ('fragile', 'fire'),
+            'PulseVulnerableDmgIncrease': ('fragile', 'pulse'),
+            'CrystVulnerableDmgIncrease': ('fragile', 'cryst'),
+            'NaturalVulnerableDmgIncrease': ('fragile', 'natural'),
+        }
+        for modifier in attributes.get('attributeModifiers') or []:
+            attr_spec = typed_attribute_types.get(modifier.get('attributeType')) if isinstance(modifier, dict) else None
+            vulnerability_zone = (typed_vulnerability_types.get(modifier.get('attributeType'))
+                                  if isinstance(modifier, dict) else None)
+            if attr_spec is None:
+                if vulnerability_zone is None:
+                    continue
+                attr_type, required_formula = None, 'BaseAddition'
+            else:
+                attr_type, required_formula = attr_spec
+            if (type(attributes.get('isConvertedAttribute')) is not bool
+                    or modifier.get('formulaItem') != required_formula
+                    or modifier.get('modifyAttributeType') != 'Specific'):
+                record['rdps_unresolved_semantic_condition'] = ['unsupported_conditional_attribute_formula']
+                return []
+            param = modifier.get('param') or {}
+            bb_key = str(param.get('blackboardKey') or '')
+            use_key = param.get('useBlackboardKey')
+            rate = (_coerce_optional_float(bb_values.get(bb_key)) if use_key is True and bb_key else
+                    _coerce_optional_float(param.get('value')) if use_key is False else None)
+            if rate is None or rate < 0:
+                record['rdps_unresolved_semantic_condition'] = ['missing_or_invalid_attribute_rate']
+                return []
+            zone, element = vulnerability_zone or (('arts_strength', 'all') if attr_type == 87 else _ATTR_TYPE_TO_EFFECT[attr_type])
+            condition = ({'type': 'damage_decorate_mask', 'check': 'HasAny',
+                          'mask': _ATTR_TYPE_DAMAGE_MASK[attr_type],
+                          'source': 'DamagePackData.GetAttackerDamageScaleIncreaseFromSkillType'}
+                         if attr_type in _ATTR_TYPE_DAMAGE_MASK else None)
+            effects.append({'zone': zone, 'element': element, 'rate': rate, 'attr_type': attr_type,
+                            'bb_key': bb_key if use_key is True else '',
+                            **({'condition': condition} if condition is not None else {}),
+                            'semantic_source': 'typed_current_attributeModifier'})
+            if attributes['isConvertedAttribute']:
+                # Full Attributes.GetValue uses FilerTypeMask.All (-1),
+                # which includes Converted. Read the observed BB operand;
+                # do not reconstruct the conversion that generated it.
+                effects[-1]['converted_attribute'] = True
+    return effects
+
+
+def _collect_zone_effects(record: dict[str, Any], *, root_lookup_cache: dict | None = None) -> list[dict[str, Any]]:
+    if record.get('rdps_live_identity_conflict'):
+        record['rdps_unresolved_semantic_condition'] = ['conflicting_live_buff_identity']
+        return []
+    buff_id = _normalize_buff_id(record.get("event_key"))
+    verified_entry = _rdps_registry_verified_effect_entry(record, root_lookup_cache=root_lookup_cache)
+    if verified_entry is None and _rdps_registry_known_non_rdps_entry(record) is not None:
+        return []
+    if verified_entry is None and _rdps_registry_suppresses_zone_effects(record):
+        record.pop('rdps_unresolved_semantic_condition', None)
+        return []
+    if verified_entry is None:
+        # Current typed effects can describe the attacker's own baseline;
+        # they do not authorize external rDPS outside the approved whitelist.
+        effects = _collect_semantic_condition_zone_effects(record, root_lookup_cache=root_lookup_cache)
+        for effect in effects:
+            effect['external_rdps_allowed'] = False
+            effect['rdps_whitelist_keys'] = []
+        if not effects and not record.get('rdps_unresolved_semantic_condition'):
+            record['rdps_unresolved_semantic_condition'] = ['missing_verified_semantics']
+        return effects
+    effects = _rdps_registry_zone_effects(record, verified_entry)
+    semantic_effects = _collect_semantic_condition_zone_effects(record, root_lookup_cache=root_lookup_cache)
+    if record.get("rdps_unresolved_semantic_condition"):
+        return []
+    if effects and not semantic_effects:
+        # A legacy registry effect without a corresponding current typed
+        # modifier is not evidence that the effect exists in this build.
+        record['rdps_unresolved_semantic_condition'] = ['missing_current_semantic_effect']
+        return []
+    verified_effects = []
+    registry_specs_by_current_index: dict[int, list[dict[str, Any]]] = {}
+    for effect in effects:
+        matched = [(index, semantic) for index, semantic in enumerate(semantic_effects)
+                   if effect.get('zone') == semantic.get('zone')
+                   and str(semantic.get('bb_key') or '') in (effect.get('_registry_bb_keys')
+                        or [str(effect.get('_registry_bb_key') or '')])]
+        if matched:
+            if any(semantic.get('rate') != effect.get('rate') for _, semantic in matched):
+                record['rdps_unresolved_semantic_condition'] = ['conflicting_declared_rates']
+                return []
+            # The registry authorizes the effect; the current complete root
+            # defines the actual branches/conditions, not a legacy name rule.
+            for index, semantic in matched:
+                registry_specs_by_current_index.setdefault(index, []).append(effect)
+        else:
+            record['rdps_unresolved_semantic_condition'] = ['registry_effect_not_in_current_typed_root']
+            return []
+    for index, declared_specs in registry_specs_by_current_index.items():
+        approved = dict(semantic_effects[index])
+        approved['external_rdps_allowed'] = True
+        approved['rdps_whitelist_keys'] = list(verified_entry.get('_rdps_whitelist_keys') or [])
+        if verified_entry.get('_keyword_origin'):
+            approved['keyword_origin'] = copy.deepcopy(verified_entry['_keyword_origin'])
+        alternatives = []
+        for spec in declared_specs:
+            terms = [copy.deepcopy(spec['condition'])] if 'condition' in spec else []
+            element = spec.get('element', 'all')
+            if element != 'all':
+                terms.append({'type': 'damage_type_in', 'source': 'rdps_whitelist',
+                              'elements': ['fire', 'pulse', 'cryst', 'natural'] if element == 'spell' else [element]})
+            alternatives.append({'type': 'all', 'conditions': terms} if terms else {'type': 'always'})
+        # A typed branch may match several approved element rows. Preserve
+        # their union without crediting the branch more than once.
+        if not any(branch.get('type') == 'always' for branch in alternatives):
+            restriction = {'type': 'any', 'source': 'rdps_whitelist', 'conditions': alternatives}
+            approved['condition'] = ({'type': 'all', 'source': 'typed_and_whitelist',
+                                      'conditions': [approved['condition'], restriction]}
+                                     if 'condition' in approved else restriction)
+        verified_effects.append(approved)
+    effects = verified_effects
+    for effect in effects:
+        effect.pop("_registry_bb_key", None)
+    if verified_entry.get("dynamic"):
+        return []
+    return effects
+
+
+def _extract_dynamic_effect_specs(record: dict[str, Any], *, root_lookup_cache: dict | None = None) -> list[dict[str, Any]]:
+    record.pop("rdps_unresolved_dynamic_effect", None)
+    if record.get('rdps_live_identity_conflict'):
+        record['rdps_unresolved_dynamic_effect'] = True
+        return []
+    entry = _rdps_registry_verified_effect_entry(record, root_lookup_cache=root_lookup_cache)
+    if entry is None or not entry.get("dynamic") or record.get("packet_mapping_rejected"):
+        return []
+    if 'buff_chr_0023_antal_normal_fragile' in (entry.get('_rdps_whitelist_keys') or []):
+        snapshots = record.get('keyword_rate_snapshots') or []
+        if snapshots and entry.get('_keyword_origin'):
+            base_record = dict(record)
+            base_record.pop('keyword_rate_snapshots', None)
+            effects = _collect_zone_effects(base_record, root_lookup_cache=root_lookup_cache)
+            sessions = {row.get('session_id') for row in snapshots}
+            if len(sessions) == 1 and None not in sessions and effects:
+                return [{**effect, 'base_rate': effect['rate'],
+                         'keyword_rate_snapshots': copy.deepcopy(snapshots),
+                         'keyword_session_id': next(iter(sessions))}
+                        for effect in effects]
+        # A legacy parent label is not the live keyword effect. Current main
+        # Buffs are authorized by their exact creation origin and observed rate.
+        record['rdps_unresolved_dynamic_effect'] = True
+        return []
+    if record.get('event_key') in {'buff_common_natural_natural_corrupt_do', 'buff_common_natural_cryst_triggered'}:
+        snapshots = record.get('attribute_refresh_snapshots') or record.get('resistance_parameter_snapshots') or []
+        if snapshots:
+            root = _load_current_buff_roots().get(record['event_key']) or {}
+            attributes = root.get('attributeModifier') or {}
+            resistance_types = {'PhysicalResistance': 'physical', 'NaturalResistance': 'natural',
+                                'CrystResistance': 'cryst', 'PulseResistance': 'pulse',
+                                'FireResistance': 'fire', 'EtherResistance': 'ether'}
+            keys_by_element: dict[str, list[str]] = defaultdict(list)
+            approved_keys = {item.get('bb_key') for item in entry.get('effects') or [] if item.get('zone') == 'res'}
+            for modifier in attributes.get('attributeModifiers') or []:
+                element = resistance_types.get(modifier.get('attributeType'))
+                if element is None:
+                    continue
+                param = modifier.get('param') or {}
+                key = param.get('blackboardKey')
+                if (modifier.get('formulaItem') != 'BaseAddition' or modifier.get('modifyAttributeType') != 'Specific'
+                        or param.get('useBlackboardKey') is not True or key not in approved_keys):
+                    record['rdps_unresolved_dynamic_effect'] = True
+                    return []
+                keys_by_element[element].append(key)
+            if keys_by_element:
+                return [{'zone': 'res', 'element': element, 'base_rate': 0.0,
+                         'parameter_keys': keys, 'parameter_snapshots': copy.deepcopy(snapshots),
+                         'external_rdps_allowed': True,
+                         'rdps_whitelist_keys': list(entry.get('_rdps_whitelist_keys') or [])}
+                        for element, keys in keys_by_element.items()]
+    hint = record.get("packet_mapping")
+    if not isinstance(hint, dict):
+        hint = _packet_numeric_buff_hint(record.get("raw_event_key") or record.get("event_key"))
+    specs = hint.get("dynamic_effects")
+    if not isinstance(specs, list) or not specs:
+        specs = entry.get("dynamic_effects")
+    if not isinstance(specs, list) or not specs:
+        record["rdps_unresolved_dynamic_effect"] = True
+        return []
+    bb_values = record.get("bb_values") or {}
+    allow_constant = _packet_mapping_allows_static_rate(hint)
+    effects = []
+    for spec in specs:
+        if not isinstance(spec, dict) or spec.get("zone") not in _RDPS_ALLOCATABLE_ZONES:
+            record["rdps_unresolved_dynamic_effect"] = True
+            return []
+        element = spec.get("element")
+        if element not in {"all", "physical", "spell", "fire", "pulse", "cryst", "natural"}:
+            record["rdps_unresolved_dynamic_effect"] = True
+            return []
+        declared = [item for item in (entry.get('dynamic_effects') or entry.get('effects') or [])
+                    if item.get('zone') == spec['zone'] and item.get('element', 'all') == element]
+        if not declared:
+            record['rdps_unresolved_dynamic_effect'] = True
+            record['rdps_whitelist_rejection'] = 'dynamic_effect_not_declared'
+            return []
+        effect = {"zone": spec["zone"], "element": element}
+        parameters = (("base_rate", "base_bb_key", "base_bb_keys", "bb_key"),
+                      ("tick_rate", "tick_bb_key", "tick_bb_keys", "tick_bb_key"),
+                      ("delayed_add_rate", "add_bb_key", "", "add_bb_key"),
+                      ("delay_sec", "delay_bb_key", "", "delay_bb_key"),
+                      ("max_rate", "max_bb_key", "", "max_bb_key"))
+        for parameter, key_field, aliases_field, provenance in parameters:
+            aliases = spec.get(aliases_field) if aliases_field else []
+            if aliases is not None and not isinstance(aliases, list):
+                record["rdps_unresolved_dynamic_effect"] = True
+                return []
+            keys = list(dict.fromkeys([str(key) for key in aliases or [] if key]))
+            primary = spec.get(key_field) or (spec.get("bb_key") if parameter == "base_rate" else None)
+            if primary and str(primary) not in keys:
+                keys.insert(0, str(primary))
+            values = [(key, _coerce_optional_float(bb_values[key])) for key in keys if key in bb_values]
+            if str(spec.get("zone") or "") == "res":
+                values = [(key, -value if value is not None and value < 0 else value)
+                          for key, value in values]
+            if values:
+                if any(value is None or value < 0 for _, value in values) or len({value for _, value in values}) != 1:
+                    record["rdps_unresolved_dynamic_effect"] = True
+                    return []
+                effect[parameter] = values[0][1]
+                effect[provenance] = values[0][0]
+            elif parameter in spec and allow_constant:
+                value = _coerce_optional_float(spec[parameter])
+                if value is None or value < 0:
+                    record["rdps_unresolved_dynamic_effect"] = True
+                    return []
+                effect[parameter] = value
+            elif keys or parameter in spec:
+                record["rdps_unresolved_dynamic_effect"] = True
+                return []
+            else:
+                # The declared formula has no such term: its additive identity is zero.
+                effect[parameter] = 0.0
+        multiplier = _coerce_optional_float(spec.get("tick_multiplier", 1))
+        if multiplier is None or multiplier < 0 or not isfinite(effect["tick_rate"] * multiplier):
+            record["rdps_unresolved_dynamic_effect"] = True
+            return []
+        effect["tick_rate"] *= multiplier
+        declared_keys = {str(item[field]) for item in declared
+                         for field in ('bb_key', 'base_bb_key', 'tick_bb_key', 'add_bb_key', 'delay_bb_key', 'max_bb_key')
+                         if item.get(field)}
+        declared_keys.update(str(key) for item in declared
+                             for field in ('bb_keys', 'base_bb_keys', 'tick_bb_keys', 'required_bb_keys')
+                             for key in item.get(field) or [])
+        used_keys = {str(effect[field]) for field in ('bb_key', 'tick_bb_key', 'add_bb_key', 'delay_bb_key', 'max_bb_key')
+                     if effect.get(field)}
+        if not used_keys <= declared_keys:
+            record['rdps_unresolved_dynamic_effect'] = True
+            record['rdps_whitelist_rejection'] = 'dynamic_operand_not_declared'
+            return []
+        for parameter, _, _, provenance in parameters:
+            if parameter in spec and not effect.get(provenance):
+                if not any(_coerce_optional_float(item.get(parameter)) == effect[parameter]
+                           for item in declared if parameter in item):
+                    record['rdps_unresolved_dynamic_effect'] = True
+                    record['rdps_whitelist_rejection'] = 'dynamic_literal_not_declared'
+                    return []
+        # Native ModifyDynamicBlackboard reports the destination key's value
+        # after assignment. That result alone does not prove the attribute
+        # modifier was refreshed; bind the typed key and explicit refresh
+        # before using it. Never integrate the configured tick over time.
+        if effect["tick_rate"] != 0.0 or effect["delayed_add_rate"] != 0.0:
+            record["rdps_unresolved_dynamic_effect"] = True
+            return []
+        if spec.get("dynamic_key"):
+            effect["dynamic_key"] = spec["dynamic_key"]
+        if "condition" in spec:
+            effect["condition"] = copy.deepcopy(spec["condition"])
+        if all('condition' in item for item in declared):
+            restriction = {'type': 'any', 'source': 'rdps_whitelist',
+                           'conditions': [copy.deepcopy(item['condition']) for item in declared]}
+            effect['condition'] = ({'type': 'all', 'conditions': [effect['condition'], restriction]}
+                                   if 'condition' in effect else restriction)
+        effect['external_rdps_allowed'] = True
+        effect['rdps_whitelist_keys'] = list(entry.get('_rdps_whitelist_keys') or [])
         effects.append(effect)
     return effects
 
 
-def _collect_zone_effects(record: dict[str, Any]) -> list[dict[str, Any]]:
-    buff_id = _normalize_buff_id(record.get("event_key"))
-    if _rdps_registry_suppresses_zone_effects(record):
+def _window_effects_at_ts(window: dict[str, Any], hit_ts_ms: int, *,
+                          line_no: int | None = None, packet_seq_id: int | None = None,
+                          packet_session_id: str | None = None) -> list[dict[str, Any]]:
+    window['_enable_state_unobserved_at_hit'] = False
+    window['_effect_state_unresolved_at_hit'] = False
+    window['_buff_enabled_at_hit'] = None
+    start = window.get('start_ts_ms')
+    end = window.get('end_ts_ms')
+    if type(start) is int and hit_ts_ms < start or type(end) is int and hit_ts_ms > end:
         return []
-    semantic_condition_effects = _collect_semantic_condition_zone_effects(record)
-    if (
-        _is_noise_buff(buff_id)
-        or _should_ignore_rate_buff(buff_id)
-        or _should_ignore_record_rate_effects(record)
-        or record.get("packet_mapping_rejected")
-    ):
-        return []
-    registry_candidate = _rdps_registry_candidate_effect_entry(record)
-    if _is_effectless_wrapper_record(record) and not semantic_condition_effects and registry_candidate is None:
-        return []
-    if registry_candidate is not None:
-        registry_entry = _rdps_registry_verified_effect_entry(record)
-        if registry_entry is None:
+    if line_no:
+        if start == hit_ts_ms and int(window.get('start_line_no') or 0) > line_no:
             return []
-        registry_effects = _rdps_registry_zone_effects(record, registry_entry)
-        for registry_effect in registry_effects:
-            registry_bb_key = str(registry_effect.get("bb_key") or registry_effect.get("_registry_bb_key") or "")
-            for semantic_effect in semantic_condition_effects:
-                if (
-                    registry_bb_key
-                    and registry_bb_key == str(semantic_effect.get("bb_key") or "")
-                    and str(registry_effect.get("zone") or "") == str(semantic_effect.get("zone") or "")
-                    and _normalize_effect_element(registry_effect.get("element"))
-                    == _normalize_effect_element(semantic_effect.get("element"))
-                    and isinstance(semantic_effect.get("condition"), dict)
-                ):
-                    registry_effect["bb_key"] = registry_bb_key
-                    registry_effect["condition"] = dict(semantic_effect["condition"])
-                    if semantic_effect.get("semantic_source"):
-                        registry_effect["semantic_source"] = semantic_effect.get("semantic_source")
-        for registry_effect in registry_effects:
-            registry_effect.pop("_registry_bb_key", None)
-        if registry_entry.get("dynamic"):
+        if end == hit_ts_ms and window.get('end_line_no') and line_no >= int(window['end_line_no']):
             return []
-        return registry_effects
-
-    semantic_bb_keys = {
-        str(effect.get("bb_key") or "")
-        for effect in semantic_condition_effects
-        if str(effect.get("bb_key") or "")
-    }
-    packet_effects = [
-        effect
-        for effect in _packet_numeric_effects(record)
-        if not (str(effect.get("bb_key") or "") and str(effect.get("bb_key") or "") in semantic_bb_keys)
-    ]
-    target_is_enemy = bool(record.get("target_enemy_key"))
-    bb_values = {str(key): value for key, value in (record.get("bb_values") or {}).items()}
-    effects: list[dict[str, Any]] = list(packet_effects)
-    effects.extend(semantic_condition_effects)
-    covered_bb_keys: set[str] = set()
-    for effect in packet_effects:
-        bb_key = str(effect.get("bb_key") or "")
-        if bb_key:
-            covered_bb_keys.add(bb_key)
-    for effect in effects:
-        if effect.get("condition"):
-            bb_key = str(effect.get("bb_key") or "")
-            if bb_key:
-                covered_bb_keys.add(bb_key)
-    for effect in _packet_numeric_dynamic_effects(record):
-        for key_name in ("bb_key", "add_bb_key", "delay_bb_key"):
-            bb_key = str(effect.get(key_name) or "")
-            if bb_key:
-                covered_bb_keys.add(bb_key)
-
-    for attr_mod in record.get("attr_mods") or []:
-        bb_key = str(attr_mod.get("bb_key") or "")
-        if bb_key and bb_key in semantic_bb_keys:
-            covered_bb_keys.add(bb_key)
-            continue
-        if _buff_effect_bb_key_ignored(buff_id, bb_key):
-            continue
-        if bb_key:
-            covered_bb_keys.add(bb_key)
-        try:
-            attr_type_int = int(attr_mod.get("attr_type"))
-        except (TypeError, ValueError):
-            attr_type_int = None
-        attr_zone = None
-        attr_element = None
-        if bb_key in _DEF_DECREASE_BASE_KEYS and attr_type_int is not None:
-            attr_zone, attr_element = _DEF_DECREASE_ATTR_TYPE_TO_EFFECT.get(attr_type_int, (None, None))
-        elif attr_type_int is not None and attr_type_int in _ATTR_TYPE_TO_EFFECT:
-            attr_zone, attr_element = _ATTR_TYPE_TO_EFFECT[attr_type_int]
-        elif attr_type_int in _FRAGILE_ATTR_TYPES:
-            attr_zone, attr_element = "fragile", "all"
-        zone = None
-        element = None
-        if _is_damage_increase_bb_key(bb_key):
-            zone = "dmg_inc"
-            element = _damage_increase_element_from_bb_key(bb_key) or attr_element
-        elif attr_zone is not None:
-            zone, element = attr_zone, attr_element
-        elif attr_type_int is not None:
-            continue
-        elif bb_key:
-            label = _label_from_bb_key(bb_key, buff_id=buff_id, target_is_enemy=target_is_enemy)
-            zone = _zone_from_label(label or "")
-            element = _element_from_text(bb_key)
-            if element is None and label:
-                label_elements = _elements_from_text(label)
-                if label_elements:
-                    element = label_elements[0]
-            if (
-                element is None
-                and bb_key.lower() == "rate"
-                and (
-                    "enhance_" in buff_id.lower()
-                    or "vulnerable" in buff_id.lower()
-                    or "fragile" in buff_id.lower()
-                )
-            ):
-                element = _element_from_text(buff_id)
-        if zone is None:
-            continue
-
-        rate = None
-        uses_runtime_bb_key = bb_key and str(attr_mod.get("use_key") or "0") == "1"
-        if uses_runtime_bb_key:
-            rate = _safe_positive_rate(bb_values.get(bb_key))
-            if rate is None and bb_values:
-                # This instance carried runtime BB data, but not for the key the modifier says to use.
-                # Treat that as a non-effect wrapper/refresh row instead of falling back to the template rate.
-                continue
-        if rate is None:
-            rate = _safe_positive_rate(attr_mod.get("value"))
-        if rate is None and bb_key:
-            rate = _safe_positive_rate(bb_values.get(bb_key))
-        if rate is None:
-            continue
-        if bb_key.startswith("final_"):
-            covered_bb_keys.add(bb_key.removeprefix("final_"))
-        effect = {"zone": zone, "element": _normalize_effect_element(element), "rate": rate}
-        if attr_type_int is not None:
-            effect["attr_type"] = attr_type_int
-        if bb_key:
-            effect["bb_key"] = bb_key
-            _attach_bb_key_damage_type_condition(effect, bb_key)
-        effects.append(effect)
-
-    bb_value_keys = {str(key).lower() for key in bb_values}
-    for bb_key, raw_value in bb_values.items():
-        if bb_key in covered_bb_keys:
-            continue
-        final_override_key = _FINAL_BB_KEY_OVERRIDES.get(bb_key.lower())
-        if final_override_key and final_override_key in bb_value_keys:
-            continue
-        if _buff_effect_bb_key_ignored(buff_id, bb_key):
-            continue
-        label = _label_from_bb_key(bb_key, buff_id=buff_id, target_is_enemy=target_is_enemy)
-        zone = _zone_from_label(label or "")
-        element = _damage_increase_element_from_bb_key(bb_key) if zone == "dmg_inc" else _element_from_text(bb_key)
-        if element is None and label:
-            label_elements = _elements_from_text(label)
-            if label_elements:
-                element = label_elements[0]
-        if (
-            element is None
-            and bb_key.lower() == "rate"
-            and (
-                "enhance_" in buff_id.lower()
-                or "vulnerable" in buff_id.lower()
-                or "fragile" in buff_id.lower()
-            )
-        ):
-            element = _element_from_text(buff_id)
-        element = _normalize_effect_element(element)
-        rate = _safe_positive_rate(raw_value)
-        if zone is None or rate is None:
-            continue
-        effect = {"zone": zone, "element": element, "rate": rate}
-        _attach_bb_key_damage_type_condition(effect, bb_key)
-        effects.append(effect)
-
-    deduped: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, float, str]] = set()
-    for effect in effects:
-        condition_marker = ""
-        if isinstance(effect.get("condition"), dict):
-            condition_marker = json.dumps(effect["condition"], ensure_ascii=False, sort_keys=True)
-        key = (
-            str(effect["zone"]),
-            str(effect["element"]),
-            round(float(effect["rate"]), 6),
-            condition_marker,
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(effect)
-    return deduped
-
-
-def _extract_dynamic_effect_specs(record: dict[str, Any]) -> list[dict[str, Any]]:
-    buff_id = _normalize_buff_id(record.get("event_key"))
-    if (
-        _rdps_registry_suppresses_zone_effects(record)
-        or _is_noise_buff(buff_id)
-        or _should_ignore_rate_buff(buff_id)
-        or _should_ignore_record_rate_effects(record)
-        or _is_effectless_wrapper_record(record)
-        or record.get("packet_mapping_rejected")
-    ):
+    elif (window.get('snapshot_update') and start == hit_ts_ms
+          or window.get('snapshot_end_ts_ms') == hit_ts_ms):
+        window['rdps_snapshot_order_unresolved'] = True
+        window['_effect_state_unresolved_at_hit'] = True
         return []
-
-    packet_dynamic_effects = _packet_numeric_dynamic_effects(record)
-    if any(effect.get("dynamic_key") == "def_decrease" for effect in packet_dynamic_effects):
-        return packet_dynamic_effects
-    bb_values = {str(key): value for key, value in (record.get("bb_values") or {}).items()}
-    tick_rate = _safe_positive_rate(bb_values.get("def_decrease_tick_final"))
-    if tick_rate is None:
-        tick_rate = _safe_positive_rate(bb_values.get("def_decrease_tick"))
-    max_rate = _safe_positive_rate(bb_values.get("max_def_decrease")) or 0.0
-    if tick_rate is None and max_rate <= 0:
-        return packet_dynamic_effects
-
-    dynamic_specs: dict[tuple[str, str], dict[str, Any]] = {}
-    for attr_mod in record.get("attr_mods") or []:
-        bb_key = str(attr_mod.get("bb_key") or "")
-        if bb_key not in _DEF_DECREASE_BASE_KEYS:
-            continue
-        try:
-            attr_type_int = int(attr_mod.get("attr_type"))
-        except (TypeError, ValueError):
-            continue
-        mapping = _DEF_DECREASE_ATTR_TYPE_TO_EFFECT.get(attr_type_int)
-        if mapping is None:
-            continue
-        zone, element = mapping
-        base_rate = _safe_positive_rate(bb_values.get(bb_key))
-        if base_rate is None:
-            base_rate = _safe_positive_rate(attr_mod.get("value")) or 0.0
-        spec = dynamic_specs.setdefault(
-            (zone, element),
-            {
-                "zone": zone,
-                "element": element,
-                "base_rate": 0.0,
-                "tick_rate": (tick_rate or 0.0) * _DEF_DECREASE_TICKS_PER_SEC,
-                "max_rate": max_rate,
-            },
-        )
-        spec["base_rate"] += base_rate
-
-    if not dynamic_specs and record.get("target_enemy_key"):
-        base_rate = _safe_positive_rate(bb_values.get("def_decrease"))
-        if base_rate is None:
-            base_rate = _safe_positive_rate(bb_values.get("start_def_decrease")) or 0.0
-        if base_rate > 0 or tick_rate is not None:
-            dynamic_specs[("res", "all")] = {
-                "zone": "res",
-                "element": "all",
-                "base_rate": base_rate,
-                "tick_rate": (tick_rate or 0.0) * _DEF_DECREASE_TICKS_PER_SEC,
-                "max_rate": max_rate,
-            }
-
-    return packet_dynamic_effects + list(dynamic_specs.values())
-
-
-def _window_effects_at_ts(window: dict[str, Any], hit_ts_ms: int) -> list[dict[str, Any]]:
+    observations = window.get('enable_observations') or []
+    if window.get('rdps_conflicting_enable_state') and not observations:
+        window['_effect_state_unresolved_at_hit'] = True
+        return []
+    prior = []
+    if observations:
+        if type(packet_seq_id) is int:
+            prior = [row for row in observations if row['operationSeq'] <= packet_seq_id]
+            prior.sort(key=lambda row: (row['operationSeq'], row['line_no']))
+        else:
+            prior = [row for row in observations if row['ts_ms'] < hit_ts_ms or
+                     row['ts_ms'] == hit_ts_ms and (not line_no or row['line_no'] <= line_no)]
+            prior.sort(key=lambda row: (row['ts_ms'], row['line_no']))
+        if prior:
+            latest = prior[-1]
+            values = {row['enabled'] for row in observations if row['operationSeq'] == latest['operationSeq']}
+            if len(values) != 1:
+                window['_effect_state_unresolved_at_hit'] = True
+                return []
+            if latest['enabled'] is False:
+                window['_buff_enabled_at_hit'] = False
+                return []
+    if window.get('requires_enable_observation') and not prior:
+        window['_enable_state_unobserved_at_hit'] = True
+        window['_effect_state_unresolved_at_hit'] = True
+        window['rdps_unresolved_enable_evidence'] = True
+        return []
+    window['_buff_enabled_at_hit'] = True
     dynamic_specs = list(window.get("dynamic_effects") or [])
     if not dynamic_specs:
         return list(window.get("zone_effects") or [])
 
-    elapsed_sec = max(0.0, (hit_ts_ms - int(window["start_ts_ms"])) / 1000.0)
     effects: list[dict[str, Any]] = []
     for spec in dynamic_specs:
-        rate = max(0.0, float(spec.get("base_rate") or 0.0))
-        rate += elapsed_sec * max(0.0, float(spec.get("tick_rate") or 0.0))
-        if elapsed_sec >= max(0.0, float(spec.get("delay_sec") or 0.0)):
-            rate += max(0.0, float(spec.get("delayed_add_rate") or 0.0))
-        max_rate = max(0.0, float(spec.get("max_rate") or 0.0))
-        if max_rate > 0:
-            rate = min(rate, max_rate)
-        if rate <= 0.001:
+        if 'keyword_rate_snapshots' in spec:
+            if ((packet_session_id is not None and packet_session_id != spec.get('keyword_session_id'))
+                    or type(packet_seq_id) is int and packet_session_id is None):
+                window['_effect_state_unresolved_at_hit'] = True
+                return []
+            prior = [row for row in spec['keyword_rate_snapshots']
+                     if row.get('session_id') == spec.get('keyword_session_id')
+                     and ((type(packet_seq_id) is int and row['operation_seq'] <= packet_seq_id)
+                          or packet_seq_id is None and (row['ts_ms'] < hit_ts_ms or
+                              row['ts_ms'] == hit_ts_ms and line_no and row['line_no'] <= line_no))]
+            rate = _coerce_optional_float(spec.get('base_rate'))
+            if prior:
+                latest = max(prior, key=lambda row: (row['operation_seq'], row['line_no']))
+                rate = (_coerce_optional_float(latest.get('rate_after'))
+                        if latest.get('status') == 'observed' else None)
+            if rate is None or rate < 0:
+                window['_effect_state_unresolved_at_hit'] = True
+                return []
+            if rate > 0:
+                effect = {key: copy.deepcopy(spec[key]) for key in
+                          ('zone', 'element', 'condition', 'external_rdps_allowed', 'rdps_whitelist_keys', 'keyword_origin')
+                          if key in spec}
+                effect['rate'] = rate
+                effects.append(effect)
             continue
-        effects.append(
-            {
+        if 'parameter_snapshots' in spec:
+            prior = [row for row in spec['parameter_snapshots']
+                     if (type(packet_seq_id) is int and type(row.get('operation_seq')) is int
+                         and row['operation_seq'] <= packet_seq_id)
+                     or (packet_seq_id is None and (row['ts_ms'] < hit_ts_ms or
+                         row['ts_ms'] == hit_ts_ms and line_no and row['line_no'] <= line_no))]
+            if not prior:
+                window['_effect_state_unresolved_at_hit'] = True
+                return []
+            snapshot = max(prior, key=lambda row: (row['operation_seq'], row['line_no']))
+            snapshot_session = snapshot.get('session_id') or (snapshot.get('identity') or {}).get('sessionId')
+            if packet_session_id is not None and snapshot_session is not None and packet_session_id != snapshot_session:
+                window['_effect_state_unresolved_at_hit'] = True
+                return []
+            values = [_coerce_optional_float((snapshot.get('bb_values') or {}).get(key))
+                      for key in spec['parameter_keys']]
+            if (snapshot.get('status') != 'attribute_parameters_observed'
+                    or not values or any(value is None or value > 0 for value in values)):
+                window['_effect_state_unresolved_at_hit'] = True
+                return []
+            rate = -sum(values)
+            if not isfinite(rate):
+                window['_effect_state_unresolved_at_hit'] = True
+                return []
+            if rate > 0:
+                effects.append({'zone': 'res', 'element': spec['element'], 'rate': rate,
+                                'external_rdps_allowed': spec['external_rdps_allowed'],
+                                'rdps_whitelist_keys': list(spec['rdps_whitelist_keys']),
+                                'resistance_point_source': 'packet_bb_update_and_refresh',
+                                'resistance_snapshot_seq': snapshot['operation_seq']})
+            continue
+        if (spec.get("observed_points")
+                and spec.get("observed_points_source") != "typed_runtime_dynamic_action"):
+            window["rdps_invalid_dynamic_evaluation"] = True
+            return []
+        if float(spec.get("tick_rate") or 0.0) != 0.0:
+            window["rdps_invalid_dynamic_evaluation"] = True
+            return []
+        if float(spec.get("delayed_add_rate") or 0.0) != 0.0:
+            window["rdps_invalid_dynamic_evaluation"] = True
+            return []
+        rate = float(spec.get("base_rate") or 0.0)
+        if spec.get("observed_points"):
+            earlier = [point for point in spec["observed_points"]
+                       if isinstance(point, (list, tuple)) and len(point) == 2
+                       and int(point[0]) <= hit_ts_ms]
+            if not earlier:
+                continue
+            rate = max(0.0, float(earlier[-1][1]))
+        if not isfinite(rate):
+            window["rdps_invalid_dynamic_evaluation"] = True
+            return []
+        if rate <= 0:
+            continue
+        effect = {
                 "zone": str(spec["zone"]),
                 "element": _normalize_effect_element(spec.get("element")),
                 "rate": rate,
             }
-        )
+        if "condition" in spec:
+            effect["condition"] = copy.deepcopy(spec["condition"])
+        for key in ('external_rdps_allowed', 'rdps_whitelist_keys'):
+            if key in spec:
+                effect[key] = copy.deepcopy(spec[key])
+        effects.append(effect)
     return effects
 
 
@@ -8743,7 +8737,24 @@ def _effect_summary_rows(effects: list[dict[str, Any]]) -> list[str]:
         except (TypeError, ValueError):
             base_rate = None
         label = _EFFECT_ZONE_LABELS.get(zone, zone)
-        if base_rate is None:
+        if 'keyword_rate_snapshots' in effect:
+            rates = [base_rate]
+            for snapshot in sorted(effect['keyword_rate_snapshots'],
+                                   key=lambda row: (row['operation_seq'], row['line_no'])):
+                if snapshot.get('session_id') != effect.get('keyword_session_id'):
+                    continue
+                snapshot_rate = (_coerce_optional_float(snapshot.get('rate_after'))
+                                 if snapshot.get('status') == 'observed' else None)
+                if snapshot_rate != rates[-1]:
+                    rates.append(snapshot_rate)
+            rate_text = ' -> '.join(f'{value * 100:.2f}%' if value is not None else '未确认'
+                                    for value in rates)
+            row_text = f"{label}/{element} {rate_text}"
+        elif zone == 'res' and 'parameter_snapshots' in effect:
+            row_text = f"{label}/{element} 按包内实际减抗点数更新"
+        elif zone == 'res' and base_rate is not None:
+            row_text = f"{label}/{element} {base_rate:g} 点"
+        elif base_rate is None:
             row_text = f"{label}/{element} -"
         else:
             delayed_add_rate = _safe_positive_rate(effect.get("delayed_add_rate")) or 0.0
@@ -8763,10 +8774,14 @@ def _effect_summary_rows(effects: list[dict[str, Any]]) -> list[str]:
             else:
                 row_text = f"{label}/{element} {base_rate * 100:.2f}%"
         condition = effect.get("condition")
-        if isinstance(condition, dict) and str(condition.get("type") or "") == "target_hp_ratio_lte":
-            threshold = _safe_positive_rate(condition.get("threshold"))
+        if isinstance(condition, dict) and str(condition.get("type") or "") in {"target_hp_ratio_lte", "target_hp_compare"}:
+            threshold = _coerce_optional_float(condition.get("threshold"))
             if threshold is not None:
-                row_text = f"{row_text} (target HP <= {threshold * 100:.2f}%)"
+                legacy = condition.get("type") == "target_hp_ratio_lte"
+                compare = "LE" if legacy else condition.get("compare")
+                operator = {"LT": "<", "LE": "<=", "GT": ">", "GE": ">=", "EQ": "=", "NE": "!="}.get(compare, "?")
+                value = f"{threshold * 100:.2f}%" if legacy or condition.get("is_ratio") is True else str(threshold)
+                row_text = f"{row_text} (target HP {operator} {value})"
         elif isinstance(condition, dict) and str(condition.get("type") or "") == "damage_type_in":
             elements = [str(item) for item in condition.get("elements") or [] if str(item or "")]
             if elements:
@@ -8800,6 +8815,55 @@ def _effect_segments_for_event(
             }
         )
     for effect in dynamic_effects:
+        if 'keyword_rate_snapshots' in effect:
+            states = [{'ts_ms': start_ts_ms, 'rate_after': effect.get('base_rate'),
+                       'status': 'observed', 'operation_seq': None, 'line_no': None}]
+            latest_seq = -1
+            for snapshot in sorted(effect['keyword_rate_snapshots'],
+                                   key=lambda row: (row['ts_ms'], row['line_no'], row['operation_seq'])):
+                if (snapshot.get('session_id') != effect.get('keyword_session_id')
+                        or snapshot['ts_ms'] > end_ts_ms
+                        or snapshot['operation_seq'] < latest_seq):
+                    continue
+                latest_seq = snapshot['operation_seq']
+                states.append(snapshot)
+            for index, state in enumerate(states):
+                following = states[index + 1] if index + 1 < len(states) else None
+                segment_start = max(start_ts_ms, state['ts_ms'])
+                segment_end = min(end_ts_ms, following['ts_ms'] if following else end_ts_ms)
+                if segment_end < segment_start:
+                    continue
+                rate = (_coerce_optional_float(state.get('rate_after'))
+                        if state.get('status') == 'observed' else None)
+                # Equal timestamps still have an explicit packet/line boundary;
+                # retain it instead of making the earlier operation disappear.
+                segments.append({'start_ts_ms': segment_start, 'start_time': _ms_time_text(segment_start),
+                                 'end_ts_ms': segment_end, 'end_time': _ms_time_text(segment_end),
+                                 'zone': str(effect.get('zone') or ''),
+                                 'element': _normalize_effect_element(effect.get('element')),
+                                 'rate': rate, 'mode': 'packet_keyword_update',
+                                 'operation_seq': state['operation_seq'], 'line_no': state['line_no'],
+                                 'end_operation_seq': following['operation_seq'] if following else None,
+                                 'end_line_no': following['line_no'] if following else None,
+                                 'session_id': effect.get('keyword_session_id')})
+            continue
+        if 'parameter_snapshots' in effect:
+            snapshots = effect['parameter_snapshots']
+            for index, snapshot in enumerate(snapshots):
+                values = [_coerce_optional_float((snapshot.get('bb_values') or {}).get(key))
+                          for key in effect['parameter_keys']]
+                resolved = (snapshot.get('status') == 'attribute_parameters_observed'
+                            and values and all(value is not None and value <= 0 for value in values))
+                start = max(start_ts_ms, snapshot['ts_ms'])
+                end = min(end_ts_ms, snapshots[index + 1]['ts_ms'] if index + 1 < len(snapshots) else end_ts_ms)
+                if end >= start:
+                    segments.append({'start_ts_ms': start, 'start_time': _ms_time_text(start),
+                                     'end_ts_ms': end, 'end_time': _ms_time_text(end),
+                                     'zone': 'res', 'element': effect['element'],
+                                     'rate': -sum(values) if resolved else None,
+                                     'rate_unit': 'resistance_points', 'mode': 'packet_refresh',
+                                     'operation_seq': snapshot['operation_seq']})
+            continue
         base_rate = float(effect.get("base_rate") or 0.0)
         delayed_add_rate = float(effect.get("delayed_add_rate") or 0.0)
         delay_ms = int(max(0.0, float(effect.get("delay_sec") or 0.0)) * 1000)
@@ -8807,6 +8871,30 @@ def _effect_segments_for_event(
         max_rate = float(effect.get("max_rate") or 0.0)
         zone = str(effect.get("zone") or "")
         element = _normalize_effect_element(effect.get("element"))
+        observed_points = [
+            (int(point[0]), float(point[1]))
+            for point in (effect.get("observed_points") or [])
+            if isinstance(point, (list, tuple)) and len(point) == 2
+        ]
+        if observed_points:
+            for index, (point_ts, point_rate) in enumerate(observed_points):
+                segment_start = max(start_ts_ms, point_ts)
+                segment_end = (observed_points[index + 1][0]
+                               if index + 1 < len(observed_points)
+                               else end_ts_ms)
+                if segment_end <= segment_start:
+                    continue
+                segments.append({
+                    "start_ts_ms": segment_start,
+                    "start_time": _ms_time_text(segment_start),
+                    "end_ts_ms": min(segment_end, end_ts_ms),
+                    "end_time": _ms_time_text(min(segment_end, end_ts_ms)),
+                    "zone": zone,
+                    "element": element,
+                    "rate": point_rate,
+                    "mode": "dynamic_observed",
+                })
+            continue
         if delayed_add_rate > 0 and delay_ms > 0 and start_ts_ms + delay_ms < end_ts_ms:
             segments.append(
                 {
@@ -8869,22 +8957,17 @@ def _build_buff_events(
     *,
     battle_start_ms: int,
     battle_end_ms: int,
+    root_lookup_cache: dict | None = None,
 ) -> list[dict[str, Any]]:
     included_identities = {_buff_window_identity(window) for window in buff_windows}
     events: list[dict[str, Any]] = []
     for record in buff_starts:
         start_ts_ms = int(record.get("ts_ms") or 0)
-        duration_ms = _normalize_buff_duration_ms(
-            start_ts_ms,
-            event_key=record.get("event_key"),
-            end_ts_ms=record.get("end_ts_ms"),
-            raw_duration_ms=record.get("raw_duration_ms"),
-            battle_end_ms=battle_end_ms,
-        )
-        end_ts_ms = start_ts_ms + duration_ms
-        labels = _collect_buff_labels(record)
-        zone_effects = _collect_zone_effects(record)
-        dynamic_effects = _extract_dynamic_effect_specs(record)
+        end_ts_ms = _buff_record_end_ts_ms(record, battle_end_ms)
+        duration_ms = max(0, end_ts_ms - start_ts_ms)
+        labels = _collect_buff_labels(record, root_lookup_cache=root_lookup_cache)
+        zone_effects = _collect_zone_effects(record, root_lookup_cache=root_lookup_cache)
+        dynamic_effects = _extract_dynamic_effect_specs(record, root_lookup_cache=root_lookup_cache)
         has_effects = bool(zone_effects or dynamic_effects)
         identity = _buff_window_identity(
             {
@@ -8908,6 +8991,11 @@ def _build_buff_events(
                 "raw_event_key": record.get("raw_event_key"),
                 "event_name": " / ".join(labels) if labels else record.get("event_key"),
                 "packet_mapping": record.get("packet_mapping"),
+                "origin_observations": copy.deepcopy(record.get('origin_observations') or []),
+                "enable_observations": copy.deepcopy(record.get('enable_observations') or []),
+                "creation_observations": copy.deepcopy(record.get('creation_observations') or []),
+                "repeated_creation_observations": copy.deepcopy(record.get('repeated_creation_observations') or []),
+                "attribute_refresh_snapshots": copy.deepcopy(record.get('attribute_refresh_snapshots') or []),
                 "packet_classification": packet_classification,
                 "semantic_candidates": _packet_buff_semantic_candidates(record),
                 "source_character_key": record.get("source_character_key"),
@@ -8920,6 +9008,9 @@ def _build_buff_events(
                 "target_player_key": record.get("target_character_key"),
                 "target_enemy_key": record.get("target_enemy_key"),
                 "owner_raw": record.get("owner_raw"),
+                "target_actor_id": record.get("target_actor_id"),
+                "source_actor_id": record.get("source_actor_id"),
+                "source_weapon_template": record.get("source_weapon_template"),
                 "start_ts_ms": start_ts_ms,
                 "start_time": _ms_time_text(start_ts_ms),
                 "end_ts_ms": end_ts_ms,
@@ -8928,9 +9019,19 @@ def _build_buff_events(
                 "end_ms_from_battle": end_ts_ms - battle_start_ms,
                 "duration_ms": duration_ms,
                 "raw_end_ts_ms": record.get("end_ts_ms"),
+                "snapshot_end_ts_ms": record.get('snapshot_end_ts_ms'),
+                "snapshot_end_line_no": record.get('snapshot_end_line_no'),
+                "snapshot_update": bool(record.get('snapshot_update')),
+                "instance_start_line_no": record.get('instance_start_line_no'),
                 "raw_end_time": _ms_time_text(record.get("end_ts_ms")) if record.get("end_ts_ms") is not None else None,
                 "raw_duration_ms": record.get("raw_duration_ms"),
+                "lifetime_mode": record.get('lifetime_mode'),
+                "lifetime_source": record.get('lifetime_source'),
+                "end_is_observation_boundary": record.get('end_ts_ms') is None and record.get('snapshot_end_ts_ms') is None and record.get('lifetime_mode') == 'Infinity',
+                "end_source": ('snapshot_update' if record.get('snapshot_end_ts_ms') == end_ts_ms else
+                               'buff_end' if record.get('end_ts_ms') == end_ts_ms else 'duration_or_capture_boundary'),
                 "overlaps_battle": end_ts_ms >= battle_start_ms and start_ts_ms <= battle_end_ms,
+                "dynamic_bb_events": list(record.get("dynamic_bb_events") or []),
                 "bb_keys": sorted(set(str(key) for key in record.get("bb_keys") or [])),
                 "bb_values": dict(record.get("bb_values") or {}),
                 "attr_types": list(record.get("attr_types") or []),
@@ -8950,19 +9051,19 @@ def _build_buff_events(
     return sorted(events, key=lambda item: (int(item.get("start_ts_ms") or 0), int(item.get("line_no") or 0)))
 
 
-def _build_buff_record_index(buff_starts: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
-    index: dict[str, dict[str, Any]] = {}
+def _build_buff_record_index(buff_starts: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    index: dict[str, list[dict[str, Any]]] = {}
     for record in buff_starts:
         uid = str(record.get("uid") or "")
         if uid:
-            index[uid] = record
+            index.setdefault(uid, []).append(record)
     return index
 
 
 def _record_could_affect_external_rdps(record: dict[str, Any]) -> bool:
     source_key = str(record.get("source_character_key") or "")
     if not source_key.startswith("chr_"):
-        return False
+        return bool(record.get("target_enemy_key") or record.get("target_character_key"))
     target_enemy_key = str(record.get("target_enemy_key") or "")
     if target_enemy_key.startswith("eny_"):
         return True
@@ -8972,6 +9073,10 @@ def _record_could_affect_external_rdps(record: dict[str, Any]) -> bool:
 
 def _record_overlaps_window(record: dict[str, Any], *, battle_start_ms: int, battle_end_ms: int) -> bool:
     start_ts_ms = int(record.get("ts_ms") or 0)
+    if record.get('snapshot_end_ts_ms') is not None and int(record['snapshot_end_ts_ms']) < battle_start_ms:
+        return False
+    if record.get("end_ts_ms") is None and record.get("raw_duration_ms") is None:
+        return start_ts_ms <= battle_end_ms
     duration_ms = _normalize_buff_duration_ms(
         start_ts_ms,
         event_key=record.get("event_key"),
@@ -8984,55 +9089,119 @@ def _record_overlaps_window(record: dict[str, Any], *, battle_start_ms: int, bat
 
 
 def _known_non_rdps_buff_record(record: dict[str, Any]) -> bool:
-    event_key = _normalize_buff_id(record.get("event_key"))
-    if _rdps_registry_known_non_rdps_entry(record) is not None:
-        return True
-    if _rdps_registry_verified_effect_entry(record) is not None:
-        return False
-    if _is_noise_buff(event_key) or _should_ignore_rate_buff(event_key):
-        return True
-    if _is_internal_trigger_damage_record(record):
-        return True
-    if _is_effectless_wrapper_record(record):
-        return True
-    classification = _classify_packet_buff_record(record)
-    return classification.get("class") in {"utility", "utility_or_marker", "marker", "wrapper"}
+    # A name, classifier label, or lack of decoded effects is not proof.
+    return _rdps_registry_known_non_rdps_entry(record) is not None
 
 
 def _build_rdps_preflight(
     buff_starts: list[dict[str, Any]],
     buff_windows: list[dict[str, Any]],
     *,
+    hits: list[dict[str, Any]] | None = None,
+    unresolved_hits: list[dict[str, Any]] | None = None,
+    unresolved_buff_actions: list[dict[str, Any]] | None = None,
     battle_start_ms: int,
     battle_end_ms: int,
     active_character_keys: set[str] | None = None,
+    root_lookup_cache: dict | None = None,
 ) -> dict[str, Any]:
     included_uids: set[str] = set()
     for window in buff_windows:
         included_uids.update(_window_uid_aliases(window))
     blockers: list[dict[str, Any]] = []
+    for row in unresolved_buff_actions or []:
+        if row.get("uid_observation_only"):
+            continue
+        if _record_overlaps_window(row, battle_start_ms=battle_start_ms, battle_end_ms=battle_end_ms):
+            blockers.append(dict(row))
+    for window in buff_windows:
+        if window.get("rdps_invalid_dynamic_evaluation"):
+            blockers.append({"uid": window.get("uid"), "reason": "invalid_dynamic_evaluation"})
+        if window.get('rdps_unresolved_stack_evidence'):
+            blockers.append({'uid': window.get('uid'), 'event_key': window.get('event_key'),
+                             'reason': 'unresolved_stack_evidence'})
+        if window.get('rdps_unresolved_enable_evidence'):
+            blockers.append({'uid': window.get('uid'), 'event_key': window.get('event_key'),
+                             'reason': 'unobserved_initial_buff_enable_state'})
+        if window.get('rdps_snapshot_order_unresolved'):
+            blockers.append({'uid': window.get('uid'), 'reason': 'unresolved_buff_snapshot_order'})
+    for row in unresolved_hits or []:
+        if battle_start_ms <= int(row.get("ts_ms") or 0) <= battle_end_ms:
+            blockers.append(dict(row))
+    for hit in hits or []:
+        missing = []
+        dpd = hit.get('dpd_raw')
+        if isinstance(dpd, dict) and any(
+                value is None for side in ('atk_zones', 'def_zones') for value in dpd.get(side) or []):
+            blockers.append({'seq': hit.get('seq'), 'reason': 'invalid_dpd_bucket_evidence'})
+        if not hit.get("damage_element") or hit.get("damage_element_source") != "official_action_unit":
+            missing.append("damage_action_unit")
+        if not hit.get("damage_school"):
+            missing.append("damage_school")
+        if not hit.get("target_enemy_key") or hit.get("target_enemy_key") == UNKNOWN_ENEMY_KEY:
+            missing.append("target_identity")
+        if hit.get("packet_hit_value") is None:
+            missing.append("packet_hp_loss")
+        if missing:
+            blockers.append({"seq": hit.get("seq"), "line_no": hit.get("line_no"),
+                             "reason": "unresolved_hit_evidence", "missing": missing})
+        if hit.get("rdps_unresolved_effect_conditions"):
+            blockers.append({"seq": hit.get("seq"), "line_no": hit.get("line_no"),
+                             "reason": "unresolved_effect_condition"})
+        if hit.get('rdps_unresolved_whitelist_effect'):
+            blockers.append({'seq': hit.get('seq'), 'reason': 'external_effect_not_whitelisted'})
+        if hit.get('rdps_unresolved_static_multiplier_sources'):
+            blockers.append({'seq': hit.get('seq'), 'reason': 'unresolved_static_multiplier_source',
+                             'sources': hit['rdps_unresolved_static_multiplier_sources']})
+        if hit.get("rdps_unresolved_target_binding"):
+            blockers.append({"seq": hit.get("seq"), "reason": "unresolved_effect_target_instance"})
+        if hit.get("rdps_unresolved_attacker_binding"):
+            blockers.append({"seq": hit.get("seq"), "reason": "unresolved_attacker_stats_binding"})
+        if hit.get("rdps_unresolved_dpd_residual"):
+            blockers.append({
+                "seq": hit.get("seq"),
+                "line_no": hit.get("line_no"),
+                "reason": "DPD residual has no authoritative attribution",
+            })
     checked_external = 0
     accepted_effects = 0
     accepted_non_rdps = 0
     for record in buff_starts:
+        if record.get("uid_observation_only"):
+            continue
         if not _record_overlaps_window(record, battle_start_ms=battle_start_ms, battle_end_ms=battle_end_ms):
+            continue
+        proven_non_rdps = _rdps_registry_known_non_rdps_entry(record)
+        if (isinstance(proven_non_rdps, dict)
+                and proven_non_rdps.get("proof_kind") == "typed_root_structural"):
+            record.pop("rdps_unresolved_semantic_condition", None)
+            accepted_non_rdps += 1
+            continue
+        # The gate must evaluate semantics itself. UI label/window building
+        # is not a prerequisite for detecting unresolved own multipliers.
+        zone_effects = _collect_zone_effects(record, root_lookup_cache=root_lookup_cache)
+        dynamic_effects = _extract_dynamic_effect_specs(record, root_lookup_cache=root_lookup_cache)
+        if (record.get("end_ts_ms") is None and record.get("raw_duration_ms") is None
+                and record.get('lifetime_mode') != 'Infinity'
+                and _rdps_registry_verified_effect_entry(record, root_lookup_cache=root_lookup_cache) is not None):
+            blockers.append({"uid": record.get("uid"), "event_key": record.get("event_key"),
+                             "reason": "unresolved_buff_lifecycle"})
+            continue
+        if record.get("rdps_unresolved_semantic_condition"):
+            blockers.append({"uid": record.get("uid"), "event_key": record.get("event_key"),
+                             "reason": "unresolved_semantic_condition",
+                             "condition_errors": record["rdps_unresolved_semantic_condition"]})
             continue
         if not _record_could_affect_external_rdps(record):
             continue
         source_key = str(record.get("source_character_key") or "")
-        if active_character_keys and source_key.startswith("chr_") and source_key not in active_character_keys:
-            continue
         checked_external += 1
         uid = str(record.get("uid") or "")
-        zone_effects = _collect_zone_effects(record)
-        dynamic_effects = _extract_dynamic_effect_specs(record)
         has_effect = bool(zone_effects or dynamic_effects)
         included = bool(uid and uid in included_uids)
         classification = _classify_packet_buff_record(record)
-        verified_entry = _rdps_registry_verified_effect_entry(record)
+        verified_entry = _rdps_registry_verified_effect_entry(record, root_lookup_cache=root_lookup_cache)
         if verified_entry is not None:
-            if not has_effect and not _record_bb_key_set(record):
-                continue
             validation_error = _rdps_registry_validation_error(verified_entry, record)
             if validation_error is not None:
                 blockers.append(
@@ -9133,7 +9302,11 @@ def _build_rdps_preflight(
         "accepted_effect_buff_count": accepted_effects,
         "accepted_non_rdps_buff_count": accepted_non_rdps,
         "blocker_count": len(blockers),
-        "blockers": blockers[:100],
+        "blocker_reason_counts": dict(Counter(str(row.get('reason') or 'unknown') for row in blockers)),
+        # Keep the complete blocker list for audit and replay tooling. The
+        # reason counts remain available for compact UI summaries, while
+        # truncating here hid the concrete records needed to close a gate.
+        "blockers": blockers,
     }
 
 
@@ -9144,6 +9317,25 @@ def _static_entry_applies_to_hit(entry: dict[str, Any], hit: dict[str, Any]) -> 
     rate = _safe_positive_rate(entry.get("rate"))
     if rate is None:
         return False
+    if entry.get('evidence_kind') in {'official_EquipTable_attribute', 'official_WeaponSkill_text_basic',
+                                    'current_official_item_skill_card_attribute'}:
+        # Captured final attributes already contain equipment additions.
+        # Preserve the typed evidence for display; do not add it twice.
+        attr_type = entry.get('attr_type')
+        baseline = hit.get('baseline') or {}
+        if attr_type != 2 and (attr_type in baseline or str(attr_type) in baseline):
+            observed = _coerce_optional_float(baseline.get(attr_type, baseline.get(str(attr_type))))
+            if observed is not None:
+                return False
+            hit['rdps_unresolved_effect_conditions'] = True
+        applies = _attr_type_applies_to_skill(attr_type, None,
+            damage_decorate_mask=hit.get('damage_decorate_mask'),
+            static_damage_decorate_mask=hit.get('static_damage_decorate_mask'),
+            static_damage_decorate_mask_source=hit.get('static_damage_decorate_mask_source'))
+        if applies is None:
+            hit['rdps_unresolved_effect_conditions'] = True
+        if applies is not True:
+            return False
     if not _effect_applies_to_damage_element(
         str(entry.get("element") or "all"),
         hit.get("damage_element"),
@@ -9154,20 +9346,15 @@ def _static_entry_applies_to_hit(entry: dict[str, Any], hit: dict[str, Any]) -> 
     skill_groups = {str(group or "") for group in entry.get("skill_groups") or [] if str(group or "")}
     if not skill_groups:
         return True
-    skill_key = str(hit.get("skill_key") or "").lower()
-    try:
-        group_type = int(hit.get("skill_group_type"))
-    except (TypeError, ValueError):
-        group_type = None
-    if "normal" in skill_groups and ("attack" in skill_key or "normal_attack" in skill_key):
-        return True
-    if "skill" in skill_groups and ("normal_skill" in skill_key or group_type == 1):
-        return True
-    if "combo" in skill_groups and ("combo" in skill_key or group_type == 3):
-        return True
-    if "ultimate" in skill_groups and ("ult" in skill_key or "ultimate" in skill_key or group_type == 2):
-        return True
-    return False
+    masks = {'normal': 0x20484, 'skill': 0x100, 'combo': 0x2000, 'ultimate': 0x200}
+    if not skill_groups.issubset(masks):
+        hit['rdps_unresolved_effect_conditions'] = True
+        return False
+    failure = _effect_condition_failure({'condition': {'type': 'damage_decorate_mask',
+        'check': 'HasAny', 'mask': sum(masks[group] for group in skill_groups)}}, hit)
+    if failure is not None and failure.get('reason_group') == 'condition_unobservable':
+        hit['rdps_unresolved_effect_conditions'] = True
+    return failure is None
 
 
 def _packet_modifier_guard_signature(effect: dict[str, Any]) -> tuple[Any, ...]:
@@ -9206,7 +9393,8 @@ def _matched_packet_defender_effect_signatures(
             continue
         if not (_window_uid_aliases(window) & defender_modifier_uids):
             continue
-        window_effects = _window_effects_at_ts(window, hit_ts_ms)
+        window_effects = _window_effects_at_ts(window, hit_ts_ms, line_no=int(hit.get('line_no') or 0),
+                                               packet_seq_id=hit.get('packet_seq_id'))
         if not window_effects:
             continue
         window_start_ts_ms = int(window.get("start_ts_ms") or 0)
@@ -9233,38 +9421,45 @@ def _matched_packet_defender_effect_signatures(
 def _active_target_buff_ids_for_hit(
     hit: dict[str, Any],
     condition_buff_records: list[dict[str, Any]] | None,
+    *, side: str = 'defender',
 ) -> set[str]:
-    target_key = str(hit.get("target_enemy_key") or "")
-    if not target_key or not condition_buff_records:
-        return set()
-    hit_ts_ms = int(hit.get("ts_ms") or 0)
-    hit_line_no = int(hit.get("line_no") or 0)
-    active: set[str] = set()
-    for record in condition_buff_records:
-        if str(record.get("target_enemy_key") or record.get("target_character_key") or "") != target_key:
+    target = str(hit.get('character_key' if side == 'attacker' else 'target_enemy_key') or '')
+    target_id = str(hit.get('source_actor_id' if side == 'attacker' else 'target_actor_id') or '')
+    stamp = int(hit.get("ts_ms") or 0)
+    line_no = int(hit.get("line_no") or 0)
+    packet_uids = {str(uid) for uid in (hit.get("packet_modifier_uids") or {}).get(side, [])}
+    active = set()
+    for record in condition_buff_records or []:
+        if str(record.get("target_enemy_key") or record.get("target_character_key") or "") != target:
             continue
-        try:
-            start_ts_ms = int(record.get("ts_ms") or 0)
-        except (TypeError, ValueError):
-            start_ts_ms = 0
-        if start_ts_ms > hit_ts_ms:
+        owner_id = str(record.get("target_actor_id") or "")
+        uid_seen = str(record.get("uid") or "") in packet_uids
+        if target_id and owner_id and target_id != owner_id:
             continue
-        try:
-            end_ts_ms = int(record.get("end_ts_ms")) if record.get("end_ts_ms") is not None else None
-        except (TypeError, ValueError):
-            end_ts_ms = None
-        if end_ts_ms is not None and hit_ts_ms > end_ts_ms:
+        if not (target_id and owner_id) and not uid_seen:
             continue
-        try:
-            start_line_no = int(record.get("line_no") or 0)
-        except (TypeError, ValueError):
-            start_line_no = 0
-        if start_ts_ms == hit_ts_ms and hit_line_no and start_line_no and start_line_no > hit_line_no:
+        start = _coerce_optional_int(record.get("ts_ms"))
+        if start is None or start > stamp:
+            continue
+        start_line = int(record.get("line_no") or 0)
+        if start == stamp and line_no and start_line and start_line > line_no:
+            continue
+        end = _coerce_optional_int(record.get("end_ts_ms"))
+        end_line = int(record.get("end_line_no") or 0)
+        if end is not None and (stamp > end or (stamp == end and (not end_line or not line_no or line_no >= end_line))):
+            continue
+        snapshot_end = record.get('snapshot_end_ts_ms')
+        if snapshot_end is not None and (stamp > int(snapshot_end) or stamp == int(snapshot_end)
+                and (not line_no or line_no >= int(record.get('snapshot_end_line_no') or 0))):
+            continue
+        duration = _coerce_optional_int(record.get("raw_duration_ms"))
+        if duration is not None and (duration <= 0 or stamp >= start + duration):
+            continue
+        if end is None and duration is None and not uid_seen and record.get('lifetime_mode') != 'Infinity':
             continue
         for key in (record.get("event_key"), record.get("raw_event_key")):
-            normalized = _normalize_buff_id(key)
-            if normalized:
-                active.add(normalized)
+            if key:
+                active.add(_normalize_buff_id(key))
     return active
 
 
@@ -9274,18 +9469,21 @@ def _arts_strength_effect_contributors(
     effect: dict[str, Any],
     buff_windows: list[dict[str, Any]],
 ) -> list[tuple[str, float, dict[str, Any] | None]]:
-    """Split a fracture/conduct/corrosion rate by its source-strength provenance."""
+    """Require a typed source-strength provenance before allocating it."""
 
-    event_key = _normalize_buff_id(effect_window.get("event_key"))
     source_key = str(effect_window.get("source_character_key") or "")
     final_rate = float(effect.get("rate") or 0.0)
-    if event_key not in _ARTS_STRENGTH_EFFECT_BUFF_IDS or not source_key or final_rate <= 0:
+    if effect.get('arts_strength_provenance') is not True:
+        # This helper is also used by ordinary enemy debuffs. Their explicit
+        # provider remains the provider; no secondary Arts redistribution is
+        # inferred from their identifier.
         return [(source_key, final_rate, None)]
 
     applied_at_ms = int(effect_window.get("start_ts_ms") or 0)
     applied_line_no = int(effect_window.get("start_line_no") or effect_window.get("line_no") or 0)
     self_points = max(float(effect_window.get("source_static_arts_strength") or 0.0), 0.0)
     external_points: dict[str, float] = defaultdict(float)
+    external_approval_keys: dict[str, set[str]] = defaultdict(set)
 
     for candidate in buff_windows:
         if str(candidate.get("target_character_key") or "") != source_key:
@@ -9300,7 +9498,7 @@ def _arts_strength_effect_contributors(
         provider_key = str(candidate.get("source_character_key") or "")
         if not provider_key:
             continue
-        for candidate_effect in _window_effects_at_ts(candidate, applied_at_ms):
+        for candidate_effect in _window_effects_at_ts(candidate, applied_at_ms, line_no=applied_line_no):
             if str(candidate_effect.get("zone") or "") != "arts_strength":
                 continue
             points = float(candidate_effect.get("rate") or 0.0)
@@ -9309,7 +9507,10 @@ def _arts_strength_effect_contributors(
             if provider_key == source_key:
                 self_points += points
             else:
+                if candidate_effect.get('external_rdps_allowed') is False:
+                    continue
                 external_points[provider_key] += points
+                external_approval_keys[provider_key].update(candidate_effect.get('rdps_whitelist_keys') or [])
 
     external_total = sum(external_points.values())
     if external_total <= 0:
@@ -9330,6 +9531,7 @@ def _arts_strength_effect_contributors(
             "arts_strength_points": points,
             "arts_strength_self_points": self_points,
             "arts_strength_external_points": external_total,
+            "arts_strength_whitelist_keys": sorted(external_approval_keys[provider_key]),
         }
         contributors.append((provider_key, provider_rate, provenance))
     return contributors
@@ -9358,6 +9560,8 @@ def _rdps_debug_record_arts_effect_provenance(
                 "arts_strength_points": _round4(provenance.get("arts_strength_points") or 0.0),
                 "arts_strength_self_points": _round4(provenance.get("arts_strength_self_points") or 0.0),
                 "arts_strength_external_points": _round4(provenance.get("arts_strength_external_points") or 0.0),
+                "effect_rdps_whitelist_keys": list(effect.get('rdps_whitelist_keys') or []),
+                "rdps_whitelist_keys": list(provenance.get('arts_strength_whitelist_keys') or []),
             }
         )
     return record
@@ -9368,8 +9572,9 @@ def _allocate_rdps_for_hit(
     buff_windows: list[dict[str, Any]],
     *,
     include_debug: bool = False,
-    buff_records_by_uid: dict[str, dict[str, Any]] | None = None,
+    buff_records_by_uid: dict[str, list[dict[str, Any]]] | None = None,
     condition_buff_records: list[dict[str, Any]] | None = None,
+    condition_records_by_target: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     attacker_key = hit["character_key"]
     target_enemy_key = hit["target_enemy_key"]
@@ -9378,6 +9583,46 @@ def _allocate_rdps_for_hit(
     damage_element = hit.get("damage_element")
     damage_school = hit.get("damage_school")
     arts_strength_damage_hit = _is_arts_strength_damage_hit(hit)
+    # Attack percentage bonuses affect only attack-scaled damage. A dormant
+    # custom calculation on a simple unit is not its active damage formula.
+    calculation = hit.get('damage_calculation')
+    calculations = [calculation] if isinstance(calculation, dict) else []
+    if not calculations and 'damage_calculation' in hit:
+        calculations = [unit['damage_calculation'] for units in
+                        _load_skill_action_damage_units(str(hit.get('skill_key') or '')).values()
+                        for unit in units if unit.get('damage_attribute_type') == 'hp'
+                        and isinstance(unit.get('damage_calculation'), dict)]
+    attack_kinds = []
+    for candidate in calculations:
+        if candidate.get('source') != 'current_typed_damage_unit':
+            attack_kinds.append('unknown')
+            continue
+        custom = candidate.get('atkCalculation') or {}
+        kind = custom.get('$type')
+        if candidate.get('simpleCalculation') is True:
+            attack_kinds.append('linear')
+        elif candidate.get('simpleCalculation') is not False:
+            attack_kinds.append('unknown')
+        elif kind in {'Beyond.Gameplay.Core.AtkScaleCalculation', 'Beyond.Gameplay.Core.BreakingAttackCalculation'}:
+            attack_kinds.append('linear')
+        elif kind in {'Beyond.Gameplay.Core.DefiniteValueCalculation', 'Beyond.Gameplay.Core.PrimaryAttrCalculation'}:
+            attack_kinds.append('independent')
+        elif kind == 'Beyond.Gameplay.Core.MultiplyAttributeCalculation':
+            if custom.get('attributeType') != 'Atk' or custom.get('valueSource') != 'AttackerOrHealer':
+                attack_kinds.append('independent')
+            else:
+                addition = custom.get('addition') or {}
+                attack_kinds.append('linear' if addition.get('useBlackboardKey') is False
+                                    and _coerce_optional_float(addition.get('value')) == 0.0 else 'affine')
+        else:
+            attack_kinds.append('unknown')
+    attack_kind = (attack_kinds[0] if attack_kinds and len(set(attack_kinds)) == 1 else
+                   'linear' if 'damage_calculation' not in hit else 'unknown')
+    if attack_kind == 'affine' and not isinstance(calculation, dict):
+        attack_kind = 'unknown'  # Different units cannot borrow one set of BB parameters.
+    hit['attack_damage_dependency'] = attack_kind
+    # The official text defines arts-strength as anomaly-only. A hit that
+    # is not observed as anomaly damage does not consume this entry.
     packet_modifier_uids = hit.get("packet_modifier_uids") if isinstance(hit.get("packet_modifier_uids"), dict) else {}
     attacker_modifier_uids = {str(item) for item in packet_modifier_uids.get("attacker") or [] if str(item)}
     defender_modifier_uids = {str(item) for item in packet_modifier_uids.get("defender") or [] if str(item)}
@@ -9387,20 +9632,189 @@ def _allocate_rdps_for_hit(
 
     external_by_zone: dict[str, list[tuple[str, float, dict[str, Any] | None]]] = defaultdict(list)
     self_by_zone: dict[str, float] = defaultdict(float)
+    self_factor_by_zone: dict[str, float] = defaultdict(lambda: 1.0)
     captured_by_attr_type: dict[int, float] = defaultdict(float)
     contributors_by_zone: dict[str, list[dict[str, Any]]] = defaultdict(list) if include_debug else {}
     ignored_effects: list[dict[str, Any]] = []
+    invalid_numeric_allocation = False
+    resistance_attr_type = {'physical': 94, 'natural': 95, 'cryst': 96,
+                            'pulse': 97, 'fire': 98, 'ether': 99}.get(damage_element)
+    resistance_rows = [str(token).partition(':')[2]
+                       for token in (packet_attr_details.get('defender') or [])
+                       if resistance_attr_type is not None
+                       and str(token).partition(':')[0] == str(resistance_attr_type)]
+    # This is the resistance observed in this damage operation, including
+    # temporary modifications such as the attacker's resistance ignore.
+    # ENTITY_STATS may predate the debuff and is not a replacement for it.
+    resistance_values = [_coerce_optional_float(value) for row in resistance_rows for value in row.split(',')]
+    effective_resistance = (resistance_values[0] if resistance_values and not hit.get('packet_attr_conflict')
+                            and all(value is not None for value in resistance_values)
+                            and len(set(resistance_values)) == 1 else None)
+    resistance_numerator = 100.0 - effective_resistance if effective_resistance is not None else None
+    resistance_source = f'PKT_ATTR.defender.attr{resistance_attr_type}'
     matched_packet_defender_effect_signatures = _matched_packet_defender_effect_signatures(
         hit=hit,
         buff_windows=buff_windows,
         defender_modifier_uids=defender_modifier_uids,
     ) if bool(hit.get("packet_modifier_seen")) else set()
-    active_target_buff_ids = _active_target_buff_ids_for_hit(hit, condition_buff_records)
+    defender_records = (condition_records_by_target.get(str(hit.get('target_enemy_key') or ''), [])
+                        if condition_records_by_target is not None else condition_buff_records)
+    active_target_buff_ids = _active_target_buff_ids_for_hit(hit, defender_records)
     hit["_active_target_buff_ids"] = sorted(active_target_buff_ids)
+    if hit.get('source_actor_id'):
+        attacker_records = (condition_records_by_target.get(str(hit.get('character_key') or ''), [])
+                            if condition_records_by_target is not None else condition_buff_records)
+        hit['_active_attacker_buff_ids'] = sorted(_active_target_buff_ids_for_hit(hit, attacker_records, side='attacker'))
 
-    for window in buff_windows:
-        window_effects = _window_effects_at_ts(window, hit_ts_ms)
+    effects_at_hit = [_window_effects_at_ts(window, hit_ts_ms, line_no=hit_line_no,
+                                           packet_seq_id=hit.get('packet_seq_id'),
+                                           packet_session_id=hit.get('packet_session_id')) for window in buff_windows]
+    stack_groups: defaultdict[tuple[str, str, str, str], list[int]] = defaultdict(list)
+    disabled_self_groups: defaultdict[tuple[str, str, str, str], list[int]] = defaultdict(list)
+    unresolved_stack_zones: set[str] = set()
+    for index, (window, effects) in enumerate(zip(buff_windows, effects_at_hit)):
+        owner = window.get('target_character_key')
+        actor_id = str(hit.get('source_actor_id' if owner == attacker_key else 'target_actor_id') or '')
+        window_actor_id = str(window.get('target_actor_id') or '')
+        if owner not in {attacker_key, target_enemy_key} or (actor_id and window_actor_id and actor_id != window_actor_id):
+            continue
+        if window.get('_effect_state_unresolved_at_hit'):
+            potential_effects = list(window.get('zone_effects') or []) + list(window.get('dynamic_effects') or [])
+            zones = {str(effect['zone']) for effect in potential_effects
+                     if _effect_element_applies_to_hit(effect, damage_element, damage_school)}
+            if zones:
+                unresolved_stack_zones.update(zones)
+                hit['rdps_unresolved_effect_conditions'] = True
+                if include_debug:
+                    ignored_effects.append({'uid': window.get('uid'), 'event_key': window.get('event_key'),
+                        'reason': 'unresolved_buff_state_zone_baseline', 'reason_group': 'condition_unobservable'})
+        if window.get('_buff_enabled_at_hit') is False and window.get('source_character_key') == attacker_key:
+            disabled_self_groups[_buff_window_stack_group_key(window)].append(index)
+        if not effects:
+            continue
+        stack_groups[_buff_window_stack_group_key(window)].append(index)
+    for group, indices in stack_groups.items():
+        policies, limits = set(), set()
+        for index in indices:
+            window = buff_windows[index]
+            root = _load_current_buff_roots().get(str(window.get('event_key') or ''))
+            settings = root.get('stackingSettings') if isinstance(root, dict) else None
+            policies.add(settings.get('stackingType') if isinstance(settings, dict) else window.get('stacking_type'))
+            limits.add(_buff_stack_limit(window.get('event_key'), window.get('bb_values'))
+                       if isinstance(settings, dict) else _positive_int(window.get('stack_limit')))
+        if policies == {'Unlimited'}:
+            continue
+        if (policies & {'HighPriority', 'HighPriorityWithMaxStack'} and disabled_self_groups.get(group)
+                and any(buff_windows[i].get('source_character_key') != attacker_key for i in indices)):
+            # Removing an external priority winner may reactivate a suppressed
+            # self buff. Its counterfactual selection has not been proved.
+            for index in indices + disabled_self_groups[group]:
+                window = buff_windows[index]
+                potential_effects = list(window.get('zone_effects') or []) + list(window.get('dynamic_effects') or [])
+                zones = {str(effect['zone']) for effect in potential_effects
+                         if _effect_element_applies_to_hit(effect, damage_element, damage_school)}
+                if zones:
+                    unresolved_stack_zones.update(zones)
+                    hit['rdps_unresolved_effect_conditions'] = True
+                    window['rdps_unresolved_stack_evidence'] = True
+                    if include_debug:
+                        ignored_effects.append({'uid': window.get('uid'), 'event_key': window.get('event_key'),
+                            'reason': 'unresolved_priority_self_baseline', 'reason_group': 'condition_unobservable'})
+        uids = {str(buff_windows[i].get('uid') or f'unknown:{i}') for i in indices}
+        if len(uids) <= 1:
+            continue
+        limit = next(iter(limits)) if len(limits) == 1 else None
+        if len(policies) == 1 and limit is not None and len(uids) <= limit:
+            continue
+        # No enabled winner is implied by age, UID ordering, or BB magnitude.
+        # Omit this zone too when a competing self buff makes its baseline
+        # unknown; allocating another external effect against zero would lie.
+        for index in indices:
+            window = buff_windows[index]
+            zones = {str(effect['zone']) for effect in effects_at_hit[index]
+                     if _effect_element_applies_to_hit(effect, damage_element, damage_school)}
+            if not zones:
+                continue
+            unresolved_stack_zones.update(zones)
+            window['rdps_unresolved_stack_evidence'] = True
+            hit['rdps_unresolved_effect_conditions'] = True
+            if include_debug:
+                ignored_effects.append({'uid': window.get('uid'), 'event_key': window.get('event_key'),
+                    'reason': 'unresolved_buff_stack_selection', 'reason_group': 'condition_unobservable',
+                    'stack_group': list(group), 'candidate_uids': sorted(uids)})
+
+    # A present, complete report with no entry for this resistance means no
+    # instant modifier touched it. A known pre-debuff snapshot plus explicit
+    # persistent updates can then supply the same resistance factor.
+    if (effective_resistance is None and not resistance_rows and resistance_attr_type is not None
+            and hit.get('packet_attribute_report_present') is True
+            and not hit.get('packet_attribute_report_unresolved') and 'res' not in unresolved_stack_zones):
+        initial = _coerce_optional_float((hit.get('target_resistance_points') or {}).get(damage_element))
+        snapshot_ts = hit.get('target_stats_snapshot_ts_ms')
+        snapshot_line = hit.get('target_stats_snapshot_line_no')
+        target_id = str(hit.get('target_actor_id') or '')
+        if (initial is not None and type(snapshot_ts) is int and type(snapshot_line) is int
+                and target_id and not hit.get('rdps_unresolved_target_binding')):
+            baseline_stamp = (snapshot_ts, snapshot_line)
+            current_stamp = (hit_ts_ms, hit_line_no)
+            known = baseline_stamp <= current_stamp
+            persistent_points = 0.0
+            observed_persistent = False
+            covered_instances = set()
+            for candidate, effects in zip(buff_windows, effects_at_hit):
+                if (str(candidate.get('target_actor_id') or '') != target_id
+                        or candidate.get('target_character_key') != target_enemy_key):
+                    continue
+                specs = [spec for spec in candidate.get('dynamic_effects') or []
+                         if 'parameter_snapshots' in spec and spec.get('zone') == 'res'
+                         and _effect_element_applies_to_hit(spec, damage_element, damage_school)]
+                if not specs:
+                    continue
+                covered_instances.add((str(candidate.get('uid') or ''), candidate.get('start_ts_ms'), candidate.get('start_line_no')))
+                start_stamp = (int(candidate.get('start_ts_ms') or 0), int(candidate.get('start_line_no') or 0))
+                end_stamp = (int(candidate.get('end_ts_ms') or 0), int(candidate.get('end_line_no') or 2**63 - 1))
+                if start_stamp <= baseline_stamp < end_stamp:
+                    known = False  # The snapshot may already include this Buff.
+                if candidate.get('_effect_state_unresolved_at_hit'):
+                    known = False
+                if start_stamp <= current_stamp <= end_stamp:
+                    observed_persistent = True
+                    persistent_points += sum(effect['rate'] for effect in effects
+                        if effect.get('resistance_point_source') == 'packet_bb_update_and_refresh'
+                        and _effect_element_applies_to_hit(effect, damage_element, damage_school))
+            attribute_name = {'physical': 'PhysicalResistance', 'natural': 'NaturalResistance',
+                              'cryst': 'CrystResistance', 'pulse': 'PulseResistance',
+                              'fire': 'FireResistance', 'ether': 'EtherResistance'}[damage_element]
+            for candidate in condition_buff_records or []:
+                if (str(candidate.get('target_actor_id') or '') != target_id
+                        or (str(candidate.get('uid') or ''), candidate.get('ts_ms'), candidate.get('line_no')) in covered_instances):
+                    continue
+                start_stamp = (int(candidate.get('ts_ms') or 0), int(candidate.get('line_no') or 0))
+                end_stamp = (int(candidate.get('end_ts_ms') or hit_ts_ms), int(candidate.get('end_line_no') or 2**63 - 1))
+                if not (start_stamp <= baseline_stamp < end_stamp or start_stamp <= current_stamp < end_stamp):
+                    continue
+                root = _load_current_buff_roots().get(str(candidate.get('event_key') or '')) or {}
+                if any(modifier.get('attributeType') == attribute_name
+                       for modifier in (root.get('attributeModifier') or {}).get('attributeModifiers') or []):
+                    known = False  # Another observed persistent change is not modeled here.
+            if known and observed_persistent and isfinite(persistent_points):
+                effective_resistance = initial - persistent_points
+                resistance_numerator = 100.0 - effective_resistance
+                resistance_source = 'ENTITY_STATS+packet_bb_refresh+complete_instant_report'
+
+    for window, window_effects in zip(buff_windows, effects_at_hit):
         if not window_effects:
+            if window.get('_enable_state_unobserved_at_hit'):
+                hit['rdps_unresolved_effect_conditions'] = True
+                if include_debug:
+                    ignored_effects.append({'uid': window.get('uid'), 'event_key': window.get('event_key'),
+                        'reason': 'unobserved_initial_buff_enable_state', 'reason_group': 'condition_unobservable'})
+            if (not hit_line_no and (window.get('snapshot_update') and window.get('start_ts_ms') == hit_ts_ms
+                                    or window.get('snapshot_end_ts_ms') == hit_ts_ms)):
+                hit['rdps_unresolved_effect_conditions'] = True
+                if include_debug:
+                    ignored_effects.append({'uid': window.get('uid'), 'event_key': window.get('event_key'),
+                                            'reason': 'unresolved_buff_snapshot_order', 'reason_group': 'condition_unobservable'})
             continue
         window_start_ts_ms = int(window.get("start_ts_ms") or 0)
         if not (window_start_ts_ms <= hit_ts_ms <= int(window.get("end_ts_ms") or 0)):
@@ -9424,6 +9838,26 @@ def _allocate_rdps_for_hit(
 
         window_uid_aliases = _window_uid_aliases(window)
         packet_uid_match = bool(window_uid_aliases & defender_modifier_uids)
+        if applies_to_attacker:
+            attacker_instance = str(hit.get("source_actor_id") or "")
+            window_instance = str(window.get("target_actor_id") or "")
+            if attacker_instance and window_instance and attacker_instance != window_instance:
+                if window_uid_aliases & attacker_modifier_uids:
+                    hit["rdps_unresolved_target_binding"] = True
+                if include_debug:
+                    ignored_effects.append({'uid': window.get('uid'), 'event_key': window.get('event_key'),
+                                            'reason': 'buff_owner_instance_mismatch'})
+                continue
+        if applies_to_enemy:
+            target_instance = str(hit.get("target_actor_id") or "")
+            window_instance = str(window.get("target_actor_id") or "")
+            if target_instance and window_instance and target_instance != window_instance:
+                if packet_uid_match:
+                    hit["rdps_unresolved_target_binding"] = True
+                continue
+            if not (target_instance and window_instance) and not packet_uid_match:
+                hit["rdps_unresolved_target_binding"] = True
+                continue
 
         source_key = window["source_character_key"]
         if not source_key:
@@ -9431,8 +9865,42 @@ def _allocate_rdps_for_hit(
 
         for effect in window_effects:
             zone = effect["zone"]
-            rate = effect["rate"]
+            if zone == 'atk' and attack_kind in {'independent', 'unknown'}:
+                if attack_kind == 'unknown':
+                    hit['rdps_unresolved_effect_conditions'] = True
+                if include_debug:
+                    ignored_effects.append({'uid': window.get('uid'), 'event_key': window.get('event_key'),
+                        'zone': 'atk', 'reason': 'damage_not_scaled_by_attack' if attack_kind == 'independent'
+                        else 'attack_damage_calculation_unresolved'})
+                continue
+            if zone in unresolved_stack_zones:
+                if include_debug:
+                    ignored_effects.append({'uid': window.get('uid'), 'event_key': window.get('event_key'),
+                        'zone': zone, 'reason': 'unresolved_stack_zone_baseline', 'reason_group': 'condition_unobservable'})
+                continue
+            rate = _coerce_optional_float(effect.get('rate'))
+            if rate is None:
+                invalid_numeric_allocation = True
+                if include_debug:
+                    ignored_effects.append({'uid': window.get('uid'), 'event_key': window.get('event_key'),
+                                            'reason': 'invalid_effect_rate'})
+                continue
             element = effect.get("element")
+            required_side = ('defender' if zone in {'vuln_taken', 'fragile', 'res', 'prod_vuln_taken'} else
+                             'attacker' if zone in {'atk', 'dmg_inc', 'amp', 'combo', 'arts_strength', 'crit', 'prod_dmg_inc'} else None)
+            if 'recipient_side' in effect:
+                if effect['recipient_side'] not in {'attacker', 'defender'}:
+                    hit['rdps_unresolved_effect_conditions'] = True
+                    continue
+                required_side = effect['recipient_side']
+            if ((required_side == 'defender' and not applies_to_enemy)
+                    or (required_side == 'attacker' and not applies_to_attacker)):
+                if include_debug:
+                    ignored_effects.append({
+                        **_rdps_debug_record_applicable_effect(window=window, effect=effect, scope='ignored'),
+                        'reason': 'effect_recipient_side_mismatch', 'required_side': required_side,
+                    })
+                continue
             packet_uid_restricted = (
                 bool(hit.get("packet_modifier_seen"))
                 and applies_to_enemy
@@ -9461,11 +9929,23 @@ def _allocate_rdps_for_hit(
             if effect_skill_filter and not effect_skill_filter.search(str(hit.get("skill_key") or "")):
                 continue
             attr_type = effect.get("attr_type")
-            if isinstance(attr_type, int) and not _attr_type_applies_to_skill(
-                attr_type,
-                str(hit.get("skill_key") or ""),
-            ):
-                continue
+            if isinstance(attr_type, int):
+                attr_applies = _attr_type_applies_to_skill(
+                    attr_type, None, damage_decorate_mask=hit.get('damage_decorate_mask'),
+                    static_damage_decorate_mask=hit.get('static_damage_decorate_mask'),
+                    static_damage_decorate_mask_source=hit.get('static_damage_decorate_mask_source'))
+                if attr_applies is None:
+                    hit['rdps_unresolved_effect_conditions'] = True
+                if attr_applies is not True:
+                    if include_debug:
+                        ignored_effects.append({
+                            **_rdps_debug_record_applicable_effect(window=window, effect=effect, scope='ignored'),
+                            'reason': 'attribute_damage_mask_missing' if attr_applies is None else 'attribute_damage_mask_filtered',
+                            'reason_group': 'condition_unobservable' if attr_applies is None else 'condition_unsatisfied',
+                        })
+                    continue
+            # The typed processor defines the zone. A BB name containing
+            # "resistance" does not turn a NormalCalcZone effect into resistance.
             if zone == "crit":
                 if include_debug:
                     ignored_effects.append(
@@ -9480,7 +9960,7 @@ def _allocate_rdps_for_hit(
                     ignored_effects.append(
                         {
                             **_rdps_debug_record_applicable_effect(window=window, effect=effect, scope="ignored"),
-                            "reason": "utility_not_allocated",
+                            "reason": "resistance_counterfactual_unresolved" if zone == 'res' else "utility_not_allocated",
                         }
                     )
                 continue
@@ -9506,6 +9986,8 @@ def _allocate_rdps_for_hit(
                 continue
             condition_failure = _effect_condition_failure(effect, hit)
             if condition_failure:
+                if condition_failure.get("reason_group") == "condition_unobservable":
+                    hit["rdps_unresolved_effect_conditions"] = True
                 if include_debug:
                     ignored_effects.append(
                         {
@@ -9529,8 +10011,19 @@ def _allocate_rdps_for_hit(
                         }
                     )
                 continue
-            if applies_to_attacker and isinstance(attr_type, int):
-                captured_by_attr_type[attr_type] += rate
+            if zone == 'res':
+                if damage_element in {'real', 'lifedrain'}:
+                    continue
+                if (resistance_numerator is None or not isfinite(resistance_numerator)
+                        or resistance_numerator <= 0):
+                    hit['rdps_unresolved_effect_conditions'] = True
+                    if include_debug:
+                        ignored_effects.append({
+                            **_rdps_debug_record_applicable_effect(window=window, effect=effect, scope='ignored'),
+                            'reason': 'resistance_counterfactual_unresolved',
+                            'detail': 'missing_or_conflicting_hit_resistance',
+                        })
+                    continue
             effect_contributors = (
                 _arts_strength_effect_contributors(
                     effect_window=window,
@@ -9541,8 +10034,25 @@ def _allocate_rdps_for_hit(
                 else [(source_key, rate, None)]
             )
             for contributor_key, contributor_rate, provenance in effect_contributors:
+                contributor_rate = _coerce_optional_float(contributor_rate)
+                if contributor_rate is None:
+                    invalid_numeric_allocation = True
+                    continue
                 if contributor_rate <= 0:
                     continue
+                if contributor_key != attacker_key and effect.get('external_rdps_allowed') is False:
+                    hit['rdps_unresolved_whitelist_effect'] = True
+                    if include_debug:
+                        ignored_effects.append({
+                            **_rdps_debug_record_applicable_effect(window=window, effect=effect, scope='ignored'),
+                            'reason': 'external_effect_not_whitelisted',
+                        })
+                    continue
+                # Subtract only effects actually retained in the model from
+                # the observed final attribute. Rejected external effects
+                # remain in the attacker's baseline; they get no credit.
+                if applies_to_attacker and isinstance(attr_type, int):
+                    captured_by_attr_type[attr_type] += contributor_rate
                 scope = "self" if contributor_key == attacker_key else "external"
                 record = (
                     _rdps_debug_record_arts_effect_provenance(
@@ -9557,16 +10067,19 @@ def _allocate_rdps_for_hit(
                     else None
                 )
                 if contributor_key == attacker_key:
-                    self_by_zone[zone] += contributor_rate
+                    if zone.startswith('prod_'):
+                        self_factor_by_zone[zone] *= 1.0 + contributor_rate
+                    else:
+                        self_by_zone[zone] += contributor_rate
                 else:
                     external_by_zone[zone].append((contributor_key, contributor_rate, record))
                 if include_debug and record is not None:
                     contributors_by_zone[zone].append(record)
 
+    observed_final_attr_types: set[int] = set()
     for raw_attr_type, final_value in (hit.get("baseline") or {}).items():
         try:
             attr_type = int(raw_attr_type)
-            final_rate = float(final_value)
         except (TypeError, ValueError):
             continue
         if attr_type == 2:
@@ -9574,15 +10087,35 @@ def _allocate_rdps_for_hit(
         mapping = _ATTR_TYPE_TO_EFFECT.get(attr_type)
         if mapping is None:
             continue
+        final_rate = _coerce_optional_float(final_value)
+        if final_rate is None or final_rate < 0:
+            hit['rdps_unresolved_effect_conditions'] = True
+            continue
         zone, element = mapping
         if zone == "crit":
             continue
-        if not _attr_type_applies_to_skill(attr_type, str(hit.get("skill_key") or "")):
+        observed_final_attr_types.add(attr_type)
+        if final_rate == 0:
+            continue
+        attr_applies = _attr_type_applies_to_skill(
+            attr_type, None, damage_decorate_mask=hit.get('damage_decorate_mask'),
+            static_damage_decorate_mask=hit.get('static_damage_decorate_mask'),
+            static_damage_decorate_mask_source=hit.get('static_damage_decorate_mask_source'))
+        if attr_applies is None and element == damage_element:
+            # An element-specific attribute has an exact element match; the
+            # decorate mask is only needed for broader skill-category rules.
+            attr_applies = True
+        if attr_applies is None:
+            hit['rdps_unresolved_effect_conditions'] = True
+        if attr_applies is not True:
             continue
         if not _effect_applies_to_damage_element(element, damage_element, damage_school):
             continue
         baseline_rate = final_rate - captured_by_attr_type.get(attr_type, 0.0)
-        if baseline_rate <= 0.001:
+        if baseline_rate < 0:
+            hit['rdps_unresolved_effect_conditions'] = True
+            continue
+        if baseline_rate == 0:
             continue
         self_by_zone[zone] += baseline_rate
         if include_debug:
@@ -9601,17 +10134,86 @@ def _allocate_rdps_for_hit(
     for entry in hit.get("static_multiplier_entries") or []:
         if not isinstance(entry, dict) or not _static_entry_applies_to_hit(entry, hit):
             continue
+        if entry.get('zone') == 'atk' and attack_kind == 'independent':
+            continue
+        if entry.get('attr_type') in observed_final_attr_types:
+            # The per-hit final attribute already contains this static source.
+            continue
         zone = str(entry.get("zone") or "")
-        rate = float(entry.get("rate") or 0.0)
+        rate = _coerce_optional_float(entry.get('rate'))
+        if rate is None:
+            invalid_numeric_allocation = True
+            continue
         self_by_zone[zone] += rate
         if include_debug:
             contributors_by_zone[zone].append(_rdps_debug_record_static_self(hit=hit, entry=entry))
+
+    attack_extra_baseline = 0.0
+    attack_baseline_error = None
+    flat_attack = _coerce_optional_float(hit.get('static_flat_attack', 0.0))
+    base_attack = _coerce_optional_float(hit.get('base_attack_for_percent'))
+    if flat_attack is None or flat_attack < 0:
+        attack_baseline_error = 'invalid_flat_attack_baseline'
+    elif flat_attack > 0:
+        if base_attack is None or base_attack <= 0:
+            attack_baseline_error = 'missing_base_attack_for_flat_addition'
+        else:
+            attack_extra_baseline += flat_attack / base_attack
+    if attack_kind == 'affine':
+        custom = calculation['atkCalculation']
+        params = {}
+        resource = (calculation.get('sourceProof') or {}).get('resourceId')
+        owner_uid = str(hit.get('event_inst_id') or '')
+        stamp = (hit_ts_ms, hit_line_no)
+        records = [record for record in condition_buff_records or []
+                   if str(record.get('uid') or '') == owner_uid and record.get('event_key') == resource
+                   and (int(record.get('ts_ms') or 0), int(record.get('line_no') or 0)) <= stamp
+                   and (record.get('end_ts_ms') is None or stamp < (int(record['end_ts_ms']), int(record.get('end_line_no') or 2**63-1)))
+                   and (record.get('snapshot_end_ts_ms') is None or stamp < (int(record['snapshot_end_ts_ms']), int(record.get('snapshot_end_line_no') or 2**63-1)))]
+        for key in ('multiplier', 'addition'):
+            parameter = custom.get(key) or {}
+            raw = parameter.get('value') if parameter.get('useBlackboardKey') is False else (
+                (records[0].get('bb_values') or {}).get(parameter.get('blackboardKey'))
+                if parameter.get('useBlackboardKey') is True and len(records) == 1 else None)
+            params[key] = _coerce_optional_float(raw)
+        if params['addition'] is None:
+            attack_baseline_error = 'missing_damage_base_addition'
+        elif params['addition'] != 0:
+            ability_factor = _coerce_optional_float(hit.get('attack_ability_factor'))
+            coefficient = params['multiplier']
+            if (base_attack is None or base_attack <= 0 or ability_factor is None or ability_factor <= 0
+                    or coefficient is None or coefficient <= 0):
+                attack_baseline_error = 'missing_attack_scale_for_fixed_damage'
+            else:
+                scale = base_attack * ability_factor * coefficient
+                if not isfinite(scale) or scale <= 0:
+                    attack_baseline_error = 'invalid_attack_scale_for_fixed_damage'
+                else:
+                    attack_extra_baseline += params['addition'] / scale
+    if not isfinite(attack_extra_baseline):
+        attack_baseline_error = 'invalid_attack_addition_ratio'
+    if attack_baseline_error:
+        if external_by_zone.get('atk'):
+            hit['rdps_unresolved_effect_conditions'] = True
+            if include_debug:
+                ignored_effects.append({'zone': 'atk', 'reason': attack_baseline_error})
+    elif attack_extra_baseline != 0:
+        self_by_zone['atk'] += attack_extra_baseline
+        if include_debug:
+            contributors_by_zone['atk'].append(_rdps_debug_record_static_self(hit=hit, entry={
+                'zone': 'atk', 'element': 'all', 'rate': attack_extra_baseline,
+                'source_type': 'fixed_attack_basis', 'source_name': '固定攻击与基础伤害项',
+                'evidence_kind': 'explicit_fixed_terms_normalization', 'base_attack': base_attack,
+                'flat_attack': flat_attack}))
 
     if arts_strength_damage_hit:
         for entry in hit.get("static_arts_strength_entries") or []:
             if not isinstance(entry, dict):
                 continue
-            points = float(entry.get("rate") or 0.0)
+            points = _coerce_optional_float(entry.get('rate'))
+            if points is None:
+                invalid_numeric_allocation = True
+                continue
             if points <= 0:
                 continue
             self_by_zone["arts_strength"] += points
@@ -9629,35 +10231,76 @@ def _allocate_rdps_for_hit(
         )
         residual = (bucket_value - 1.0) - recognized_total
         if abs(residual) > 0.003:
-            self_by_zone[zone] += residual
-            if include_debug:
-                contributors_by_zone[zone].append(
-                    _rdps_debug_record_dpd_self_residual(hit=hit, zone=zone, rate=residual)
-                )
+            hit["rdps_unresolved_dpd_residual"] = True
 
     m_values: dict[str, float] = {}
     external_sum_by_zone: dict[str, float] = {}
+    combined_multiplier = 1.0
+    if any(not isfinite(value) for value in (*self_by_zone.values(), *self_factor_by_zone.values(), *captured_by_attr_type.values())):
+        invalid_numeric_allocation = True
     for zone, contributors in external_by_zone.items():
+        if zone == 'atk' and attack_baseline_error:
+            continue
         external_sum = sum(rate for _, rate, _ in contributors)
+        if not isfinite(external_sum):
+            invalid_numeric_allocation = True
+            break
         if external_sum <= 0:
             continue
         self_sum = self_by_zone.get(zone, 0.0)
-        if zone == "arts_strength":
+        if not isfinite(self_sum) or (100.0 if zone == 'arts_strength' else 1.0) + self_sum <= 0:
+            invalid_numeric_allocation = True
+            break
+        if zone.startswith('prod_'):
+            m_z = 1.0
+            for _, rate, _ in contributors:
+                m_z *= 1.0 + rate
+        elif zone == "arts_strength":
             m_z = (
                 _arts_strength_damage_multiplier(self_sum + external_sum)
                 / _arts_strength_damage_multiplier(self_sum)
-            )
+            ) ** (hit.get('arts_strength_damage_factor_count') or 1)
+        elif zone == 'res':
+            # Rates in this lane are positive resistance points. Remove only
+            # approved external points from the observed resistance factor;
+            # own reductions/ignore and rejected sources stay in the baseline.
+            denominator = resistance_numerator - external_sum
+            if not isfinite(denominator) or denominator <= 0:
+                hit['rdps_unresolved_effect_conditions'] = True
+                if include_debug:
+                    ignored_effects.append({'zone': 'res', 'reason': 'resistance_counterfactual_unresolved',
+                                            'detail': 'nonpositive_without_external_resistance_factor'})
+                continue
+            m_z = resistance_numerator / denominator
         else:
             m_z = (1.0 + self_sum + external_sum) / (1.0 + self_sum)
-        bucket_value = _dpd_bucket_value_for_zone(zone, hit.get("dpd_raw"))
-        if bucket_value is not None and bucket_value > 1.0001:
-            calibrated_m_z = bucket_value / max(1.0, bucket_value - external_sum)
-            if calibrated_m_z > 1.0001:
-                m_z = calibrated_m_z
+        if not isfinite(m_z):
+            invalid_numeric_allocation = True
+            break
+        # DPD buckets remain a cross-check. An unexplained remainder cannot
+        # become a self multiplier or calibrate the externally proven rate.
         if m_z <= 1.0:
             continue
         external_sum_by_zone[zone] = external_sum
         m_values[zone] = m_z
+        combined_multiplier *= m_z
+        if not isfinite(combined_multiplier):
+            invalid_numeric_allocation = True
+            break
+
+    if invalid_numeric_allocation:
+        # Invalid or overflowing coefficients cannot erase observed damage.
+        # Keep the hit with its attacker and expose the failed allocation.
+        hit['rdps_invalid_numeric_allocation'] = True
+        hit['rdps_unresolved_effect_conditions'] = True
+        m_values.clear()
+        external_sum_by_zone.clear()
+        external_by_zone.clear()
+        self_by_zone.clear()
+        self_factor_by_zone.clear()
+        contributors_by_zone.clear()
+        if include_debug:
+            ignored_effects.append({'reason': 'invalid_numeric_allocation', 'reason_group': 'condition_unobservable'})
 
     hit_rdps_contributions: dict[str, float] = defaultdict(float)
     if not m_values:
@@ -9699,9 +10342,11 @@ def _allocate_rdps_for_hit(
     normalized_contributions = {
         character_key: value
         for character_key, value in hit_rdps_contributions.items()
-        if value > 0.0001
+        if value > 0.0
     }
     result: dict[str, Any] = {
+        "allocation_policy": "log_marginal_v1",
+        "allocation_policy_basis": "accounting_convention",
         "contributions_map": normalized_contributions,
         "contributions_list": _rdps_contribution_rows(normalized_contributions, sort_by_value=True),
     }
@@ -9719,20 +10364,29 @@ def _allocate_rdps_for_hit(
 
     zones: list[dict[str, Any]] = []
     for zone in sorted(
-        set(self_by_zone) | set(external_by_zone),
+        set(self_by_zone) | set(self_factor_by_zone) | set(external_by_zone),
         key=lambda key: (_RDPS_DEBUG_ZONE_ORDER.get(key, 99), key),
     ):
-        self_rate = self_by_zone.get(zone, 0.0)
+        self_rate = (self_factor_by_zone.get(zone, 1.0) - 1.0
+                     if zone.startswith('prod_') else self_by_zone.get(zone, 0.0))
         external_rate = external_sum_by_zone.get(
             zone,
             sum(rate for _, rate, _ in external_by_zone.get(zone, [])),
         )
         total_rate = self_rate + external_rate
         total_multiplier = (
-            _arts_strength_damage_multiplier(total_rate)
+            self_factor_by_zone.get(zone, 1.0) * m_values.get(zone, 1.0)
+            if zone.startswith('prod_')
+            else
+            resistance_numerator / 100.0
+            if zone == 'res' and resistance_numerator is not None
+            else
+            _arts_strength_damage_multiplier(total_rate) ** (hit.get('arts_strength_damage_factor_count') or 1)
             if zone == "arts_strength"
             else 1.0 + total_rate
         )
+        if zone.startswith('prod_'):
+            total_rate = total_multiplier - 1.0
         bucket_value = _dpd_bucket_value_for_zone(zone, hit.get("dpd_raw"))
         zones.append(
             {
@@ -9743,6 +10397,10 @@ def _allocate_rdps_for_hit(
                 "total_rate": _round4(total_rate),
                 "total_multiplier": _round4(total_multiplier),
                 "external_multiplier": _round4(m_values.get(zone, 1.0)),
+                **({'rate_unit': 'resistance_points', 'effective_resistance': effective_resistance,
+                    'effective_resistance_source': resistance_source,
+                    'without_external_resistance': effective_resistance + external_rate}
+                   if zone == 'res' and effective_resistance is not None else {}),
                 "zone_external_share": _round4(zone_external_share.get(zone, 0.0)),
                 "dpd_bucket": (
                     {
@@ -9785,7 +10443,16 @@ def _allocate_rdps_for_hit(
     record_index = buff_records_by_uid if isinstance(buff_records_by_uid, dict) else {}
     for side, uids in (("attacker", sorted(attacker_modifier_uids)), ("defender", sorted(defender_modifier_uids))):
         for uid in uids:
-            record = record_index.get(uid)
+            candidates = record_index.get(uid) or []
+            if isinstance(candidates, dict):
+                candidates = [candidates]
+            stamp = (hit_ts_ms, hit_line_no)
+            matched_records = [row for row in candidates
+                if stamp >= (int(row.get('ts_ms') or 0), int(row.get('line_no') or 0))
+                and (row.get('end_ts_ms') is None or stamp < (int(row['end_ts_ms']), int(row.get('end_line_no') or 0)))
+                and (row.get('snapshot_end_ts_ms') is None or stamp < (int(row['snapshot_end_ts_ms']), int(row.get('snapshot_end_line_no') or 0)))
+                and (hit_line_no or hit_ts_ms not in (row.get('ts_ms'), row.get('end_ts_ms'), row.get('snapshot_end_ts_ms')))]
+            record = matched_records[0] if len(matched_records) == 1 else None
             if not isinstance(record, dict):
                 modifier_details.append(
                     {
@@ -9872,6 +10539,10 @@ def _compute_rdps_damage_shares(
     condition_buff_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, float]:
     rdps_damage: dict[str, float] = defaultdict(float)
+    condition_records_by_target: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in condition_buff_records or []:
+        target = str(record.get('target_enemy_key') or record.get('target_character_key') or '')
+        condition_records_by_target[target].append(record)
 
     for hit in hits:
         allocation = _allocate_rdps_for_hit(
@@ -9879,6 +10550,7 @@ def _compute_rdps_damage_shares(
             buff_windows,
             include_debug=False,
             condition_buff_records=condition_buff_records,
+            condition_records_by_target=condition_records_by_target,
         )
         normalized_contributions = dict(allocation.get("contributions_map") or {})
         hit["rdps_contributions"] = normalized_contributions
@@ -9918,6 +10590,8 @@ def _build_rdps_damage_basis(
     return {
         "mode": "packet_hp_loss",
         "rdps_mode": "packet_hp_loss",
+        "allocation_policy": "log_marginal_v1",
+        "allocation_policy_basis": "accounting_convention",
         "source": "HP_V2.hit with packet eHP overkill cap",
         "hit_count": len(hits),
         "packet_grounded_hit_count": sum(1 for hit in hits if hit.get("packet_hit_value") is not None),
@@ -9939,26 +10613,7 @@ def _build_rdps_damage_basis(
 
 
 def _resolve_weapon_buff_sources(buff_records: list[dict[str, Any]]) -> None:
-    weapon_records = [record for record in buff_records if record.get("is_weapon_buff")]
-    for record in weapon_records:
-        raw_source_key = record.get("raw_source_character_key")
-        target_key = record.get("target_character_key")
-        if not raw_source_key or not target_key or raw_source_key == target_key:
-            continue
-
-        peer_targets = {
-            peer.get("target_character_key")
-            for peer in weapon_records
-            if peer.get("event_key") == record.get("event_key")
-            and peer.get("raw_source_character_key") == raw_source_key
-            and peer.get("target_character_key")
-            and abs(int(peer.get("ts_ms") or 0) - int(record.get("ts_ms") or 0)) <= 20
-        }
-        if len(peer_targets) < 2:
-            continue
-
-        record["source_character_key"] = raw_source_key
-        record["source_character_name"] = _resolve_character_name(raw_source_key) or raw_source_key
+    return
 
 
 def _buff_record_end_ts_ms(record: dict[str, Any], battle_end_ms: int) -> int:
@@ -9970,7 +10625,8 @@ def _buff_record_end_ts_ms(record: dict[str, Any], battle_end_ms: int) -> int:
         raw_duration_ms=record.get("raw_duration_ms"),
         battle_end_ms=battle_end_ms,
     )
-    return start_ts_ms + duration_ms
+    end = start_ts_ms + duration_ms
+    return min(end, int(record['snapshot_end_ts_ms'])) if record.get('snapshot_end_ts_ms') is not None else end
 
 
 def _matches_hidden_combo_rule(buff_id: str) -> dict[str, Any] | None:
@@ -10211,6 +10867,12 @@ def _build_combo_consume_windows(
             target_key = str(first_layer["target_key"] or "")
             skill_family_key = str(first_layer["skill_family_key"] or "")
             window_end_ms = min(consume_ts_ms + _COMBO_CONSUME_MAX_WINDOW_MS, battle_end_ms)
+            projection_key = f"{_GENERIC_COMBO_TRIGGER_BUFF_ID}::{skill_family_key}"
+            approval = _rdps_registry_verified_effect_entry({
+                'event_key': projection_key, 'source_character_key': source_key, 'target_character_key': target_key})
+            if not approval or not any(spec.get('zone') == 'combo' and spec.get('element') == 'all'
+                                       for spec in approval.get('effects') or []):
+                continue
             combo_windows.append(
                 {
                     "start_ts_ms": consume_ts_ms,
@@ -10222,9 +10884,11 @@ def _build_combo_consume_windows(
                     "target_character_name": consume_buff_record.get("target_character_name"),
                     "target_player_key": target_key,
                     "target_enemy_key": None,
-                    "event_key": f"{_GENERIC_COMBO_TRIGGER_BUFF_ID}::{skill_family_key}",
+                    "event_key": projection_key,
                     "event_name": "连击增伤",
-                    "zone_effects": [{"zone": "combo", "element": "all", "rate": rate}],
+                    "zone_effects": [{"zone": "combo", "element": "all", "rate": rate,
+                                      "external_rdps_allowed": True,
+                                      "rdps_whitelist_keys": list(approval.get('_rdps_whitelist_keys') or [])}],
                     "skill_family_key": skill_family_key,
                     "combo_stack_count": len(capped_layers),
                     "combo_layer_count": len(bucket["layers"]),
@@ -10242,9 +10906,246 @@ def _build_special_combo_windows(
     *,
     battle_end_ms: int,
 ) -> list[dict[str, Any]]:
-    combo_windows = _build_hidden_combo_windows(hits, buff_starts, battle_end_ms=battle_end_ms)
-    combo_windows.extend(_build_combo_consume_windows(hits, buff_starts, battle_end_ms=battle_end_ms))
-    return _merge_buff_windows(combo_windows)
+    # The packet names the modifier on this exact hit. The two explicit
+    # creation origins identify its provider; no nearby cast is selected.
+    trigger_id = 'buff_common_affixes_combo_trigger'
+    imbue_id = 'buff_common_affixes_skillimbue'
+    modifier_id = 'buff_common_affixes_skillimbue_atk'
+    roots = _load_current_buff_roots()
+    if not all(isinstance(roots.get(key), dict) for key in (trigger_id, imbue_id, modifier_id)):
+        return []
+    for parent_id, action_id, child_id in ((trigger_id, 4, imbue_id), (imbue_id, 0, modifier_id)):
+        actions = []; pending = [(roots[parent_id], True)]
+        while pending:
+            node, enabled = pending.pop()
+            if isinstance(node, dict):
+                enabled = enabled and ('serverActionIndex' not in node or node.get('isEnable') is True)
+                if (node.get('$type') == 'Beyond.Gameplay.Core.CreateBuffAction.Data'
+                        and type(node.get('serverActionIndex')) is int and node['serverActionIndex'] == action_id):
+                    actions.append((node, enabled))
+                pending.extend((value, enabled) for value in node.values())
+            elif isinstance(node, list):
+                pending.extend((value, enabled) for value in node)
+        if len(actions) != 1 or actions[0][1] is not True:
+            return []
+        action = actions[0][0]
+        created = action.get('buffs') or []
+        if (len(created) != 1 or created[0].get('readIdFromBlackboard') is not False
+                or created[0].get('buffId') != child_id or created[0].get('assignBlackboard') is not True
+                or action.get('buffSource') != 'ActionSource'
+                or (action.get('targetSettings') or {}).get('targetSource') != 'Owner'):
+            return []
+        assigned = [row for row in created[0].get('assignItems') or []
+                    if isinstance(row, dict) and row.get('targetKey') == 'imbue_scale']
+        if (len(assigned) != 1 or assigned[0].get('useDirectValue') is not False
+                or assigned[0].get('inputValueKey') != 'imbue_scale'):
+            return []
+    groups = roots[modifier_id].get('damageModifier') or []
+    if len(groups) != 1 or groups[0].get('enableSide') != 'Attacker':
+        return []
+    processors = groups[0].get('damageProcessors') or []
+    if (len(processors) != 1 or processors[0].get('$type') != 'Beyond.Gameplay.Core.DamageScaleProcessor'
+            or processors[0].get('side') != 'Attacker' or processors[0].get('zoneName') != 'ComboCalcZone'
+            or (processors[0].get('addition') or {}).get('blackboardKey') != 'real_imbue_scale'
+            or (processors[0].get('addition') or {}).get('useBlackboardKey') is not True):
+        return []
+    conditions = (groups[0].get('condition') or {}).get('actionData') or []
+    if (len(conditions) != 3 or any(row.get('isEnable') is not True for row in conditions)
+            or conditions[0].get('$type') != 'Beyond.Gameplay.Core.Conditions.CheckSkillCastId.Data'
+            or conditions[1].get('$type') != 'Beyond.Gameplay.Core.Conditions.CheckDamageDecorateMask.Data'
+            or conditions[1].get('checkType') != 'HasAny' or conditions[1].get('mask') != 0x300
+            or conditions[2].get('$type') != 'Beyond.Gameplay.Core.IfElseAction.IfElseActionData'):
+        return []
+    branch = conditions[2]
+    checks = (branch.get('conditionAction') or {}).get('actionData') or []
+    succeeds = (branch.get('succeedActions') or {}).get('actionData') or []
+    failures = (branch.get('failActions') or {}).get('actionData') or []
+    if (len(checks) != 1 or len(succeeds) != 1 or len(failures) != 1
+            or any(row.get('isEnable') is not True for row in (*checks, *succeeds, *failures))
+            or checks[0].get('$type') != 'Beyond.Gameplay.Core.Conditions.CheckDamageDecorateMask.Data'
+            or checks[0].get('checkType') != 'HasAny' or checks[0].get('mask') != 0x100
+            or succeeds[0].get('$type') != 'Beyond.Gameplay.Core.SimpleCalcBBAction.Data'
+            or succeeds[0].get('operation') != 'Multiply' or succeeds[0].get('key') != 'real_imbue_scale'
+            or (succeeds[0].get('value1') or {}).get('useBlackboardKey') is not True
+            or (succeeds[0].get('value1') or {}).get('blackboardKey') != 'imbue_scale'
+            or (succeeds[0].get('value2') or {}).get('useBlackboardKey') is not False
+            or failures[0].get('$type') != 'Beyond.Gameplay.Core.ModifyDynamicBlackboard.Data'
+            or failures[0].get('operation') != 'Assign' or failures[0].get('directValue') is not True
+            or failures[0].get('key') != 'real_imbue_scale'
+            or (failures[0].get('value') or {}).get('useBlackboardKey') is not True
+            or (failures[0].get('value') or {}).get('blackboardKey') != 'imbue_scale'):
+        return []
+    skill_factor = _coerce_optional_float(succeeds[0]['value2'].get('value'))
+    if skill_factor is None or skill_factor <= 0:
+        return []
+    by_uid: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in buff_starts:
+        if record.get('event_key') in {trigger_id, imbue_id, modifier_id}:
+            by_uid[str(record.get('uid') or '')].append(record)
+    windows = []
+    for hit in hits:
+        raw_handles = (hit.get('packet_modifier_handles') or {}).get('attacker') or []
+        grouped_handles: defaultdict[str, list[dict[str, Any]]] = defaultdict(list)
+        for handle in raw_handles:
+            if isinstance(handle, dict) and str(handle.get('buff_inst_id') or '') in by_uid:
+                grouped_handles[str(handle['buff_inst_id'])].append(handle)
+        for uid, handles in grouped_handles.items():
+            if not any(row.get('event_key') == modifier_id for row in by_uid[uid]):
+                continue
+            rejection = None
+            session = hit.get('packet_session_id')
+            seq = hit.get('packet_seq_id')
+            stamp = (hit.get('ts_ms'), hit.get('line_no'))
+            if (not isinstance(session, str) or not session or type(seq) is not int or seq < 0
+                    or any(type(value) is not int for value in stamp) or stamp[1] <= 0):
+                rejection = 'missing_combo_hit_identity'
+            elif (any(type(row.get('index')) is not int or row['index'] != 0 for row in handles)
+                  or len({json.dumps(row, sort_keys=True, ensure_ascii=False) for row in handles}) != 1):
+                rejection = 'conflicting_combo_modifier_handle'
+            mask = hit.get('damage_decorate_mask')
+            scope_source = 'observed_damage_decorate_mask'
+            if mask is None:
+                mask = hit.get('static_damage_decorate_mask')
+                scope_source = hit.get('static_damage_decorate_mask_source')
+                if scope_source != 'current_typed_skill_or_buff_exact_unit_generation_only':
+                    mask = None
+            if type(mask) is not int or mask < 0 or not mask & 0x300:
+                rejection = rejection or 'unresolved_or_inapplicable_combo_skill_scope'
+            selected = []; chain = []; origins_used = []; anchors_used = []
+            current_uid, expected_id, point = uid, modifier_id, stamp
+            for parent_id, expected_action in ((imbue_id, 0), (trigger_id, 4), (None, None)):
+                if rejection:
+                    break
+                candidates = []
+                for record in by_uid.get(current_uid, []):
+                    if record.get('event_key') != expected_id:
+                        continue
+                    start = (record.get('ts_ms', record.get('start_ts_ms')), record.get('line_no', 0))
+                    if any(type(value) is not int for value in start) or point < start:
+                        continue
+                    cutoffs = [(record.get(name), record.get(line_name)) for name, line_name in (
+                        ('end_ts_ms', 'end_line_no'), ('snapshot_end_ts_ms', 'snapshot_end_line_no'))]
+                    if any(type(end) is int and (point[0] > end or point[0] == end
+                           and type(line) is int and point[1] >= line) for end, line in cutoffs):
+                        continue
+                    candidates.append(record)
+                if len(candidates) != 1:
+                    rejection = 'ambiguous_or_missing_combo_instance'
+                    break
+                record = candidates[0]
+                if (record.get('rdps_live_identity_conflict') or record.get('rdps_dynamic_identity_conflict')
+                        or not record.get('source_character_key')
+                        or record.get('target_actor_id') != hit.get('source_actor_id')
+                        or record.get('target_character_key') != hit.get('character_key')
+                        or any(type(record.get(key)) is not str or not re.fullmatch(r'[1-9]\d*', record[key])
+                               or int(record[key]) >= 2**64 for key in ('uid', 'source_actor_id', 'target_actor_id'))
+                        or chain and (record['source_actor_id'] != chain[0]['source_actor_id']
+                                      or record['source_character_key'] != chain[0]['source_character_key'])):
+                    rejection = 'conflicting_combo_provider_or_recipient'
+                    break
+                chain.append(record)
+                if parent_id is None:
+                    break
+                origins = record.get('origin_observations') or []
+                normalized_origins = []
+                for origin in origins:
+                    parent = origin.get('templateStrId')
+                    if parent in (None, '') and type(origin.get('templateIntId')) is int:
+                        parent = _load_num_id_str_buff_map().get(str(origin['templateIntId']))
+                    elif not isinstance(parent, str) or not parent or origin.get('templateIntId') is not None:
+                        parent = None
+                    if (origin.get('_boundCreateRecord') is not True or parent != parent_id
+                            or origin.get('buffUid') != current_uid or origin.get('buffTemplate') != expected_id
+                            or origin.get('sourceActorId') != record['source_actor_id']
+                            or origin.get('targetActorId') != record['target_actor_id']
+                            or str(origin.get('environmentType') or '').lower() != 'buff'
+                            or str(origin.get('ownerType')) != '1'
+                            or type(origin.get('actionId')) is not int or origin['actionId'] != expected_action
+                            or origin.get('triggerType') != 0 or type(origin.get('operationSeq')) is not int
+                            or type(origin.get('environmentInstId')) is not str
+                            or not re.fullmatch(r'[1-9]\d*', origin['environmentInstId'])):
+                        rejection = 'invalid_combo_creation_origin'
+                        break
+                    normalized_origins.append(origin)
+                parent_uids = {row['environmentInstId'] for row in normalized_origins}
+                if rejection or not normalized_origins or len(parent_uids) != 1:
+                    rejection = rejection or 'missing_or_conflicting_combo_creation_origin'
+                    break
+                anchors = [row for row in record.get('creation_observations') or []
+                           if row.get('sessionId') == session and row.get('buffUid') == current_uid
+                           and row.get('buffTemplate') == expected_id and row.get('sourceActorId') == record['source_actor_id']
+                           and row.get('targetActorId') == record['target_actor_id']
+                           and row.get('sourceEvent') == 'BattleOpTriggerAction'
+                           and type(row.get('operationSeq')) is int and row['operationSeq'] <= seq
+                           and any(row['operationSeq'] == origin['operationSeq'] for origin in normalized_origins)]
+                if not anchors or any(not isinstance(row.get('assignedItems'), list) for row in anchors):
+                    rejection = 'missing_combo_creation_parameters'
+                    break
+                rates = set()
+                for anchor in anchors:
+                    values = [row for row in anchor['assignedItems'] if isinstance(row, dict) and row.get('target_key') == 'imbue_scale']
+                    if (not values or any(row.get('use_direct_value') is not True or row.get('string_value')
+                                          or _coerce_optional_float(row.get('numeric_value')) is None for row in values)
+                            or 'imbue_scale' in (anchor.get('bb_conflicts') or []) or '*' in (anchor.get('bb_conflicts') or [])):
+                        rejection = 'invalid_combo_creation_rate'
+                        break
+                    rates.update(float(row['numeric_value']) for row in values)
+                if rejection or len(rates) != 1 or next(iter(rates)) <= 0:
+                    rejection = rejection or 'conflicting_combo_creation_rate'
+                    break
+                selected.append(next(iter(rates)))
+                points = {(row.get('ts_ms'), row.get('line_no')) for row in anchors}
+                if len(points) != 1 or any(type(value) is not int for value in next(iter(points))):
+                    rejection = 'ambiguous_combo_creation_boundary'
+                    break
+                point = next(iter(points))
+                current_uid, expected_id = next(iter(parent_uids)), parent_id
+                origins_used.extend(normalized_origins)
+                anchors_used.extend(anchors)
+            if not rejection and (len(chain) != 3 or len(selected) != 2 or selected[0] != selected[1]):
+                rejection = 'combo_forwarded_rate_conflict'
+            if not rejection:
+                states = chain[0].get('enable_observations') or []
+                prior = [row for row in states if type(row.get('operationSeq')) is int and row['operationSeq'] <= seq]
+                if prior:
+                    latest = max(row['operationSeq'] for row in prior)
+                    enabled = {row.get('enabled') for row in prior if row['operationSeq'] == latest}
+                    if enabled != {True}:
+                        rejection = 'disabled_or_conflicting_combo_modifier'
+                elif chain[0].get('rdps_conflicting_enable_state'):
+                    rejection = 'disabled_or_conflicting_combo_modifier'
+            if rejection:
+                hit['rdps_unresolved_effect_conditions'] = True
+                hit.setdefault('combo_unresolved_reasons', []).append({'uid': uid, 'reason': rejection})
+                continue
+            projection_key = f'{trigger_id}::packet/{session}/{seq}/{stamp[1]}'
+            approval = _rdps_registry_verified_effect_entry({'event_key': projection_key,
+                'source_character_key': chain[0]['source_character_key'], 'target_character_key': hit['character_key']})
+            if (not approval or not approval.get('_rdps_whitelist_keys')
+                    or not any(row.get('zone') == 'combo' and row.get('element') == 'all' for row in approval.get('effects') or [])):
+                continue
+            rate = selected[0] * (skill_factor if mask & 0x100 else 1.0)
+            if not isfinite(rate) or rate <= 0:
+                continue
+            windows.append({'uid': uid, 'start_ts_ms': stamp[0], 'end_ts_ms': stamp[0],
+                'start_line_no': stamp[1], 'end_line_no': stamp[1] + 1, 'line_no': stamp[1],
+                'snapshot_update': True, 'snapshot_end_ts_ms': stamp[0], 'snapshot_end_line_no': stamp[1] + 1,
+                'duration_ms': 1, 'stacking_type': (roots[modifier_id].get('stackingSettings') or {}).get('stackingType'),
+                'stack_limit': None, 'source_character_key': chain[0]['source_character_key'],
+                'source_character_name': chain[0].get('source_character_name'), 'source_actor_id': chain[0]['source_actor_id'],
+                'target_character_key': hit['character_key'], 'target_character_name': hit.get('character_name') or hit['character_key'],
+                'target_actor_id': hit['source_actor_id'],
+                'target_player_key': hit['character_key'], 'target_enemy_key': None,
+                'event_key': projection_key, 'event_name': '连击增伤', 'skill_family_key': None,
+                'zone_effects': [{'zone': 'combo', 'element': 'all', 'rate': rate,
+                                  'external_rdps_allowed': True, 'rdps_whitelist_keys': list(approval['_rdps_whitelist_keys'])}],
+                'combo_rate_model': 'exact_packet_modifier_and_creation_chain', 'combo_imbue_scale': selected[0],
+                'combo_skill_scope_mask': mask & 0x300, 'combo_skill_scope_source': scope_source,
+                'combo_source_uids': [row['uid'] for row in reversed(chain)],
+                'combo_origins': copy.deepcopy(origins_used), 'combo_creation_observations': copy.deepcopy(anchors_used),
+                'combo_hit_identity': {'sessionId': session, 'operationSeq': seq, 'lineNo': stamp[1],
+                                       'targetActorId': hit.get('target_actor_id'), 'damageUnitIndex': hit.get('damage_unit_index')}})
+    return windows
 
 
 def parse_raw_battle_log_text(
@@ -10256,6 +11157,7 @@ def parse_raw_battle_log_text(
     reference_date: date | None = None,
     include_rdps_debug: bool = False,
     loadout_override_by_char: dict[str, dict[str, Any]] | None = None,
+    critical_attributes_override_by_actor: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     reference_date = reference_date or datetime.now().astimezone().date()
     text = _apply_short_actor_aliases(text)
@@ -10265,7 +11167,10 @@ def parse_raw_battle_log_text(
     last_hit_hint_ms = _parse_hint_timestamp_ms(last_hit_hint)
 
     hits: list[dict[str, Any]] = []
+    unresolved_hits: list[dict[str, Any]] = []
+    unresolved_buff_actions: list[dict[str, Any]] = []
     hits_by_seq: dict[int, dict[str, Any]] = {}
+    critical_stats_by_actor = copy.deepcopy(critical_attributes_override_by_actor or {})
     baseline_by_character: dict[str, dict[int, float]] = {}
     buff_starts: list[dict[str, Any]] = []
     roster_order: list[str] = []
@@ -10275,7 +11180,6 @@ def parse_raw_battle_log_text(
     enemy_counter: Counter[str] = Counter()
     last_enemy_hp_by_target: dict[str, int] = {}
     active_buff_starts_by_uid: dict[str, dict[str, Any]] = {}
-    buff_start_index_by_uid_ts: dict[tuple[str, int], int] = {}
     packet_modifier_last_seen_by_uid: dict[str, int] = {}
     pending_attr_mods: dict[str, list[dict[str, str]]] = defaultdict(list)
     pending_buff_record: dict[str, Any] | None = None
@@ -10290,11 +11194,22 @@ def parse_raw_battle_log_text(
     # CHAR_SKILLS（bridge 自 SC_SELF_SCENE_INFO_SKILLS 落盘）：角色技能等级清单，
     # 供排轴导出 API 消费；同角色多次同步取最后一次。
     char_skill_levels: dict[str, dict[str, int]] = {}
+    squad_actor_keys: dict[str, str] = {}
     first_party_action_ms: int | None = None
     recent_numeric_buffs_by_source: dict[str, list[dict[str, Any]]] = defaultdict(list)
     dungeon_context: tuple[str, str] | None = None
     dungeon_context_id: str | None = None
     party_actor_ids: set[str] = set()
+    entity_stats_timelines: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    dynamic_bb_events: list[dict[str, Any]] = []
+    buff_attribute_refresh_events: list[dict[str, Any]] = []
+    buff_creation_operation_history: dict[tuple[Any, ...], dict[str, Any]] = {}
+    # A typed root is immutable during a parse. Keep its exact object alive and
+    # index every integer action identity once; duplicate identities and the
+    # inherited enabled state remain part of each lookup's existing guards.
+    # This cache is local so another parse/root/version cannot reuse its proof.
+    buff_root_action_indices: dict[int, tuple[Any, dict[int, list[tuple[dict[str, Any], bool]]],
+                                                   list[tuple[dict[str, Any], bool]]]] = {}
     game_timer_start_ms: int | None = None
     game_timer_end_ms: int | None = None
     game_timer_elapsed_ms: int | None = None
@@ -10302,6 +11217,8 @@ def parse_raw_battle_log_text(
     official_timer_start_ms: int | None = None
     official_timer_elapsed_ms: int | None = None
     official_timer_end_ms: int | None = None
+    live_timer_elapsed_ms: int | None = None
+    packet_timer_elapsed_ms: int | None = None
     timer_start_seen = False
     timer_end_seen = False
     timer_window_valid = True
@@ -10339,19 +11256,411 @@ def parse_raw_battle_log_text(
         # keeping or guessing a leaderboard from an enemy target.
         dungeon_context = _resolve_dungeon_context(context_id)
 
+    timestamp_clock_origin: int | None = None
+    timer_observed_times: dict[int, int] = {}
     for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        if "GAME_TIMER_RESET source=CAPTURE_SESSION_START" in raw_line:
+            critical_stats_by_actor.clear()
         ts_ms = _parse_prefixed_timestamp_ms(raw_line)
         if ts_ms is None:
             continue
+        # Legacy trace timestamps are time-of-day, not dated instants. Express
+        # them in one fixed modulo-24h coordinate system for this segment.
+        # Never increment a day on a decreasing observation: late/replayed
+        # events must keep the same coordinate. This is not server elapsed
+        # time and is never used to validate or reconstruct passTime.
+        if timestamp_clock_origin is None:
+            timestamp_clock_origin = ts_ms
+        ts_ms = timestamp_clock_origin + (ts_ms - timestamp_clock_origin) % 86_400_000
+        if 'TIMER_' in raw_line or 'GAME_INST_' in raw_line or 'GAME_MECHANICS_TIME_FREEZE' in raw_line:
+            timer_observed_times[line_no] = ts_ms
         if first_context_ms is None:
             first_context_ms = ts_ms
         last_context_ms = ts_ms
         party_actor_ids.update(_collect_party_actor_ids(raw_line))
+        if " SQUAD " in raw_line:
+            members = [(match.group(2), match.group(1)) for match in _SQUAD_MEMBER_RE.finditer(raw_line)]
+            squad_actor_keys = dict(members) if len({pair[0] for pair in members}) == len(members) else {}
+
+        entity_stats_snapshot = _parse_entity_stats_snapshot(raw_line)
+        if entity_stats_snapshot is not None:
+            entity_id, snapshot = entity_stats_snapshot
+            snapshot["ts_ms"] = ts_ms
+            snapshot["line_no"] = line_no
+            entity_stats_timelines[entity_id].append((ts_ms, snapshot))
+            update_critical_observation(critical_stats_by_actor, entity_id, snapshot, line_no)
+            continue
+
+        if " ENTITY_ATTR_UPDATE " in raw_line:
+            update = _parse_entity_stats_snapshot(raw_line.replace(" ENTITY_ATTR_UPDATE ", " ENTITY_STATS ", 1))
+            if update is not None:
+                entity_id, snapshot = update
+                snapshot["ts_ms"] = ts_ms
+                update_critical_observation(critical_stats_by_actor, entity_id, snapshot, line_no, partial=True)
+            continue
+
+        if " BUFF_ACTION_UNRESOLVED " in raw_line:
+            fields = _extract_fields(raw_line)
+            unresolved_buff_actions.append({
+                'uid': fields.get('uid'), 'seq': fields.get('seq'),
+                'ts_ms': ts_ms, 'line_no': line_no,
+                'trigger_type': fields.get('triggerType'), 'action_id': fields.get('actionId'),
+                'target_actor_id': fields.get('ownerId'), 'source_actor_id': fields.get('srcId'),
+                'reason': 'unresolved_buff_action_phase',
+            })
+            continue
+
+        if " BUFF_KEYWORD_UPDATE " in raw_line or " BUFF_KEYWORD_UPDATE_UNRESOLVED " in raw_line:
+            keyword_record = None
+            keyword_bound = False
+            keyword_observation = {}
+            try:
+                tag = (' BUFF_KEYWORD_UPDATE_UNRESOLVED ' if ' BUFF_KEYWORD_UPDATE_UNRESOLVED ' in raw_line
+                       else ' BUFF_KEYWORD_UPDATE ')
+                encoded = raw_line.split(tag, 1)[1]
+                pairs = json.loads(encoded, object_pairs_hook=list)
+                if (not encoded.startswith('{') or not isinstance(pairs, list)
+                        or any(not isinstance(pair, tuple) or len(pair) != 2 for pair in pairs)):
+                    raise ValueError('invalid_keyword_observation')
+                keyword_observation = dict(pairs)
+                if len(keyword_observation) != len(pairs):
+                    raise ValueError('duplicate_keyword_fields')
+                uid = keyword_observation.get('buffUid')
+                owner = keyword_observation.get('ownerId')
+                session = keyword_observation.get('sessionId')
+                seq = keyword_observation.get('operationSeq')
+                generation = keyword_observation.get('generation')
+                added = keyword_observation.get('addedBuffNumId')
+                keyword_record = active_buff_starts_by_uid.get(uid) if isinstance(uid, str) else None
+                if (keyword_observation.get('schemaVersion') != 1
+                        or type(keyword_observation.get('schemaVersion')) is not int
+                        or keyword_observation.get('operationPayloadCase') != 'trigger_keyword_op_data'
+                        or keyword_record is None or keyword_record.get('rdps_live_identity_conflict')
+                        or not isinstance(session, str) or not session
+                        or type(seq) is not int or seq < 0
+                        or type(generation) is not int or not 0 <= generation < 2**32
+                        or type(added) is not int or added < 0
+                        or any(not isinstance(value, str) or not re.fullmatch(r'[1-9][0-9]*', value)
+                               or int(value) >= 2**64 for value in (uid, owner))
+                        or keyword_record.get('target_actor_id') != owner
+                        or (ts_ms, line_no) < (keyword_record['ts_ms'], keyword_record['line_no'])):
+                    raise ValueError('unbound_keyword_identity')
+                anchors = keyword_record.get('creation_observations') or []
+                if (not any(anchor.get('sessionId') == session for anchor in anchors)
+                        or any(anchor.get('sessionId') not in (None, session) for anchor in anchors)):
+                    raise ValueError('keyword_creation_session_mismatch')
+                if any(anchor.get('sessionId') == session and anchor.get('operationSeq', -1) >= seq
+                       for anchor in anchors if anchor.get('line_no', 0) >= keyword_record['line_no']):
+                    raise ValueError('keyword_update_before_creation')
+                approved = _rdps_registry_matching_effect_entry(keyword_record, require_guard=True,
+                                                                  root_lookup_cache=buff_root_action_indices)
+                if (not approved or approved.get('_rdps_whitelist_keys') != ['buff_chr_0023_antal_normal_fragile']
+                        or not approved.get('_keyword_origin')):
+                    raise ValueError('keyword_update_without_approved_origin')
+                keyword_bound = True
+                raw_rows = keyword_observation.get('modify')
+                normalized_rows = []
+                for raw_row in raw_rows if isinstance(raw_rows, list) else []:
+                    normalized_rows.append(dict(raw_row) if isinstance(raw_row, list)
+                                           and all(isinstance(pair, tuple) and len(pair) == 2 for pair in raw_row)
+                                           else raw_row)
+                signature = (generation, added, json.dumps(normalized_rows if isinstance(raw_rows, list) else raw_rows,
+                                                          sort_keys=True, ensure_ascii=False))
+                seen = keyword_record.setdefault('_keyword_seen_updates', {})
+                snapshots = keyword_record.setdefault('keyword_rate_snapshots', [])
+                if seq in seen:
+                    if seen[seq] != signature:
+                        for previous in snapshots:
+                            if previous['operation_seq'] == seq:
+                                previous['status'] = 'conflicting_keyword_update'
+                        raise ValueError('conflicting_keyword_update')
+                    continue
+                seen[seq] = signature
+                if keyword_observation.get('validationErrors'):
+                    raise ValueError('unresolved_keyword_packet_fields')
+                if not isinstance(raw_rows, list) or len(raw_rows) != 1:
+                    raise ValueError('invalid_keyword_modify_rows')
+                row_pairs = raw_rows[0]
+                if (not isinstance(row_pairs, list)
+                        or any(not isinstance(pair, tuple) or len(pair) != 2 for pair in row_pairs)):
+                    raise ValueError('invalid_keyword_modify_row')
+                row = dict(row_pairs)
+                if len(row) != len(row_pairs) or type(row.get('configIndex')) is not int or row['configIndex'] != 0:
+                    raise ValueError('invalid_keyword_config_index')
+                rate = row.get('rateAfter')
+                if type(rate) not in (int, float) or _coerce_optional_float(rate) is None or rate < 0:
+                    raise ValueError('invalid_keyword_rate')
+                added_id = _load_num_id_str_buff_map().get(str(added))
+                parent_root = _load_current_buff_roots().get('buff_chr_0023_antal_tageffect') or {}
+                for origin in approved['_keyword_origin']:
+                    selected = []; pending = [parent_root]
+                    while pending:
+                        node = pending.pop()
+                        if isinstance(node, dict):
+                            if (node.get('$type') == 'Beyond.Gameplay.Core.VulnerableAction.Data'
+                                    and node.get('serverActionIndex') == origin['actionId']):
+                                selected.append(node)
+                            pending.extend(node.values())
+                        elif isinstance(node, list):
+                            pending.extend(node)
+                    enhancing = selected[0].get('enhancingList') if len(selected) == 1 else None
+                    if (not isinstance(enhancing, list) or len(enhancing) != 1
+                            or enhancing[0].get('operationType') != 'Add'
+                            or (enhancing[0].get('value') or {}).get('useBlackboardKey') is not True
+                            or (enhancing[0].get('value') or {}).get('blackboardKey') != 'potential_5_rate'
+                            or added_id not in (enhancing[0].get('buffIds') or [])):
+                        raise ValueError('keyword_marker_not_in_current_config')
+                snapshots.append({'operation_seq': seq, 'line_no': line_no, 'ts_ms': ts_ms,
+                                  'session_id': session, 'generation': generation,
+                                  'rate_after': float(rate), 'status': 'observed',
+                                  'added_buff_id': added_id, 'config_index': row['configIndex']})
+            except (ValueError, TypeError, KeyError, IndexError) as error:
+                if keyword_bound and keyword_record is not None:
+                    snapshots = keyword_record.setdefault('keyword_rate_snapshots', [])
+                    if not any(row['operation_seq'] == keyword_observation['operationSeq'] for row in snapshots):
+                        snapshots.append({'operation_seq': keyword_observation['operationSeq'], 'line_no': line_no,
+                                          'ts_ms': ts_ms, 'session_id': keyword_observation['sessionId'],
+                                          'generation': keyword_observation['generation'], 'rate_after': None,
+                                          'status': 'unresolved_keyword_update'})
+                unresolved_buff_actions.append({'ts_ms': ts_ms, 'line_no': line_no,
+                                                'reason': str(error), 'source': 'BUFF_KEYWORD_UPDATE'})
+            continue
+
+        if " BUFF_ENABLE " in raw_line:
+            try:
+                state_text = raw_line.split(' BUFF_ENABLE ', 1)[1]
+                pairs = json.loads(state_text, object_pairs_hook=list)
+                if not state_text.startswith('{') or any(not isinstance(pair, tuple) or len(pair) != 2 for pair in pairs):
+                    raise ValueError('state_not_object')
+                state = dict(pairs)
+                if len(state) != len(pairs):
+                    raise ValueError('duplicate_state_fields')
+                uid = state.get('buffUid')
+                record = active_buff_starts_by_uid.get(uid) if isinstance(uid, str) else None
+                if (type(state.get('schemaVersion')) is not int or state['schemaVersion'] != 1
+                        or type(state.get('enabled')) is not bool or record is None
+                        or type(state.get('ownerId')) is not str or state['ownerId'] != record.get('target_actor_id')
+                        or type(state.get('operationSeq')) is not int or state['operationSeq'] < 0):
+                    raise ValueError('unbound_buff_enable_state')
+                previous = record.setdefault('enable_observations', [])
+                if any(row['operationSeq'] == state['operationSeq'] and row['enabled'] != state['enabled'] for row in previous):
+                    record['rdps_conflicting_enable_state'] = True
+                    unresolved_buff_actions.append({'uid': uid, 'ts_ms': ts_ms, 'line_no': line_no,
+                                                   'reason': 'conflicting_buff_enable_state'})
+                previous.append({**state, 'ts_ms': ts_ms, 'line_no': line_no})
+            except (ValueError, TypeError, KeyError):
+                unresolved_buff_actions.append({'ts_ms': ts_ms, 'line_no': line_no, 'reason': 'unbound_buff_enable_state'})
+            continue
+
+        if " BUFF_CREATE_OBSERVED " in raw_line:
+            try:
+                blob = raw_line.split(' BUFF_CREATE_OBSERVED ', 1)[1]
+                pairs = json.loads(blob, object_pairs_hook=list)
+                if not blob.startswith('{') or any(not isinstance(pair, tuple) or len(pair) != 2 for pair in pairs):
+                    raise ValueError('creation_not_object')
+                observation = dict(pairs)
+                if len(observation) != len(pairs):
+                    raise ValueError('duplicate_creation_fields')
+                uid = observation.get('buffUid')
+                record = active_buff_starts_by_uid.get(uid) if isinstance(uid, str) else None
+                template = observation.get('buffTemplate')
+                if isinstance(template, str) and template.isdigit():
+                    template = _load_num_id_str_buff_map().get(template)
+                reported_templates = []
+                number = observation.get('buffNumId')
+                if number not in (None, 0):
+                    if type(number) is not int or number < 0:
+                        raise ValueError('invalid_creation_numeric_template')
+                    reported_templates.append(_load_num_id_str_buff_map().get(str(number)))
+                elif type(number) is bool:
+                    raise ValueError('invalid_creation_numeric_template')
+                literal = observation.get('buffId')
+                if literal not in (None, ''):
+                    if not isinstance(literal, str):
+                        raise ValueError('invalid_creation_string_template')
+                    reported_templates.append(literal)
+                template_pairs = observation.get('buffTemplateId')
+                if template_pairs is not None:
+                    if (not isinstance(template_pairs, list)
+                            or any(not isinstance(pair, tuple) or len(pair) != 2 for pair in template_pairs)):
+                        raise ValueError('invalid_creation_template_object')
+                    template_object = dict(template_pairs)
+                    if len(template_object) != len(template_pairs):
+                        raise ValueError('duplicate_creation_template_fields')
+                    observation['buffTemplateId'] = template_object
+                    choices = [key for key in ('int_id', 'str_id') if key in template_object]
+                    if (len(choices) != 1 or type(template_object.get('type')) not in (int, str)
+                            or template_object['type'] not in (1, 'Buff')):
+                        raise ValueError('invalid_creation_template_oneof')
+                    if choices[0] == 'int_id':
+                        number = template_object['int_id']
+                        if type(number) is not int or number < 0:
+                            raise ValueError('invalid_creation_numeric_template')
+                        reported_templates.append(_load_num_id_str_buff_map().get(str(number)))
+                    else:
+                        literal = template_object['str_id']
+                        if not isinstance(literal, str) or not literal:
+                            raise ValueError('invalid_creation_string_template')
+                        reported_templates.append(literal)
+                if not reported_templates or any(value != template for value in reported_templates):
+                    raise ValueError('creation_template_evidence_conflict')
+                if (record is not None and template == record.get('event_key')
+                        and observation.get('sourceEvent') == 'BattleOpTriggerAction'
+                        and observation.get('sourceActorId') == record.get('source_actor_id')
+                        and observation.get('targetActorId') == record.get('target_actor_id')
+                        and isinstance(observation.get('sessionId'), str) and observation['sessionId']
+                        and type(observation.get('operationSeq')) is int and observation['operationSeq'] >= 0):
+                    context = {'session_id': observation['sessionId'], 'operation_seq': observation['operationSeq']}
+                    contexts = record.setdefault('packet_creation_contexts', [])
+                    if context not in contexts:
+                        contexts.append(context)
+                if (type(observation.get('schemaVersion')) is not int or observation['schemaVersion'] != 1
+                        or record is None or template != record.get('event_key')
+                        or observation.get('sourceEvent') not in {'BattleOpTriggerAction', 'BattleOpAddBuff'}
+                        or not isinstance(observation.get('sessionId'), str) or not observation['sessionId']
+                        or type(observation.get('operationSeq')) is not int or observation['operationSeq'] < 0
+                        or observation.get('generationScope') != 'operation_owner'
+                        or any(type(observation.get(key)) is not str or not re.fullmatch(r'[1-9]\d*', observation[key])
+                               or int(observation[key]) >= 2**64 for key in ('buffUid', 'targetActorId', 'operationOwnerId'))
+                        or uid in {'0', '4294967295'}
+                        or observation['targetActorId'] != record.get('target_actor_id')
+                        or (record.get('source_actor_id') and observation.get('sourceActorId') != record['source_actor_id'])):
+                    raise ValueError('unbound_buff_creation_observation')
+                previous = record.setdefault('creation_observations', [])
+                observed_values = dict(record.get('_observed_bb_values') or {})
+                bb_conflicts = set()
+                assigned = observation.get('assignedItems')
+                if isinstance(assigned, list):
+                    decoded_items = []
+                    observed_values = {}
+                    for item_pairs in assigned:
+                        if (not isinstance(item_pairs, list)
+                                or any(not isinstance(pair, tuple) or len(pair) != 2 for pair in item_pairs)):
+                            bb_conflicts.add('*')
+                            continue
+                        item = dict(item_pairs)
+                        if len(item) != len(item_pairs):
+                            bb_conflicts.add('*')
+                            continue
+                        decoded_items.append(item)
+                        key = item.get('target_key')
+                        operand = item.get('numeric_value')
+                        if not isinstance(key, str) or not key:
+                            bb_conflicts.add('*')
+                            continue
+                        if (item.get('use_direct_value') is not True or type(operand) not in (int, float)
+                                or _coerce_optional_float(operand) is None):
+                            bb_conflicts.add(key)
+                            continue
+                        operand = float(operand)
+                        if key in observed_values and observed_values[key].hex() != operand.hex():
+                            bb_conflicts.add(key)
+                        observed_values[key] = operand
+                    observation['assignedItems'] = decoded_items
+                    for key in bb_conflicts:
+                        observed_values.pop(key, None)
+                    if '*' in bb_conflicts:
+                        observed_values = {}
+                creation_key = (observation['sessionId'], observation['operationOwnerId'],
+                                observation.get('operationGeneration'), observation['operationSeq'], uid)
+                historical_creation = buff_creation_operation_history.get(creation_key)
+                same_operations = [historical_creation['observation']] if historical_creation is not None else []
+                pending_state = record.get('_dynamic_pending_state')
+                comparable_anchors = [row for row in previous if
+                    (row['sessionId'], row['operationOwnerId'], row.get('operationGeneration')) == creation_key[:3]]
+                stale = any(row['operationSeq'] > observation['operationSeq'] for row in comparable_anchors)
+                if (pending_state is not None and pending_state['context'] == creation_key[:3]
+                        and observation['operationSeq'] < pending_state['last_seq']):
+                    stale = True
+                conflicting = any(observed_values and row.get('bb_values') and row['bb_values'] != observed_values for row in same_operations)
+                if same_operations or stale:
+                    prior_record = record.get('_previous_snapshot_record')
+                    incoming_record = record
+                    if prior_record is not None:
+                        for key, old_value in record['_previous_snapshot_boundary'].items():
+                            if old_value is None:
+                                prior_record.pop(key, None)
+                            else:
+                                prior_record[key] = old_value
+                        active_buff_starts_by_uid[uid] = prior_record
+                        pending_buff_record = prior_record
+                        record = prior_record
+                    elif historical_creation is not None and historical_creation['instance_start_line_no'] != record['instance_start_line_no']:
+                        active_buff_starts_by_uid.pop(uid, None)
+                        pending_buff_record = None
+                        record = historical_creation['record']
+                    if record is not incoming_record:
+                        buff_starts = [row for row in buff_starts if row is not incoming_record]
+                    record.setdefault('repeated_creation_observations', []).append({
+                        **observation, 'ts_ms': ts_ms, 'line_no': line_no, 'bb_values': observed_values,
+                        'status': 'conflicting' if conflicting else 'duplicate' if same_operations else 'out_of_order'})
+                    if conflicting:
+                        affected_record = historical_creation['record'] if historical_creation is not None else record
+                        affected_record.setdefault('_dynamic_unresolved_keys', set()).add('*')
+                        if affected_record.get('_dynamic_pending_state') is not None:
+                            affected_record['_dynamic_pending_state']['invalid_keys'].add('*')
+                        for snapshot in affected_record.get('attribute_refresh_snapshots') or []:
+                            if snapshot['operation_seq'] >= observation['operationSeq']:
+                                snapshot['status'] = 'conflicting_creation_parameters'
+                    continue
+                if any(row['sessionId'] != observation['sessionId'] for row in previous):
+                    record['rdps_dynamic_identity_conflict'] = True
+                    raise ValueError('conflicting_buff_creation_session')
+                accepted = {**observation, 'ts_ms': ts_ms, 'line_no': line_no, 'bb_values': observed_values,
+                            'bb_conflicts': sorted(bb_conflicts), 'bb_observation_source': 'unverified_creation_bb'}
+                previous.append(accepted)
+                buff_creation_operation_history[creation_key] = {
+                    'observation': accepted, 'record': record, 'instance_start_line_no': record['instance_start_line_no']}
+                record['_observed_bb_values'] = {}
+                if pending_state is not None:
+                    context = pending_state['context']
+                    same_owner_wrong_generation = (observation['operationOwnerId'] == context[1]
+                                                    and observation.get('operationGeneration') != context[2])
+                    if not same_owner_wrong_generation:
+                        pending_state['values'].update(observed_values)
+                        pending_state['invalid_keys'].difference_update(observed_values)
+                        record.setdefault('_dynamic_unresolved_keys', set()).difference_update(observed_values)
+                        pending_state['invalid_keys'].update(bb_conflicts)
+                        for key in observed_values:
+                            pending_state['value_sources'][key] = {'kind': 'creation_observation', 'creation_key': creation_key}
+            except (ValueError, TypeError, KeyError):
+                unresolved_buff_actions.append({'ts_ms': ts_ms, 'line_no': line_no,
+                                               'reason': 'unbound_buff_creation_observation'})
+            continue
+
+        if " BUFF_ORIGIN " in raw_line:
+            try:
+                origin_text = raw_line.split(' BUFF_ORIGIN ', 1)[1]
+                pairs = json.loads(origin_text, object_pairs_hook=list)
+                if (not origin_text.startswith('{') or not isinstance(pairs, list)
+                        or any(not isinstance(pair, tuple) or len(pair) != 2 for pair in pairs)):
+                    raise ValueError('origin_not_object')
+                origin = dict(pairs)
+                if len(origin) != len(pairs):
+                    raise ValueError('duplicate_origin_fields')
+                uid = origin.get('buffUid')
+                record = active_buff_starts_by_uid.get(uid) if isinstance(uid, str) else None
+                if (type(origin.get('schemaVersion')) is not int or origin['schemaVersion'] != 1
+                        or record is None or origin.get('buffTemplate') not in {record.get('event_key'), record.get('raw_event_key')}
+                        or any(type(origin.get(key)) is not str or not re.fullmatch(r'[1-9]\d*', origin[key])
+                               or int(origin[key]) >= 2**64 for key in ('buffUid','sourceActorId','targetActorId','environmentInstId'))
+                        or origin['sourceActorId'] != record.get('source_actor_id')
+                        or origin['targetActorId'] != record.get('target_actor_id')
+                        or type(origin.get('actionId')) is not int or origin['actionId'] < 0
+                        or type(origin.get('operationSeq')) is not int or origin['operationSeq'] < 0
+                        or type(origin.get('triggerType')) is not int or origin['triggerType'] != 0):
+                    raise ValueError('unbound_origin_identity')
+                record.setdefault('origin_observations', []).append({**origin, 'lineNo': line_no, '_boundCreateRecord': True})
+            except (ValueError, TypeError, KeyError):
+                unresolved_buff_actions.append({'ts_ms': ts_ms, 'line_no': line_no,
+                                               'reason': 'unbound_buff_origin'})
+            continue
 
         if " LOADOUT reason=" in raw_line or "LOADOUT reason=" in raw_line:
             fields = _extract_fields(raw_line)
             current_loadout_group = {
                 "ts_ms": ts_ms,
+                "line_no": line_no,
                 "reason": str(fields.get("reason") or ""),
                 "index": len(loadout_groups),
                 "rows": {},
@@ -10383,10 +11692,12 @@ def parse_raw_battle_log_text(
             continue
 
         if " LOADOUT_STATS " in raw_line or "LOADOUT_STATS " in raw_line:
-            stats_snapshot = _parse_loadout_stats_snapshot(raw_line)
+            stats_snapshot = _parse_loadout_stats_snapshot(raw_line,
+                allow_bound_gem=bool(current_loadout_group and current_loadout_group.get("ts_ms") == ts_ms
+                    and current_loadout_group.get("reason") in {"SC_SYNC_CHAR_BAG_INFO", "SC_SELF_SCENE_INFO"}))
             if stats_snapshot is not None:
                 char_key = str(stats_snapshot["character_key"])
-                loadout_by_char[char_key] = _merge_loadout_snapshot(
+                loadout_by_char[char_key] = _merge_tracked_loadout_state(
                     loadout_by_char.get(char_key, {"character_key": char_key}),
                     stats_snapshot,
                 )
@@ -10398,6 +11709,7 @@ def parse_raw_battle_log_text(
                 if current_loadout_group is None or current_loadout_group.get("ts_ms") != ts_ms:
                     current_loadout_group = {
                         "ts_ms": ts_ms,
+                        "line_no": line_no,
                         "reason": "",
                         "index": len(loadout_groups),
                         "rows": {},
@@ -10419,7 +11731,7 @@ def parse_raw_battle_log_text(
             loadout_snapshot = _parse_loadout_slot_snapshot(raw_line)
             if loadout_snapshot is not None:
                 char_key = str(loadout_snapshot["character_key"])
-                loadout_by_char[char_key] = _merge_loadout_snapshot(
+                loadout_by_char[char_key] = _merge_tracked_loadout_state(
                     loadout_by_char.get(char_key, {}),
                     loadout_snapshot,
                 )
@@ -10431,6 +11743,7 @@ def parse_raw_battle_log_text(
                 if current_loadout_group is None or current_loadout_group.get("ts_ms") != ts_ms:
                     current_loadout_group = {
                         "ts_ms": ts_ms,
+                        "line_no": line_no,
                         "reason": "",
                         "index": len(loadout_groups),
                         "rows": {},
@@ -10461,6 +11774,20 @@ def parse_raw_battle_log_text(
         if _OFFICIAL_TIMER_START_RE.search(raw_line):
             fields = _extract_fields(raw_line)
             set_dungeon_context(fields.get("gameId") or fields.get("game_id"))
+            # A new explicit challenge start opens a new timer scope. A prior
+            # attempt's completion and elapsed time cannot certify this one.
+            official_timer_elapsed_ms = None
+            official_timer_end_ms = None
+            live_timer_elapsed_ms = None
+            game_timer_end_ms = None
+            game_timer_elapsed_ms = None
+            game_timer_window_elapsed_ms = None
+            packet_timer_elapsed_ms = None
+            timer_end_seen = False
+            timer_window_valid = True
+            challenge_pass_confirmed = False
+            official_pass_confirmed = False
+            completion_source = ""
             official_timer_start_ms = ts_ms
             game_timer_start_ms = ts_ms
             timer_start_seen = True
@@ -10470,6 +11797,7 @@ def parse_raw_battle_log_text(
             fields = _extract_fields(raw_line)
             elapsed_ms = _coerce_int(fields.get("elapsedMs"), default=0)
             if elapsed_ms > 0:
+                live_timer_elapsed_ms = elapsed_ms
                 game_timer_end_ms = ts_ms
                 game_timer_elapsed_ms = elapsed_ms
                 game_timer_window_elapsed_ms = elapsed_ms
@@ -10508,6 +11836,9 @@ def parse_raw_battle_log_text(
                 completion_source = str(fields.get("source") or "game_timer_end")
             elapsed_ms = _coerce_int(fields.get("elapsedMs"), default=0)
             wall_elapsed_ms = _coerce_int(fields.get("wallElapsedMs"), default=0)
+            packet_elapsed_ms = _coerce_int(fields.get("packetElapsedMs"), default=0)
+            if packet_elapsed_ms > 0:
+                packet_timer_elapsed_ms = packet_elapsed_ms
             sane = _coerce_int(fields.get("sane"), default=1)
             if (
                 official_timer_elapsed_ms is None
@@ -10538,6 +11869,7 @@ def parse_raw_battle_log_text(
                 "line_no": line_no,
                 "skill": cast_skill,
                 "owner": fields.get("owner"),
+                "owner_id": fields.get("ownerId"),
                 "skill_inst_id": fields.get("inst"),
                 "skill_source": fields.get("skillSource") or fields.get("skill_source"),
                 "source_character_key": cast_character_key,
@@ -10576,6 +11908,448 @@ def parse_raw_battle_log_text(
             parsed_char_skills = _parse_char_skills_line(raw_line)
             if parsed_char_skills is not None:
                 char_skill_levels[parsed_char_skills[0]] = parsed_char_skills[1]
+                char_key = parsed_char_skills[0]
+                stats_snapshot = _parse_loadout_stats_snapshot(
+                    raw_line, loadout_context=loadout_by_char.get(char_key), squad_actor_keys=squad_actor_keys
+                )
+                if stats_snapshot is not None:
+                    loadout_by_char[char_key] = stats_snapshot
+                    current_loadout_group = {
+                        "ts_ms": ts_ms, "line_no": line_no, "reason": "CHAR_SKILLS", "index": len(loadout_groups),
+                        "rows": {key: copy.deepcopy(loadout_by_char[key])
+                                 for key in set(squad_actor_keys.values()) if key in loadout_by_char},
+                    }
+                    loadout_groups.append(current_loadout_group)
+            continue
+
+        if (" BB_MODIFY_DYNAMIC " in raw_line or " BUFF_ATTR_REFRESH " in raw_line
+                or " BUFF_ATTR_REFRESH_UNRESOLVED " in raw_line):
+            refresh_tag = (' BUFF_ATTR_REFRESH_UNRESOLVED ' if ' BUFF_ATTR_REFRESH_UNRESOLVED ' in raw_line
+                           else ' BUFF_ATTR_REFRESH ')
+            is_refresh = refresh_tag in raw_line
+            fields = _extract_fields(raw_line.split(' identity=', 1)[0]) if not is_refresh else {}
+            value = _coerce_optional_float(fields.get("value"))
+            blackboard_key = None
+            skill_key = fields.get("skill")
+            action_id = _coerce_optional_int(fields.get("actionId"))
+            root = _load_current_buff_roots().get(str(skill_key or ""))
+            action_metadata: dict[str, Any] = {}
+            if isinstance(root, dict) and action_id is not None:
+                cached_actions = buff_root_action_indices.get(id(root))
+                if cached_actions is None or cached_actions[0] is not root:
+                    action_index: dict[int, list[tuple[dict[str, Any], bool]]] = {}
+                    create_actions = []
+                    pending_nodes = [(root, True)]
+                    while pending_nodes:
+                        node, enabled = pending_nodes.pop()
+                        if isinstance(node, dict):
+                            enabled = enabled and ('serverActionIndex' not in node or node.get('isEnable') is True)
+                            if type(node.get('serverActionIndex')) is int:
+                                action_index.setdefault(node['serverActionIndex'], []).append((node, enabled))
+                            if node.get('$type') == 'Beyond.Gameplay.Core.CreateBuffAction.Data':
+                                create_actions.append((node, enabled))
+                            pending_nodes.extend((item, enabled) for item in node.values())
+                        elif isinstance(node, list):
+                            pending_nodes.extend((item, enabled) for item in node)
+                    buff_root_action_indices[id(root)] = (root, action_index, create_actions)
+                else:
+                    action_index = cached_actions[1]
+                matches = [node for node, _enabled in action_index.get(action_id, [])
+                           if str(node.get('$type') or '').replace('+', '.')
+                           == 'Beyond.Gameplay.Core.ModifyDynamicBlackboard.Data']
+                if len(matches) == 1:
+                    node = matches[0]
+                    blackboard_key = str(node.get("key") or "") or None
+                    operand = node.get("value") or {}
+                    action_metadata = {
+                        "blackboard_key_source": "typed_current_buff_action",
+                        "operand_blackboard_key": (operand.get("blackboardKey")
+                                                   if operand.get("useBlackboardKey") is True else None),
+                        "operation": node.get("operation"),
+                    }
+                elif len(matches) > 1:
+                    action_metadata["mapping_error"] = "ambiguous_dynamic_action"
+                else:
+                    action_metadata["mapping_error"] = "missing_dynamic_action"
+            elif action_id is not None:
+                skill_metadata = _load_skill_item_metadata(str(skill_key or ""))
+                action_keys = skill_metadata.get("dynamic_action_keys") if isinstance(skill_metadata, dict) else None
+                if isinstance(action_keys, dict):
+                    blackboard_key = action_keys.get(action_id)
+                    if blackboard_key is not None:
+                        action_metadata["blackboard_key_source"] = "unversioned_skill_observation"
+            event = {
+                "line_no": line_no,
+                "ts_ms": ts_ms,
+                "seq": _coerce_optional_int(fields.get("seq")),
+                "tick": _coerce_optional_int(fields.get("tick")),
+                "instance_id": fields.get("inst"),
+                "owner_id": fields.get("ownerId"),
+                "owner": fields.get("owner"),
+                "skill_key": skill_key,
+                "action_id": action_id,
+                "blackboard_key": blackboard_key,
+                "value": value,
+                **action_metadata,
+            }
+            (buff_attribute_refresh_events if is_refresh else dynamic_bb_events).append(event)
+            # Legacy decoded packets kept exact Buff/owner/template/operation
+            # identities before the later generation/oneof envelope existed.
+            # Preserve that narrower evidence separately; do not fabricate the
+            # missing envelope or let an invalid modern identity fall back to it.
+            try:
+                observation = json.loads(raw_line.split(refresh_tag if is_refresh else ' identity=', 1)[1])
+                context = observation.get('eventContext')
+                legacy = (isinstance(context, dict)
+                          and all(observation.get(key) is None for key in
+                                  ('operationOwnerId', 'ownerId', 'environmentInstId', 'generation',
+                                   'templateType', 'templateIdCase', 'actionRuntimeCase', 'operationPayloadCase')))
+                if legacy and str(context.get('owner_type')) == '1' and context.get('template_type') == 'Buff':
+                    legacy_uid = str(context.get('inst_id'))
+                    legacy_owner = str(context.get('owner_id'))
+                    legacy_seq = context.get('seq_id')
+                    legacy_action = observation.get('actionId')
+                    template_int = context.get('template_int_id')
+                    template_str = context.get('template_str_id')
+                    legacy_template = (_load_num_id_str_buff_map().get(str(template_int))
+                                       if type(template_int) is int and not template_str else template_str)
+                    legacy_record = active_buff_starts_by_uid.get(legacy_uid)
+                    creation_contexts = (legacy_record or {}).get('packet_creation_contexts') or []
+                    creation_sessions = {row['session_id'] for row in creation_contexts}
+                    if (legacy_template in {'buff_common_natural_natural_corrupt_do', 'buff_common_natural_cryst_triggered'}
+                            and type(observation.get('schemaVersion')) is int and observation['schemaVersion'] == 1
+                            and type(legacy_seq) is int and legacy_seq >= 0
+                            and type(legacy_action) is int and legacy_record is not None
+                            and legacy_record.get('event_key') == legacy_template
+                            and legacy_record.get('target_actor_id') == legacy_owner
+                            and legacy_record.get('source_actor_id')
+                            and all(re.fullmatch(r'[1-9]\d*', str(value)) and int(value) < 2**64
+                                    for value in (legacy_uid, legacy_owner, legacy_record.get('source_actor_id')))
+                            and legacy_record.get('source_character_key')
+                            and not legacy_record.get('rdps_live_identity_conflict')
+                            and creation_sessions == {observation.get('sessionId')}
+                            and all(legacy_seq > row['operation_seq'] for row in creation_contexts)
+                            and observation.get('operationSeq') == legacy_seq
+                            and observation.get('actionType') == (31 if is_refresh else 7)):
+                        candidates = []; nodes = [(_load_current_buff_roots().get(legacy_template), True)]
+                        while nodes:
+                            item, enabled = nodes.pop()
+                            if isinstance(item, dict):
+                                enabled = enabled and ('serverActionIndex' not in item or item.get('isEnable') is True)
+                                if item.get('serverActionIndex') == legacy_action:
+                                    candidates.append((item, enabled))
+                                nodes.extend((value, enabled) for value in item.values())
+                            elif isinstance(item, list):
+                                nodes.extend((value, enabled) for value in item)
+                        expected = ('Beyond.Gameplay.Core.RefreshBuffAttrModifierValue.Data' if is_refresh else
+                                    'Beyond.Gameplay.Core.ModifyDynamicBlackboard.Data')
+                        if (len(candidates) == 1 and candidates[0][1] is True
+                                and candidates[0][0].get('$type') == expected):
+                            keys = ('def_decrease', 'additional_def_decrease')
+                            state = legacy_record.setdefault('_resistance_parameter_state', {
+                                'values': {key: _coerce_optional_float((legacy_record.get('bb_values') or {}).get(key)) for key in keys},
+                                'seen': {}, 'last_seq': -1, 'invalid': set()})
+                            key = candidates[0][0].get('key')
+                            if not is_refresh and key in keys:
+                                if (fields.get('inst') == legacy_uid and fields.get('ownerId') == legacy_owner
+                                        and skill_key == legacy_template and action_id == legacy_action
+                                        and _coerce_optional_int(fields.get('seq')) == legacy_seq):
+                                    signature = (legacy_action, key, value)
+                                    if legacy_seq in state['seen']:
+                                        if state['seen'][legacy_seq] != signature:
+                                            state['invalid'].add(key)
+                                            for saved in legacy_record.get('resistance_parameter_snapshots') or []:
+                                                if saved['operation_seq'] >= legacy_seq:
+                                                    saved['status'] = 'conflicting_dynamic_operation'
+                                    elif legacy_seq < state['last_seq']:
+                                        state['invalid'].add(key)
+                                    else:
+                                        state['seen'][legacy_seq] = signature
+                                        state['last_seq'] = legacy_seq
+                                        state['values'][key] = value
+                                        if value is None or value > 0:
+                                            state['invalid'].add(key)
+                                        else:
+                                            state['invalid'].discard(key)
+                            elif is_refresh:
+                                complete = (not state['invalid'] and legacy_seq > state['last_seq']
+                                            and all(state['values'].get(key) is not None and state['values'][key] <= 0 for key in keys))
+                                saved = {'operation_seq': legacy_seq, 'line_no': line_no, 'ts_ms': ts_ms,
+                                         'bb_values': dict(state['values']),
+                                         'status': 'attribute_parameters_observed' if complete else 'missing_attribute_parameters',
+                                         'identity_source': 'legacy_packet_uid_owner_template_sequence',
+                                         'buff_uid': legacy_uid, 'owner_id': legacy_owner,
+                                         'action_id': legacy_action, 'session_id': observation.get('sessionId')}
+                                prior = legacy_record.setdefault('resistance_parameter_snapshots', [])
+                                duplicate = [row for row in prior if row['operation_seq'] == legacy_seq]
+                                if not duplicate:
+                                    prior.append(saved)
+                                elif any(row['bb_values'] != saved['bb_values'] for row in duplicate):
+                                    for row in duplicate:
+                                        row['status'] = 'conflicting_dynamic_operation'
+            except (ValueError, TypeError, KeyError, IndexError):
+                pass
+            record = None
+            identity = None
+            identity_bound = False
+            try:
+                if is_refresh:
+                    identity_text = raw_line.split(refresh_tag, 1)[1]
+                elif ' identity=' in raw_line:
+                    identity_text = raw_line.split(' identity=', 1)[1]
+                else:
+                    raise ValueError('missing_dynamic_identity')
+                pairs = json.loads(identity_text, object_pairs_hook=list)
+                if not identity_text.startswith('{') or any(not isinstance(pair, tuple) or len(pair) != 2 for pair in pairs):
+                    raise ValueError('dynamic_identity_not_object')
+                identity = dict(pairs)
+                if len(identity) != len(pairs):
+                    raise ValueError('duplicate_dynamic_identity_fields')
+                event['identity'] = identity
+                expected_type = 31 if is_refresh else 7
+                runtime_case = 'refresh_buff_attr_modifier_value_action' if is_refresh else 'modify_dynamic_blackboard_action'
+                uid = identity.get('environmentInstId')
+                if (type(identity.get('schemaVersion')) is not int or identity['schemaVersion'] != 1
+                        or type(identity.get('actionType')) is not int or identity['actionType'] != expected_type
+                        or identity.get('actionRuntimeCase') != runtime_case
+                        or identity.get('operationPayloadCase') != 'trigger_action_op_data'
+                        or str(identity.get('ownerType')) != '1' or type(identity.get('ownerType')) not in (int, str)
+                        or identity.get('templateType') != 'Buff'
+                        or type(identity.get('triggerType')) is not int or identity['triggerType'] != 0
+                        or not isinstance(identity.get('sessionId'), str) or not identity['sessionId']
+                        or any(type(identity.get(key)) is not int or identity[key] < 0
+                               for key in ('operationSeq', 'generation', 'actionId'))
+                        or any(type(identity.get(key)) is not str or not re.fullmatch(r'[1-9]\d*', identity[key])
+                               or int(identity[key]) >= 2**64 for key in ('environmentInstId', 'ownerId', 'operationOwnerId'))
+                        or uid in {'0', '4294967295'} or identity['ownerId'] != identity['operationOwnerId']
+                        or (is_refresh and identity.get('buffUid') != uid)):
+                    raise ValueError('invalid_dynamic_buff_identity')
+                if (identity.get('templateIdCase') == 'int_id' and type(identity.get('templateIntId')) is int
+                        and identity['templateIntId'] >= 0 and identity.get('templateStrId') is None):
+                    template = _load_num_id_str_buff_map().get(str(identity['templateIntId']))
+                elif (identity.get('templateIdCase') == 'str_id' and isinstance(identity.get('templateStrId'), str)
+                        and identity['templateStrId'] and identity.get('templateIntId') is None):
+                    template = identity['templateStrId']
+                else:
+                    raise ValueError('invalid_dynamic_template_oneof')
+                record = active_buff_starts_by_uid.get(uid)
+                if (record is None or record.get('rdps_live_identity_conflict') or record.get('rdps_dynamic_identity_conflict')
+                        or template != record.get('event_key') or identity['ownerId'] != record.get('target_actor_id')):
+                    raise ValueError('unbound_dynamic_buff_instance')
+                anchors = record.get('creation_observations') or []
+                if (not anchors or any(row['sessionId'] != identity['sessionId'] for row in anchors)
+                        or not any(row['operationSeq'] <= identity['operationSeq'] for row in anchors)):
+                    raise ValueError('missing_compatible_buff_creation_observation')
+                if not is_refresh and (fields.get('inst') != uid or fields.get('ownerId') != identity['ownerId']
+                        or action_id != identity['actionId'] or skill_key != template
+                        or _coerce_optional_int(fields.get('seq')) != identity['operationSeq'] or value is None):
+                    raise ValueError('dynamic_text_identity_conflict')
+                identity_bound = True
+                root = _load_current_buff_roots().get(template)
+                expected_action = ('Beyond.Gameplay.Core.RefreshBuffAttrModifierValue.Data' if is_refresh else
+                                   'Beyond.Gameplay.Core.ModifyDynamicBlackboard.Data')
+                cached_actions = buff_root_action_indices.get(id(root))
+                if cached_actions is None or cached_actions[0] is not root:
+                    action_index = {}
+                    create_actions = []
+                    pending_nodes = [(root, True)]
+                    while pending_nodes:
+                        node, enabled = pending_nodes.pop()
+                        if isinstance(node, dict):
+                            enabled = enabled and ('serverActionIndex' not in node or node.get('isEnable') is True)
+                            if type(node.get('serverActionIndex')) is int:
+                                action_index.setdefault(node['serverActionIndex'], []).append((node, enabled))
+                            if node.get('$type') == 'Beyond.Gameplay.Core.CreateBuffAction.Data':
+                                create_actions.append((node, enabled))
+                            pending_nodes.extend((item, enabled) for item in node.values())
+                        elif isinstance(node, list):
+                            pending_nodes.extend((item, enabled) for item in node)
+                    buff_root_action_indices[id(root)] = (root, action_index, create_actions)
+                else:
+                    action_index = cached_actions[1]
+                matches = action_index.get(identity['actionId'], [])
+                if len(matches) != 1 or matches[0][1] is not True or matches[0][0].get('$type') != expected_action:
+                    raise ValueError('dynamic_action_not_in_current_template')
+                node = matches[0][0]
+                for anchor in anchors:
+                    anchor['bb_observation_source'] = 'unverified_creation_bb'
+                    if (template not in {'buff_common_natural_natural_corrupt_do', 'buff_common_natural_cryst_triggered'}
+                            or (root.get('stackingSettings') or {}).get('stackingType') != 'Stack'
+                            or anchor.get('sourceEvent') != 'BattleOpTriggerAction'
+                            or anchor.get('creationActionType') != 'BattleActionCreateBuff'
+                            or anchor.get('creationActionRuntimeCase') != 'create_buff_action'
+                            or not isinstance(anchor.get('assignedItems'), list)):
+                        continue
+                    origins = [origin for origin in record.get('origin_observations') or []
+                               if origin.get('_boundCreateRecord') is True and origin.get('operationSeq') == anchor['operationSeq']
+                               and origin.get('buffUid') == uid and origin.get('sourceActorId') == anchor.get('sourceActorId')
+                               and origin.get('targetActorId') == anchor['targetActorId']]
+                    creator_signatures = set()
+                    valid_origins = bool(origins)
+                    for origin in origins:
+                        if (str(origin.get('environmentType') or '').lower() != 'buff' or str(origin.get('ownerType')) != '1'
+                                or origin.get('environmentInstId') in (None, '', '0', '4294967295')):
+                            valid_origins = False
+                            break
+                        parent = origin.get('templateStrId')
+                        if isinstance(parent, str) and parent and origin.get('templateIntId') is None:
+                            pass
+                        elif parent in (None, '') and type(origin.get('templateIntId')) is int and origin['templateIntId'] >= 0:
+                            parent = _load_num_id_str_buff_map().get(str(origin['templateIntId']))
+                        else:
+                            valid_origins = False
+                            break
+                        creator_root = _load_current_buff_roots().get(parent)
+                        cached_actions = buff_root_action_indices.get(id(creator_root))
+                        if cached_actions is None or cached_actions[0] is not creator_root:
+                            action_index = {}
+                            create_actions = []
+                            creator_nodes = [(creator_root, True)]
+                            while creator_nodes:
+                                creator, enabled = creator_nodes.pop()
+                                if isinstance(creator, dict):
+                                    enabled = enabled and ('serverActionIndex' not in creator or creator.get('isEnable') is True)
+                                    if type(creator.get('serverActionIndex')) is int:
+                                        action_index.setdefault(creator['serverActionIndex'], []).append((creator, enabled))
+                                    if creator.get('$type') == 'Beyond.Gameplay.Core.CreateBuffAction.Data':
+                                        create_actions.append((creator, enabled))
+                                    creator_nodes.extend((item, enabled) for item in creator.values())
+                                elif isinstance(creator, list):
+                                    creator_nodes.extend((item, enabled) for item in creator)
+                            buff_root_action_indices[id(creator_root)] = (creator_root, action_index, create_actions)
+                        else:
+                            action_index = cached_actions[1]
+                        try:
+                            creator_actions = action_index.get(origin.get('actionId'), [])
+                        except TypeError:
+                            creator_actions = []
+                        if (len(creator_actions) != 1 or creator_actions[0][1] is not True
+                                or creator_actions[0][0].get('$type') != 'Beyond.Gameplay.Core.CreateBuffAction.Data'):
+                            valid_origins = False
+                            break
+                        creator_signatures.add((parent, origin['actionId'], origin.get('environmentInstId')))
+                    if valid_origins and len(creator_signatures) == 1:
+                        anchor['bb_observation_source'] = 'typed_post_create_runtime_bb'
+                        anchor['bb_observation_scope'] = 'current_default_corrosion_stack_path'
+                        anchor_key = (anchor['sessionId'], anchor['operationOwnerId'], anchor.get('operationGeneration'), anchor['operationSeq'], uid)
+                        if anchor_key in buff_creation_operation_history:
+                            buff_creation_operation_history[anchor_key]['observation']['bb_observation_source'] = anchor['bb_observation_source']
+                            buff_creation_operation_history[anchor_key]['observation']['bb_observation_scope'] = anchor['bb_observation_scope']
+                context = (identity['sessionId'], identity['operationOwnerId'], identity['generation'])
+                state = record.get('_dynamic_pending_state')
+                seen_contexts = record.setdefault('_dynamic_seen_contexts', set())
+                if state is None:
+                    seeds = [row for row in anchors if row['operationSeq'] <= identity['operationSeq'] and row.get('bb_values')]
+                    newest_seq = max((row['operationSeq'] for row in seeds), default=-1)
+                    seeds = [row for row in seeds if row['operationSeq'] == newest_seq]
+                    seed_values = {}
+                    seed_sources = {}
+                    if (seeds and len({json.dumps(row['bb_values'], sort_keys=True) for row in seeds}) == 1
+                            and all(row['operationOwnerId'] != context[1] or row.get('operationGeneration') == context[2] for row in seeds)):
+                        seed_values = dict(seeds[0]['bb_values'])
+                        seed = seeds[0]
+                        seed_key = (seed['sessionId'], seed['operationOwnerId'], seed.get('operationGeneration'), seed['operationSeq'], uid)
+                        seed_sources = {key: {'kind': 'creation_observation', 'creation_key': seed_key} for key in seed_values}
+                    state = {'context': context, 'values': seed_values,
+                             'value_sources': seed_sources, 'last_seq': -1, 'operations': {},
+                             'invalid_keys': set(record.get('_dynamic_unresolved_keys') or []) | {key for seed in seeds for key in seed.get('bb_conflicts') or []}}
+                    record['_dynamic_pending_state'] = state
+                elif state['context'] != context:
+                    if context in seen_contexts:
+                        raise ValueError('dynamic_context_reused_out_of_order')
+                    # generation belongs to the operation owner. A changed
+                    # message context is not a new Buff, nor permission to
+                    # combine updates from incompatible operation streams.
+                    state = {'context': context, 'values': {}, 'value_sources': {}, 'last_seq': -1,
+                             'operations': {}, 'invalid_keys': set()}
+                    record['_dynamic_pending_state'] = state
+                seen_contexts.add(context)
+                seq = identity['operationSeq']
+                key = str(node.get('key') or '') if not is_refresh else ''
+                signature = (expected_type, identity['actionId'], key,
+                             value.hex() if value is not None else None,
+                             json.dumps(identity, sort_keys=True, ensure_ascii=False))
+                if seq in state['operations'] and state['operations'][seq] == signature:
+                    event['state_status'] = 'duplicate_dynamic_observation'
+                    continue
+                if seq < state['last_seq'] or (seq in state['operations'] and state['operations'][seq] != signature):
+                    if key:
+                        state['values'].pop(key, None)
+                        state['invalid_keys'].add(key)
+                    else:
+                        state['invalid_keys'].add('*')
+                    for snapshot in record.get('attribute_refresh_snapshots') or []:
+                        snapshot_identity = snapshot['identity']
+                        if (snapshot_identity['sessionId'], snapshot_identity['operationOwnerId'], snapshot_identity['generation']) == context and snapshot['operation_seq'] >= seq:
+                            snapshot['status'] = 'conflicting_dynamic_operation'
+                            snapshot.setdefault('conflicting_operation_seqs', []).append(seq)
+                    raise ValueError('conflicting_dynamic_operation_order')
+                duplicate = seq in state['operations']
+                state['operations'][seq] = signature
+                state['last_seq'] = seq
+                if not is_refresh:
+                    if not key:
+                        raise ValueError('missing_dynamic_target_key')
+                    # client_value is the result after AssignDynamic, including
+                    # Add/Sub operations. Assign it exactly once; never add it.
+                    state['values'][key] = value
+                    state['value_sources'][key] = {'kind': 'typed_runtime_post_assignment', 'operation_seq': seq,
+                                                  'session_id': context[0], 'operation_owner_id': context[1], 'generation': context[2]}
+                    state['invalid_keys'].discard(key)
+                    record.setdefault('_dynamic_unresolved_keys', set()).discard(key)
+                    event.update(blackboard_key=key, blackboard_key_source='typed_current_buff_action',
+                                 operation=node.get('operation'), state_status='pending_attribute_refresh',
+                                 instance_start_line_no=record['instance_start_line_no'])
+                else:
+                    event.update(instance_id=uid, owner_id=identity['ownerId'], skill_key=template,
+                                 action_id=identity['actionId'], seq=seq, state_status='attribute_refresh_observed')
+                    parameters = []; missing = []; unverified = []
+                    attributes = (root.get('attributeModifier') or {}).get('attributeModifiers')
+                    if not isinstance(attributes, list):
+                        raise ValueError('missing_current_attribute_modifiers')
+                    for index, modifier in enumerate(attributes):
+                        param = modifier.get('param') or {}
+                        bb_key = param.get('blackboardKey') if param.get('useBlackboardKey') is True else None
+                        raw_value = (state['values'].get(bb_key) if bb_key is not None else param.get('value'))
+                        operand = _coerce_optional_float(raw_value)
+                        operand_source = state['value_sources'].get(bb_key, {'kind': 'unknown'}) if bb_key is not None else {'kind': 'typed_static_literal'}
+                        if operand_source.get('kind') == 'creation_observation':
+                            source_anchor = buff_creation_operation_history.get(tuple(operand_source['creation_key']), {}).get('observation')
+                            operand_source = {**operand_source, 'kind': source_anchor.get('bb_observation_source', 'unverified_creation_bb') if source_anchor else 'unverified_creation_bb'}
+                        if operand is None or bb_key in state['invalid_keys'] or '*' in state['invalid_keys']:
+                            missing.append(bb_key or f'attribute:{index}')
+                        elif operand_source['kind'] not in {'typed_runtime_post_assignment', 'typed_post_create_runtime_bb', 'typed_static_literal'}:
+                            unverified.append(bb_key or f'attribute:{index}')
+                        parameters.append({'index': index, 'attribute_type': modifier.get('attributeType'),
+                            'formula': modifier.get('formulaItem'), 'bb_key': bb_key, 'operand': operand, 'operand_source': operand_source})
+                    snapshot = {'ts_ms': ts_ms, 'line_no': line_no, 'operation_seq': seq,
+                        'identity': copy.deepcopy(identity), 'bb_values': dict(state['values']),
+                        'attribute_parameters': parameters, 'missing_parameters': sorted(set(missing)),
+                        'unverified_parameters': sorted(set(unverified)),
+                        'status': ('missing_attribute_parameters' if missing else 'unverified_attribute_parameters' if unverified else 'attribute_parameters_observed'),
+                        'enhance_multiplier': None, 'final_modifiers_verified': False,
+                        'instance_start_line_no': record['instance_start_line_no']}
+                    if not duplicate:
+                        record.setdefault('attribute_refresh_snapshots', []).append(snapshot)
+                    event['snapshot_status'] = snapshot['status']
+                    # Keep the complete observation even if this Buff falls
+                    # outside the selected battle window. Share the object
+                    # so later conflicting evidence invalidates both views.
+                    event['snapshot'] = snapshot
+            except (ValueError, TypeError, KeyError) as error:
+                event['state_error'] = str(error)
+                if not is_refresh and (identity_bound or identity is None):
+                    affected = active_buff_starts_by_uid.get(str(fields.get('inst') or ''))
+                    if (affected is not None and fields.get('ownerId') == affected.get('target_actor_id')
+                            and skill_key == affected.get('event_key')):
+                        unknown_key = blackboard_key or '*'
+                        affected.setdefault('_dynamic_unresolved_keys', set()).add(unknown_key)
+                        affected_state = affected.get('_dynamic_pending_state')
+                        if affected_state is not None:
+                            affected_state['invalid_keys'].add(unknown_key)
+                if is_refresh:
+                    unresolved_buff_actions.append({'ts_ms': ts_ms, 'line_no': line_no,
+                        'uid': event.get('instance_id'), 'reason': 'unbound_buff_attribute_refresh', 'detail': str(error)})
             continue
 
         if " BB[" in raw_line:
@@ -10583,9 +12357,12 @@ def parse_raw_battle_log_text(
                 parsed_bb_fields = _extract_fields(raw_line)
                 pending_buff_record["bb_keys"].extend(parsed_bb_fields.keys())
                 for key, raw_value in parsed_bb_fields.items():
-                    rate = _safe_positive_rate(raw_value)
+                    # Do not discard signed BB values. Negative values are
+                    # meaningful for typed resistance reductions.
+                    rate = _coerce_optional_float(raw_value)
                     if rate is not None:
                         pending_buff_record["bb_values"][key] = rate
+                        pending_buff_record.setdefault('_observed_bb_values', {})[key] = rate
                 _apply_enemy_status_bb_overrides(
                     pending_buff_record,
                     context_enemy_hint=context_enemy_hint,
@@ -10607,6 +12384,57 @@ def parse_raw_battle_log_text(
             if hit is not None:
                 hit["baseline"] = values
                 baseline_by_character[str(hit.get("character_key") or "")] = values
+            continue
+
+        if ' PKT_ATTR_INFO #' in raw_line:
+            info_match = re.search(r'\bPKT_ATTR_INFO #(\d+) (\{.*\})$', raw_line)
+            if info_match:
+                hit = hits_by_seq.get(int(info_match.group(1)))
+                if hit is not None:
+                    try:
+                        payload = json.loads(info_match.group(2))
+                        if (type(payload.get('reportPresent')) is not bool
+                                or payload.get('packetSeq') not in (None, hit.get('packet_seq_id'))
+                                or payload.get('packetSessionId') not in (None, hit.get('packet_session_id'))):
+                            raise ValueError('attribute_report_context_mismatch')
+                        if ('packet_attribute_report_present' in hit
+                                and hit['packet_attribute_report_present'] != payload['reportPresent']):
+                            raise ValueError('conflicting_attribute_report_presence')
+                        if not hit.get('packet_attribute_report_unresolved'):
+                            hit['packet_attribute_report_present'] = payload['reportPresent']
+                    except (ValueError, TypeError, AttributeError):
+                        hit.pop('packet_attribute_report_present', None)
+                        hit['packet_attribute_report_unresolved'] = True
+            continue
+
+        if ' PKT_MOD_DETAIL #' in raw_line:
+            detail_match = re.search(r'\bPKT_MOD_DETAIL #(\d+) (\{.*\})$', raw_line)
+            if detail_match:
+                hit = hits_by_seq.get(int(detail_match.group(1)))
+                if hit is not None:
+                    try:
+                        payload = json.loads(detail_match.group(2))
+                        if (not isinstance(payload, dict)
+                                or any(not isinstance(payload.get(side), list) for side in ('attacker', 'defender'))
+                                or payload.get('packetSeq') not in (None, hit.get('packet_seq_id'))
+                                or payload.get('packetSessionId') not in (None, hit.get('packet_session_id'))):
+                            raise ValueError('modifier_handle_context_mismatch')
+                        handles = {side: [] for side in ('attacker', 'defender')}
+                        for side in handles:
+                            for item in payload[side]:
+                                if (not isinstance(item, dict) or type(item.get('index')) is not int
+                                        or item['index'] < 0 or type(item.get('buff_inst_id')) not in (int, str)
+                                        or not re.fullmatch(r'[1-9]\d*', str(item['buff_inst_id']))
+                                        or int(item['buff_inst_id']) >= 2**64):
+                                    raise ValueError('invalid_modifier_handle')
+                                handles[side].append({**item, 'buff_inst_id': str(item['buff_inst_id'])})
+                        if 'packet_modifier_handles' in hit and hit['packet_modifier_handles'] != handles:
+                            raise ValueError('conflicting_modifier_handles')
+                        if not hit.get('packet_modifier_handles_unresolved'):
+                            hit['packet_modifier_handles'] = handles
+                    except (ValueError, TypeError, KeyError):
+                        hit.pop('packet_modifier_handles', None)
+                        hit['packet_modifier_handles_unresolved'] = True
             continue
 
         packet_modifiers = _parse_packet_modifier_line(raw_line)
@@ -10632,10 +12460,17 @@ def parse_raw_battle_log_text(
             seq, attacker_attr_rows, defender_attr_rows = packet_attrs
             hit = hits_by_seq.get(seq)
             if hit is not None:
-                hit["packet_attr_details"] = {
+                observed_attrs = {
                     "attacker": attacker_attr_rows,
                     "defender": defender_attr_rows,
                 }
+                if hit.get('packet_attr_seen') and hit['packet_attr_details'] != observed_attrs:
+                    hit['packet_attr_conflict'] = True
+                    hit['packet_attribute_report_unresolved'] = True
+                    hit['rdps_unresolved_effect_conditions'] = True
+                elif not hit.get('packet_attr_conflict'):
+                    hit['packet_attr_details'] = observed_attrs
+                hit['packet_attr_seen'] = True
             continue
 
         poise_damage_event = _parse_poise_damage_event(raw_line, ts_ms, line_no)
@@ -10659,17 +12494,22 @@ def parse_raw_battle_log_text(
 
         if " HP_V2 " in raw_line:
             fields = _extract_fields(raw_line)
-            character_key = _extract_character_key(fields.get("src"), fields.get("atk"), fields.get("skill"))
-            if character_key is None:
+            source_actor = _extract_character_key(fields.get("src"))
+            attacker_actor = _extract_character_key(fields.get("atk"))
+            if not source_actor and not attacker_actor and _extract_enemy_key(fields.get("src"), fields.get("atk")):
+                # An explicitly identified enemy hit is outside player outgoing damage.
                 continue
-            target_enemy_key = _extract_enemy_key(fields.get("tgt"), fields.get("skill"))
-            if target_enemy_key is None:
-                target_enemy_key = _recover_enemy_target_from_mislabeled_actor(
-                    fields,
-                    context_enemy_hint=context_enemy_hint,
-                    party_actor_ids=party_actor_ids,
-                )
-            if target_enemy_key is None:
+            character_key = source_actor or attacker_actor
+            target_enemy_key = _extract_enemy_key(fields.get("tgt"))
+            conflicting_actor = bool(source_actor and attacker_actor and source_actor != attacker_actor)
+            if character_key is None or target_enemy_key is None or conflicting_actor:
+                unresolved_hits.append({
+                    "line_no": line_no, "ts_ms": ts_ms,
+                    "source_actor": fields.get("src"), "attacker_actor": fields.get("atk"),
+                    "target_actor": fields.get("tgt"), "raw_skill_key": fields.get("skill"),
+                    "packet_hit_value": fields.get("hit"),
+                    "reason": "conflicting_damage_actor" if conflicting_actor else "unresolved_damage_actor",
+                })
                 continue
             enemy_counter[target_enemy_key] += 1
 
@@ -10680,10 +12520,15 @@ def parse_raw_battle_log_text(
             packet_final_value = _coerce_optional_float(fields.get("packetFinalValue"))
             has_enemy_hp_after = "eHP" in fields
             enemy_hp_after = _coerce_int(fields.get("eHP"))
+            target_actor_id = fields.get("tgtId") if re.fullmatch(r"[1-9]\d*", fields.get("tgtId", "")) else None
+            source_actor_id = fields.get("atkId") if re.fullmatch(r"[1-9]\d*", fields.get("atkId", "")) else None
+            hp_state_key = _enemy_hp_state_key(target_enemy_key, target_actor_id)
+            target_entity_stats = _entity_stats_snapshot_at(entity_stats_timelines, target_actor_id, ts_ms)
+            source_entity_stats = _entity_stats_snapshot_at(entity_stats_timelines, source_actor_id, ts_ms)
             hit_value = _cap_enemy_overkill_damage(
                 raw_hit_value,
                 enemy_hp_after=enemy_hp_after if has_enemy_hp_after else None,
-                previous_enemy_hp=last_enemy_hp_by_target.get(target_enemy_key),
+                previous_enemy_hp=last_enemy_hp_by_target.get(hp_state_key),
             )
             damage_value_source = "packet_hit"
             if packet_hit_value is None:
@@ -10691,10 +12536,13 @@ def parse_raw_battle_log_text(
             elif hit_value != raw_hit_value:
                 damage_value_source = "packet_hit_overkill_capped"
             if has_enemy_hp_after:
-                last_enemy_hp_by_target[target_enemy_key] = enemy_hp_after
+                last_enemy_hp_by_target[hp_state_key] = enemy_hp_after
             crit_flag = _coerce_int(fields.get("critFlag"))
             raw_skill_key = fields.get("skill") or "unknown_skill"
             original_template_int_id = _coerce_int(fields.get("origTemplateIntId"), default=0) or None
+            action_id = int(fields["actionId"]) if re.fullmatch(r"\d+", fields.get("actionId", "")) else None
+            damage_unit_index = int(fields["damageUnitIndex"]) if re.fullmatch(r"\d+", fields.get("damageUnitIndex", "")) else None
+            damage_unit_index_source = None
             skill_key = (
                 _canonical_hit_skill_id_from_cast_context(
                     raw_skill_key,
@@ -10704,6 +12552,9 @@ def parse_raw_battle_log_text(
                     target_enemy_key=target_enemy_key,
                     recent_skill_casts_by_char=recent_skill_casts_by_char,
                     recent_numeric_buffs_by_source=recent_numeric_buffs_by_source,
+                    action_id=action_id,
+                    damage_unit_index=damage_unit_index,
+                    template_type=fields.get("templateType"),
                 )
                 or _canonical_hit_skill_id(raw_skill_key, character_key)
             )
@@ -10724,26 +12575,44 @@ def parse_raw_battle_log_text(
 
             seq_match = _HIT_SEQ_RE.search(raw_line)
             seq = int(seq_match.group(1)) if seq_match else len(hits) + 1
-            action_id = _coerce_int(fields.get("actionId"), default=0) or None
-            damage_unit_index = _coerce_int(fields.get("damageUnitIndex"), default=0)
+            dynamic_bb_values: dict[int, float] = {}
+            for token in re.split(r"[,;]", str(fields.get("dynBB") or "")):
+                key_text, separator, value_text = token.partition(":")
+                key = _coerce_optional_int(key_text)
+                value = _coerce_optional_float(value_text) if separator else None
+                if key is not None and value is not None:
+                    dynamic_bb_values[key] = value
+            calc_bb_values: dict[int, dict[str, float | str]] = {}
+            for token in re.split(r"[,;]", str(fields.get("calcBB") or "")):
+                group_text, separator, assignment = token.partition(":")
+                group = _coerce_optional_int(group_text)
+                key_text, assignment_separator, value_text = assignment.partition("=")
+                if group is None or not separator or not assignment_separator or not key_text:
+                    continue
+                numeric_value = _coerce_optional_float(value_text)
+                calc_bb_values.setdefault(group, {})[key_text] = (
+                    numeric_value if numeric_value is not None else value_text
+                )
             action_damage_element = _infer_skill_action_damage_element(
                 skill_key,
                 action_id,
                 damage_unit_index,
             )
-            damage_element = action_damage_element or _infer_skill_damage_element(skill_key, character_key)
-            if action_damage_element:
-                damage_school = _damage_school_from_element(action_damage_element) or _infer_skill_damage_school(
-                    skill_key,
-                    character_key,
-                    raw_skill_key=raw_skill_key,
-                )
-            else:
-                damage_school = _infer_skill_damage_school(
-                    skill_key,
-                    character_key,
-                    raw_skill_key=raw_skill_key,
-                ) or _damage_school_from_element(damage_element)
+            static_damage_decorate_mask = None
+            static_damage_decorate_mask_source = None
+            damage_calculation = None
+            if action_id is not None and damage_unit_index is not None:
+                exact_units = [unit for unit in _load_skill_action_damage_units(str(skill_key)).get(action_id, [])
+                               if type(unit.get('index')) is int and unit['index'] == damage_unit_index
+                               and unit.get('damage_attribute_type') == 'hp']
+                if len(exact_units) == 1 and exact_units[0].get('damage_attribute_type') == 'hp':
+                    unit = exact_units[0]
+                    if type(unit.get('damage_decorate_mask')) is int:
+                        static_damage_decorate_mask = unit['damage_decorate_mask']
+                        static_damage_decorate_mask_source = unit.get('damage_decorate_mask_source')
+                    damage_calculation = copy.deepcopy(unit.get('damage_calculation'))
+            damage_element = action_damage_element
+            damage_school = _damage_school_from_element(damage_element)
             hit = {
                 "seq": seq,
                 "line_no": line_no,
@@ -10753,16 +12622,36 @@ def parse_raw_battle_log_text(
                 "target_enemy_key": target_enemy_key,
                 "target_enemy_name": _resolve_enemy_name(target_enemy_key) or target_enemy_key,
                 "raw_skill_key": raw_skill_key,
+                "target_actor_id": target_actor_id,
+                "source_actor_id": source_actor_id,
                 "skill_key": skill_key,
                 "skill_name": skill_name,
                 "skill_level": _coerce_int(fields.get("skillLv"), default=0) or None,
                 "template_int_id": _coerce_int(fields.get("templateIntId"), default=0) or None,
+                "event_inst_id": fields.get("eventInstId") if re.fullmatch(r"[1-9]\d*", fields.get("eventInstId", "")) else None,
+                "event_owner_id": fields.get("eventOwnerId") if re.fullmatch(r"[1-9]\d*", fields.get("eventOwnerId", "")) else None,
+                "packet_seq_id": int(fields["packetSeq"]) if re.fullmatch(r"\d+", fields.get("packetSeq", "")) else None,
+                "packet_session_id": fields.get('packetSessionId') or None,
+                "packet_owner_id": (fields.get('packetOwnerId') if re.fullmatch(r'[1-9]\d*', fields.get('packetOwnerId', ''))
+                                    and int(fields['packetOwnerId']) < 2**64 else None),
+                "packet_generation": (int(fields['packetGeneration']) if re.fullmatch(r'\d+', fields.get('packetGeneration', '')) else None),
+                "client_tick_ms": int(fields["clientTick"]) if re.fullmatch(r"\d+", fields.get("clientTick", "")) else None,
                 "action_id": action_id,
                 "damage_unit_index": damage_unit_index,
+                "damage_unit_index_source": damage_unit_index_source,
                 "original_template_int_id": original_template_int_id,
                 "dynamic_bb_signature": fields.get("dynBB"),
+                "dynamic_bb_values": dynamic_bb_values,
+                "calc_bb_signature": fields.get("calcBB"),
+                "calc_bb_values": calc_bb_values,
                 "damage_element": damage_element,
                 "damage_school": damage_school,
+                "damage_element_source": "official_action_unit" if damage_element else None,
+                "damage_decorate_mask": None,
+                "damage_decorate_mask_source": None,
+                "static_damage_decorate_mask": static_damage_decorate_mask,
+                "static_damage_decorate_mask_source": static_damage_decorate_mask_source,
+                "damage_calculation": damage_calculation,
                 "skill_group_type": skill_group_type,
                 "skill_family_key": skill_family_key,
                 "hit_value": hit_value,
@@ -10775,7 +12664,11 @@ def parse_raw_battle_log_text(
                 "rdps_basis_source": damage_value_source,
                 "overkill_damage": max(0, raw_hit_value - hit_value),
                 "enemy_hp_after": enemy_hp_after,
+                "enemy_hp_after_observed": has_enemy_hp_after,
                 "crit_flag": crit_flag,
+                "critical_flag_observed": fields.get("critFlag") in {"0", "1"},
+                "critical_observation": copy.deepcopy(critical_stats_by_actor.get(source_actor_id)),
+                "part_inst_id": _coerce_optional_int(fields.get("partInstId")),
                 "hit_index": hit_index,
                 "dpd_raw": None,
                 "baseline": baseline_by_character.get(character_key),
@@ -10783,6 +12676,11 @@ def parse_raw_battle_log_text(
                 "packet_modifier_uids": {"attacker": [], "defender": []},
                 "packet_attr_details": {"attacker": [], "defender": []},
             }
+            _is_arts_strength_damage_hit(hit)
+            _attach_target_entity_stats(hit, target_entity_stats)
+            _attach_attacker_entity_stats(hit, source_entity_stats)
+            # Scene snapshots are observations at their own timestamp. They do
+            # not establish current-hit modifier state or passive coverage.
             hits.append(hit)
             hits_by_seq[seq] = hit
             if loadout_by_char and character_key not in loadout_by_char:
@@ -10841,49 +12739,9 @@ def parse_raw_battle_log_text(
                 active_suits_by_char=active_suits_by_char,
                 active_weapons_by_char=active_weapons_by_char,
             )
-            if source_key is None:
-                source_key = _extract_character_key(fields.get("src"), buff_key)
-            if (
-                source_key
-                and raw_source_key is None
-                and owner_key is None
-                and target_enemy_key is not None
-                and (
-                    _extract_enemy_key(fields.get("src")) is not None
-                    or (loadout_by_char and source_key not in loadout_by_char)
-                )
-            ):
-                # Do not let enemy-owned debuffs promote an off-roster player
-                # solely because the buff id text happens to contain a
-                # character prefix. This was pulling e.g. `chr_0021_whiten`
-                # into party rDPS even when src/owner were both enemy-side.
-                source_key = None
             is_weapon_buff = bool(_WEAPON_BUFF_RE.match(buff_key))
-            chr_key_from_buff = _extract_character_key(buff_key)
-            if chr_key_from_buff and owner_value:
-                last_chr_src_on_owner[owner_value] = (chr_key_from_buff, ts_ms)
-            if owner_key and is_weapon_buff and (raw_source_key is None or raw_source_key == owner_key):
-                source_key = owner_key
-            elif (
-                owner_key
-                and (source_key is None or source_key == owner_key)
-                and any(buff_key.startswith(prefix) for prefix in _GENERIC_BUFF_PREFIXES)
-            ):
-                borrowed = last_chr_src_on_owner.get(owner_value)
-                if borrowed is not None and ts_ms - borrowed[1] <= _CHR_BORROW_WINDOW_MS:
-                    source_key = borrowed[0]
-            if (
-                owner_key
-                and source_key
-                and source_key != owner_key
-                and loadout_by_char
-                and owner_key in loadout_by_char
-                and source_key not in loadout_by_char
-                and any(buff_key.startswith(prefix) for prefix in _PLAYER_TARGET_GENERIC_BUFF_PREFIXES)
-            ):
-                source_key = owner_key
             player_keys = [key for key in (source_key, owner_key) if key]
-            if not player_keys:
+            if not player_keys and not target_enemy_key:
                 pending_buff_record = None
                 continue
             for player_key in player_keys:
@@ -10906,12 +12764,19 @@ def parse_raw_battle_log_text(
                 ts_ms,
                 recent_skill_casts_by_char,
             ) or {}
+            raw_uid = str(fields.get("uid") or "")
+            # uint32 max is the protocol's invalid/sentinel instance ID. Keep
+            # these rows for diagnostics, but never create a live window from
+            # them or evaluate them as a semantic buff instance.
+            invalid_uid = raw_uid in {"0", "4294967295"}
             buff_record = {
-                "uid": str(fields.get("uid") or ""),
+                "uid": "" if invalid_uid else raw_uid,
+                "uid_observation_only": invalid_uid,
                 "line_no": line_no,
                 "ts_ms": ts_ms,
                 "source_character_key": source_key,
                 "source_character_name": _resolve_character_name(source_key) or source_key,
+                "source_weapon_template": active_weapons_by_char.get(source_key),
                 "source_skill_key": source_skill_context.get("source_skill_key"),
                 "source_skill_family_key": source_skill_context.get("source_skill_family_key"),
                 "raw_source_character_key": raw_source_key,
@@ -10922,6 +12787,8 @@ def parse_raw_battle_log_text(
                 "target_enemy_key": target_enemy_key,
                 "target_enemy_name": _resolve_enemy_name(target_enemy_key) or target_enemy_key,
                 "owner_raw": owner_value,
+                "target_actor_id": fields.get("ownerId") if re.fullmatch(r"[1-9]\d*", fields.get("ownerId", "")) else None,
+                "source_actor_id": fields.get("srcId") if re.fullmatch(r"[1-9]\d*", fields.get("srcId", "")) else None,
                 "event_key": buff_key,
                 "raw_event_key": raw_buff_key,
                 "packet_mapping": mapping_hint if mapping_hint else None,
@@ -10933,53 +12800,187 @@ def parse_raw_battle_log_text(
                 "attr_types": [row["attr_type"] for row in attr_mods if row["attr_type"]],
                 "attr_mods": attr_mods,
                 "is_weapon_buff": is_weapon_buff,
+                "instance_start_line_no": line_no,
+                "enable_observations": [],
+                "creation_observations": [],
+                "attribute_refresh_snapshots": [],
+                "_observed_bb_values": {},
             }
+            _apply_enemy_status_bb_overrides(buff_record, context_enemy_hint=None)
             uid_key = str(buff_record.get("uid") or "")
-            replaced_existing = False
             if uid_key:
                 existing = active_buff_starts_by_uid.get(uid_key)
-                if existing is not None and int(existing.get("ts_ms") or -1) == ts_ms:
-                    index_key = (uid_key, ts_ms)
-                    if _prefer_packet_buff_record(existing, buff_record):
-                        replace_index = buff_start_index_by_uid_ts.get(index_key)
-                        if replace_index is not None:
-                            buff_starts[replace_index] = buff_record
-                        active_buff_starts_by_uid[uid_key] = buff_record
-                    current_buff_record = active_buff_starts_by_uid.get(uid_key)
-                    replaced_existing = True
-            if not replaced_existing:
-                buff_starts.append(buff_record)
-                if raw_buff_key.isdigit() and source_key:
-                    rows = recent_numeric_buffs_by_source[str(source_key)]
-                    rows.append(buff_record)
-                    del rows[:-128]
-                if uid_key:
-                    active_buff_starts_by_uid[uid_key] = buff_record
-                    buff_start_index_by_uid_ts[(uid_key, ts_ms)] = len(buff_starts) - 1
-                current_buff_record = buff_record
+                if existing is not None:
+                    # A new observation of a live UID changes its snapshot,
+                    # not the number of simultaneous Buff instances.
+                    buff_record['_previous_snapshot_record'] = existing
+                    buff_record['_previous_snapshot_boundary'] = {
+                        'snapshot_end_ts_ms': existing.get('snapshot_end_ts_ms'),
+                        'snapshot_end_line_no': existing.get('snapshot_end_line_no')}
+                    existing['snapshot_end_ts_ms'] = ts_ms
+                    existing['snapshot_end_line_no'] = line_no
+                    buff_record['snapshot_update'] = True
+                    buff_record['instance_start_line_no'] = existing.get('instance_start_line_no', existing['line_no'])
+                    buff_record['source_weapon_template'] = existing.get('source_weapon_template')
+                    identity_fields = ('source_actor_id', 'target_actor_id', 'source_character_key',
+                                       'target_character_key', 'target_enemy_key')
+                    conflict = bool(existing.get('rdps_live_identity_conflict')) or any(
+                        existing.get(key) and buff_record.get(key) and existing[key] != buff_record[key]
+                        for key in identity_fields)
+                    known_roots = _load_current_buff_roots()
+                    if existing.get('event_key') in known_roots and buff_record['event_key'] in known_roots:
+                        conflict = conflict or existing['event_key'] != buff_record['event_key']
+                    if conflict:
+                        buff_record['rdps_live_identity_conflict'] = True
+                    else:
+                        for key in (*identity_fields, 'source_skill_key', 'source_skill_family_key'):
+                            if not buff_record.get(key) and existing.get(key):
+                                buff_record[key] = existing[key]
+                        # State history belongs to this live UID. Sharing it
+                        # retains later observations while evaluation uses
+                        # the hit's own operation/time boundary.
+                        buff_record['enable_observations'] = existing['enable_observations']
+                        buff_record['creation_observations'] = copy.deepcopy(existing.get('creation_observations') or [])
+                        buff_record['attribute_refresh_snapshots'] = existing.get('attribute_refresh_snapshots', [])
+                        if existing.get('_dynamic_pending_state') is not None:
+                            buff_record['_dynamic_pending_state'] = copy.deepcopy(existing['_dynamic_pending_state'])
+                            buff_record['_dynamic_seen_contexts'] = set(existing.get('_dynamic_seen_contexts') or [])
+                        buff_record['_dynamic_unresolved_keys'] = set(existing.get('_dynamic_unresolved_keys') or [])
+                        if existing.get('rdps_dynamic_identity_conflict'):
+                            buff_record['rdps_dynamic_identity_conflict'] = True
+                        if existing.get('rdps_conflicting_enable_state'):
+                            buff_record['rdps_conflicting_enable_state'] = True
+                        if existing.get('event_key') == buff_record['event_key']:
+                            buff_record['bb_values'] = dict(existing.get('bb_values') or {})
+                            buff_record['bb_keys'] = list(existing.get('bb_keys') or [])
+                            buff_record['origin_observations'] = copy.deepcopy(existing.get('origin_observations') or [])
+                            if not attr_mods:
+                                buff_record['attr_mods'] = copy.deepcopy(existing.get('attr_mods') or [])
+                                buff_record['attr_types'] = list(existing.get('attr_types') or [])
+            buff_starts.append(buff_record)
+            if raw_buff_key.isdigit() and source_key:
+                rows = recent_numeric_buffs_by_source[str(source_key)]
+                rows.append(buff_record)
+                del rows[:-128]
+            if uid_key:
+                active_buff_starts_by_uid[uid_key] = buff_record
+            current_buff_record = buff_record
 
         elif " BUFF_END " in raw_line:
             fields = _extract_fields(raw_line)
             uid = str(fields.get("uid") or "")
             if uid:
+                for unresolved in unresolved_buff_actions:
+                    if unresolved.get('uid') == uid and unresolved.get('end_ts_ms') is None:
+                        unresolved.update(end_ts_ms=ts_ms, end_line_no=line_no)
                 buff_record = active_buff_starts_by_uid.pop(uid, None)
                 if buff_record is not None:
                     buff_record["end_ts_ms"] = ts_ms
+                    buff_record["end_line_no"] = line_no
                     current_buff_record = buff_record
 
         pending_buff_record = current_buff_record
 
     loadout_by_char = _repair_weapon_puton_loadout_groups(loadout_groups, loadout_by_char)
+    for event in buff_attribute_refresh_events:
+        if isinstance(event.get('snapshot'), dict):
+            event['snapshot_status'] = event['snapshot']['status']
     _apply_poise_damage_events_to_hits(hits, poise_damage_events)
 
-    if not hits and (loadout_by_char or dungeon_context_id):
+    buff_records_by_instance: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for record in buff_starts:
+        record["dynamic_bb_events"] = []
+        uid = str(record.get("uid") or "")
+        if uid:
+            buff_records_by_instance[uid].append(record)
+    for event in dynamic_bb_events:
+        stamp = (int(event["ts_ms"]), int(event["line_no"]))
+        candidates = [
+            record for record in buff_records_by_instance.get(str(event.get("instance_id") or ""), [])
+            if event.get("owner_id") and record.get("target_actor_id")
+            and str(event["owner_id"]) == str(record["target_actor_id"])
+            and event.get("skill_key") == record.get("event_key")
+            and stamp >= (int(record["ts_ms"]), int(record["line_no"]))
+            and (record.get("end_ts_ms") is None or stamp < (
+                int(record["end_ts_ms"]), int(record.get("end_line_no") or 0)))
+            and (record.get('snapshot_end_ts_ms') is None or stamp < (
+                int(record['snapshot_end_ts_ms']), int(record.get('snapshot_end_line_no') or 0)))
+        ]
+        if len(candidates) == 1:
+            candidates[0]["dynamic_bb_events"].append(event)
+        elif len(candidates) > 1:
+            event["binding_error"] = "ambiguous_buff_instance"
+
+    # Cast observations require matching owner/instance/template. HP_V2 does
+    # not carry the cast instance, so proximity cannot bind these to a hit.
+    for cast in skill_casts:
+        cast["dynamic_bb_events"] = []
+    for event in dynamic_bb_events:
+        stamp = (int(event["ts_ms"]), int(event["line_no"]))
+        candidates = [cast for cast in skill_casts
+            if event.get("owner_id") and cast.get("owner_id")
+            and str(event["owner_id"]) == str(cast["owner_id"])
+            and event.get("instance_id") == cast.get("skill_inst_id")
+            and event.get("skill_key") == cast.get("skill")
+            and cast.get("end_ts_ms") is not None
+            and (int(cast["ts_ms"]), int(cast["line_no"])) <= stamp
+            < (int(cast["end_ts_ms"]), int(cast.get("end_line_no") or 0))]
+        if len(candidates) == 1:
+            candidates[0]["dynamic_bb_events"].append(event)
+        elif len(candidates) > 1:
+            event["binding_error"] = "ambiguous_skill_instance"
+    for hit in hits:
+        hit["dynamic_bb_observations"] = []
+
+    timer_evidence = collect_timer_evidence(text, _extract_fields, _parse_prefixed_timestamp_ms, timer_observed_times)
+    if timer_evidence is not None:
+        start = timer_evidence.get('start') or {}
+        complete = timer_evidence.get('complete') or {}
+        if start.get('gameId'):
+            set_dungeon_context(start['gameId'])
+        official_timer_start_ms = start.get('observedMs')
+        official_timer_end_ms = complete.get('observedMs')
+        official_pass_confirmed = complete.get('isPass') == '1'
+        challenge_pass_confirmed = challenge_pass_confirmed or official_pass_confirmed
+        official_timer_elapsed_ms = None
+        raw_pass_time = complete.get('passTimeMs')
+        if isinstance(raw_pass_time, str) and raw_pass_time.isdecimal() and int(raw_pass_time) > 0:
+            official_timer_elapsed_ms = int(raw_pass_time)
+        game_timer_start_ms = official_timer_start_ms
+        game_timer_end_ms = official_timer_end_ms
+        game_timer_elapsed_ms = official_timer_elapsed_ms if official_timer_elapsed_ms is not None else live_timer_elapsed_ms
+        game_timer_window_elapsed_ms = game_timer_elapsed_ms
+        timer_start_seen = official_timer_start_ms is not None
+        timer_end_seen = official_timer_end_ms is not None
+        completion_source = 'official_timer_end' if official_pass_confirmed else completion_source
+    # Packet receipt timestamps are diagnostic only. A negative wall-clock
+    # difference may be a date boundary; it does not disprove server passTime.
+    official_timer_observed_elapsed_ms = (
+        official_timer_end_ms - official_timer_start_ms
+        if official_timer_start_ms is not None and official_timer_end_ms is not None
+        and official_timer_end_ms >= official_timer_start_ms else None
+    )
+
+    official_scope = (timer_evidence or {}).get('start')
+    if official_scope is not None:
+        # Membership follows explicit lifecycle events, not receipt-clock
+        # proximity. A new challenge cannot inherit a previous one's hits.
+        scope_end_line = ((timer_evidence or {}).get('complete') or {}).get('line', len(text.splitlines()) + 1)
+        scope_end_line = min([scope_end_line] + [
+            event['line'] for event in timer_evidence['events']
+            if event.get('kind') == 'boundary'
+            and event.get('gameId') in (None, '', official_scope.get('gameId'))
+        ])
+        hits = [hit for hit in hits if official_scope['line'] < hit['line_no'] < scope_end_line]
+
+    if not hits and (loadout_by_char or dungeon_context_id or unresolved_hits or unresolved_buff_actions):
         anchor_ms = (
-            first_party_action_ms
+            official_timer_start_ms
+            if official_timer_start_ms is not None
+            else first_party_action_ms
             if first_party_action_ms is not None
             else game_timer_start_ms
             if game_timer_start_ms is not None
-            else official_timer_start_ms
-            if official_timer_start_ms is not None
             else first_context_ms
             if first_context_ms is not None
             else 0
@@ -11035,6 +13036,12 @@ def parse_raw_battle_log_text(
                 "timer_end_seen": timer_end_seen,
                 "official_timer_start_seen": official_timer_start_ms is not None,
                 "official_timer_end_seen": official_timer_end_ms is not None,
+                "official_timer_observed_elapsed_ms": official_timer_observed_elapsed_ms,
+                "packet_timer_elapsed_ms": packet_timer_elapsed_ms,
+                "timer_integrity_ok": False if official_pass_confirmed else None,
+                "timer_integrity_reasons": (
+                    ["missing_damage_events"] if official_pass_confirmed else []
+                ),
                 "timer_start_inferred": False,
                 "clear_flag": False,
                 "total_damage": 0,
@@ -11051,6 +13058,19 @@ def parse_raw_battle_log_text(
             "timeline_events": [],
             "role_skill_stats": [],
             "debug_hits": [],
+            "unresolved_hits": unresolved_hits,
+            "unresolved_buff_actions": unresolved_buff_actions,
+            "rdps_preflight": {
+                "ok": False, "blocker_count": max(1, len(unresolved_hits) + len(unresolved_buff_actions)),
+                "blocker_reason_counts": dict(Counter(row['reason'] for row in
+                    (unresolved_hits + unresolved_buff_actions or [{'reason': 'missing_damage_events'}]))),
+                "blockers": (unresolved_hits + unresolved_buff_actions)[:100] or [{"reason": "missing_damage_events"}],
+            },
+            "rdps_damage_basis": {
+                "rdps_preflight_ok": False, "rdps_strict_ok": False,
+                "rdps_conservation_ok": False, "hit_count": 0,
+                "unresolved_damage_actor_count": len(unresolved_hits),
+            },
             "casts": [],
             "char_skills": {},
         }
@@ -11135,7 +13155,7 @@ def parse_raw_battle_log_text(
             "hit_window",
         )
 
-    time_source = "game_timer"
+    time_source = "observed_challenge_window" if timer_evidence is not None and official_timer_elapsed_ms is None else "game_timer"
     timeline_zero_source = "game_timer"
     if game_timer_elapsed_ms is not None:
         timer_window_elapsed_ms = game_timer_window_elapsed_ms or game_timer_elapsed_ms
@@ -11185,7 +13205,8 @@ def parse_raw_battle_log_text(
 
     has_game_timer_window = game_timer_start_ms is not None or game_timer_elapsed_ms is not None
     if has_game_timer_window:
-        windowed_hits = [hit for hit in hits if first_hit_ms <= int(hit["ts_ms"]) <= last_hit_ms]
+        windowed_hits = hits if official_scope is not None else [
+            hit for hit in hits if first_hit_ms <= int(hit["ts_ms"]) <= last_hit_ms]
         if windowed_hits:
             buff_starts = _filter_buff_starts_for_timer_window(
                 buff_starts,
@@ -11245,7 +13266,7 @@ def parse_raw_battle_log_text(
     boss_key = enemy_counter.most_common(1)[0][0] if enemy_counter else "unknown_boss"
     boss_name = _resolve_enemy_name(boss_key) or boss_key
     dungeon_key, dungeon_name = dungeon_context or (UNKNOWN_DUNGEON_KEY, UNKNOWN_DUNGEON_NAME)
-    if dungeon_key.startswith("indie_battletower"):
+    if timer_evidence is not None or dungeon_key.startswith("indie_battletower"):
         # War Echo records are leaderboard data. Only the server's official
         # challenge-complete message may mark them cleared; HP zero, scene
         # exits and late dungeon status are retained as diagnostics only.
@@ -11261,6 +13282,11 @@ def parse_raw_battle_log_text(
         game_timer_elapsed_ms if game_timer_elapsed_ms is not None else last_hit_ms - first_hit_ms,
         1,
     )
+    timer_integrity_reasons: list[str] = []
+    if official_pass_confirmed:
+        timer_integrity_reasons = validate_timer_evidence(
+            timer_evidence, duration_ms=duration_ms, game_id=dungeon_context_id)
+    timer_integrity_ok = not timer_integrity_reasons if official_pass_confirmed else None
     wall_window_ms = max(last_hit_ms - first_hit_ms, 1)
     timeline_scale = duration_ms / wall_window_ms if has_game_timer_window else 1.0
     timer_start_inferred = timeline_zero_source in {
@@ -11280,6 +13306,7 @@ def parse_raw_battle_log_text(
         loadout_groups,
         loadout_by_char,
         anchor_ms=int(hits[0]["ts_ms"]) if hits else first_hit_ms,
+        anchor_line_no=int(hits[0].get("line_no") or 0) or None if hits else None,
     )
     observed_damage_characters = {
         str(hit.get("character_key") or "")
@@ -11317,21 +13344,50 @@ def parse_raw_battle_log_text(
         character_key: sum(float(entry.get("rate") or 0.0) for entry in entries)
         for character_key, entries in static_arts_strength_entries_by_char.items()
     }
+    # Static loadout effects remain unresolved unless their exact packet-level
+    # application and hit-time contribution are modeled.  Repeated snapshots,
+    # matching totals, or the presence of a runtime BB are observations only;
+    # they cannot retire a blocker or retroactively alter the rDPS baseline.
     for hit in hits:
         character_key = str(hit.get("character_key") or "")
-        hit["static_multiplier_entries"] = static_entries_by_char.get(character_key, [])
+        hit["static_multiplier_entries"] = list(static_entries_by_char.get(character_key, []))
+        loadout_row = battle_loadout_by_char.get(character_key) or {}
+        static_sources = list(loadout_row.get(
+            'rdps_unresolved_static_multiplier_sources', []))
+        # Field count and an equipment marker do not prove that each passive
+        # has been modeled or is represented by a hit-time baseline.
+        hit['rdps_unresolved_static_multiplier_sources'] = static_sources
         hit["static_arts_strength_entries"] = static_arts_strength_entries_by_char.get(character_key, [])
-        if not hit.get("damage_element"):
-            hit["damage_element"] = _damage_element_from_dpd_raw(hit.get("dpd_raw"))
+        flat_entries = [entry for entry in loadout_row.get('equipment_baseline_attributes') or []
+                        if entry.get('attr_type') == 2 and entry.get('modifier_type') == 7]
+        hit['static_flat_attack'] = sum(float(entry['value']) for entry in flat_entries)
+        hit['static_flat_attack_entries'] = copy.deepcopy(flat_entries)
+        level = hit.get('attacker_stats_level') or loadout_row.get('character_level')
+        base_stats = _character_base_stats(character_key, level) or {}
+        basic_attack = _coerce_optional_float((hit.get('attacker_stats_basic_attrs') or {}).get(2))
+        if basic_attack is None:
+            basic_attack = _coerce_optional_float(base_stats.get('atk'))
+        weapon_attack = _coerce_optional_float(loadout_row.get('weapon_base_atk'))
+        if basic_attack is not None and basic_attack > 0 and weapon_attack is not None and weapon_attack > 0:
+            hit['base_attack_for_percent'] = basic_attack + weapon_attack
+        attrs = hit.get('attacker_stats_attrs') or {}
+        main_value = _coerce_optional_float(attrs.get(base_stats.get('main_attr_type')))
+        sub_value = _coerce_optional_float(attrs.get(base_stats.get('sub_attr_type')))
+        main_scale = _coerce_optional_float(attrs.get(78))
+        sub_scale = _coerce_optional_float(attrs.get(79))
+        if all(value is not None and value >= 0 for value in (main_value, sub_value, main_scale, sub_scale)):
+            hit['attack_ability_factor'] = 1.0 + int(main_value) * main_scale + int(sub_value) * sub_scale
     _annotate_hit_enemy_hp_state(hits)
 
     roster = []
 
     buff_windows = []
     for buff_record in buff_starts:
-        labels = _collect_buff_labels(buff_record)
-        zone_effects = _collect_zone_effects(buff_record)
-        dynamic_effects = _extract_dynamic_effect_specs(buff_record)
+        if buff_record.get("uid_observation_only"):
+            continue
+        labels = _collect_buff_labels(buff_record, root_lookup_cache=buff_root_action_indices)
+        zone_effects = _collect_zone_effects(buff_record, root_lookup_cache=buff_root_action_indices)
+        dynamic_effects = _extract_dynamic_effect_specs(buff_record, root_lookup_cache=buff_root_action_indices)
         if not zone_effects and not dynamic_effects:
             continue
         if not _equip_buff_matches_active_suits(
@@ -11347,19 +13403,25 @@ def parse_raw_battle_log_text(
         ):
             continue
         start_ts_ms = buff_record["ts_ms"]
-        buff_duration_ms = _normalize_buff_duration_ms(
-            start_ts_ms,
-            event_key=buff_record.get("event_key"),
-            end_ts_ms=buff_record.get("end_ts_ms"),
-            raw_duration_ms=buff_record.get("raw_duration_ms"),
-            battle_end_ms=last_hit_ms,
-        )
+        window_end_ms = _buff_record_end_ts_ms(buff_record, last_hit_ms)
+        end_line_no = None
+        if buff_record.get('snapshot_end_ts_ms') == window_end_ms:
+            end_line_no = buff_record.get('snapshot_end_line_no')
+        elif buff_record.get('end_ts_ms') == window_end_ms:
+            end_line_no = buff_record.get('end_line_no')
         buff_windows.append(
             {
                 "start_ts_ms": start_ts_ms,
                 "start_line_no": buff_record.get("line_no"),
-                "end_ts_ms": start_ts_ms + buff_duration_ms,
-                "duration_ms": buff_duration_ms,
+                "end_ts_ms": window_end_ms,
+                "end_line_no": end_line_no,
+                "duration_ms": max(0, window_end_ms - start_ts_ms),
+                "snapshot_end_ts_ms": buff_record.get('snapshot_end_ts_ms'),
+                "snapshot_end_line_no": buff_record.get('snapshot_end_line_no'),
+                "snapshot_update": bool(buff_record.get('snapshot_update')),
+                "lifetime_mode": buff_record.get('lifetime_mode'),
+                "lifetime_source": buff_record.get('lifetime_source'),
+                "end_is_observation_boundary": buff_record.get('end_ts_ms') is None and buff_record.get('snapshot_end_ts_ms') is None and buff_record.get('lifetime_mode') == 'Infinity',
                 "uid": buff_record.get("uid"),
                 "uid_aliases": [],
                 "source_character_key": buff_record["source_character_key"],
@@ -11378,38 +13440,95 @@ def parse_raw_battle_log_text(
                 "target_player_key": buff_record["target_character_key"],
                 "target_enemy_key": buff_record["target_enemy_key"],
                 "owner_raw": buff_record.get("owner_raw"),
+                "target_actor_id": buff_record.get("target_actor_id"),
+                "source_actor_id": buff_record.get("source_actor_id"),
+                "source_weapon_template": buff_record.get("source_weapon_template"),
                 "event_key": buff_record["event_key"],
                 "event_name": " / ".join(labels) if labels else buff_record["event_key"],
+                "bb_values": copy.deepcopy(buff_record.get('bb_values') or {}),
                 "zone_effects": zone_effects,
                 "dynamic_effects": dynamic_effects,
+                "requires_enable_observation": (
+                    ((_load_current_buff_roots().get(buff_record['event_key']) or {}).get('stackingSettings') or {})
+                    .get('stackingType') in {'HighPriority', 'HighPriorityWithMaxStack'}
+                ),
                 "modifier_count": len(buff_record.get("attr_mods") or []),
+                "enable_observations": copy.deepcopy(buff_record.get('enable_observations') or []),
+                "rdps_conflicting_enable_state": bool(buff_record.get('rdps_conflicting_enable_state')),
                 "skill_family_key": None,
-                "stack_limit": _packet_mapping_stack_limit(buff_record) or _buff_stack_limit(buff_record["event_key"]),
+                "stack_limit": (
+                    _packet_mapping_stack_limit(buff_record)
+                    or _rdps_registry_stack_limit(buff_record)
+                    or _buff_stack_limit(buff_record["event_key"], buff_record.get('bb_values'))
+                ),
             }
         )
     buff_windows = _dedupe_mirrored_buff_windows(_merge_buff_windows(buff_windows))
     buff_windows.extend(_build_special_combo_windows(hits, buff_starts, battle_end_ms=last_hit_ms))
     buff_windows = _dedupe_mirrored_buff_windows(_merge_buff_windows(buff_windows))
     buff_windows = _apply_buff_stack_limits(buff_windows)
+
+    # Static audit classifies each exact weapon skill field above. Observing
+    # one known trigger never waives other unknown fields from that weapon.
+    # Trigger capture coverage and allocation remain separate per-Buff checks.
+
     _infer_missing_hit_damage_schools(hits, buff_windows)
-    rdps_preflight = _build_rdps_preflight(
-        buff_starts,
-        buff_windows,
-        battle_start_ms=first_hit_ms,
-        battle_end_ms=last_hit_ms,
-        active_character_keys=set(battle_loadout_by_char),
-    )
     buff_events = _build_buff_events(
         buff_starts,
         buff_windows,
         battle_start_ms=first_hit_ms,
         battle_end_ms=last_hit_ms,
+        root_lookup_cache=buff_root_action_indices,
     )
     rdps_damage = _compute_rdps_damage_shares(hits, buff_windows, condition_buff_records=buff_starts)
+    critical_ids = {str(record.get("event_key") or "") for record in buff_starts}
+    for hit in hits:
+        critical_ids.update(hit.get("_active_attacker_buff_ids") or [])
+        critical_ids.update(hit.get("_active_target_buff_ids") or [])
+    critical_roots = _load_current_buff_roots()
+    critical_numeric_map = _load_num_id_str_buff_map()
+    critical_profiles = {
+        key: critical_buff_profile(critical_roots.get(critical_numeric_map.get(key, key)))
+        for key in critical_ids
+    }
+    critical_changes: dict[tuple[str, str, str], set[int]] = defaultdict(set)
+    for record in buff_starts:
+        resource = str(record.get("event_key") or "")
+        if not critical_profiles.get(resource, {}).get("attributes"):
+            continue
+        identity = (str(record.get("uid") or ""), str(record.get("target_actor_id") or ""), resource)
+        for key in ("dynamic_bb_events", "enable_observations", "repeated_creation_observations"):
+            for observation in record.get(key) or []:
+                if (isinstance(observation, dict) and type(observation.get("line_no")) is int
+                        and observation.get("status") != "duplicate"):
+                    critical_changes[identity].add(observation["line_no"])
+    for window in buff_windows:
+        identities = {str(window.get("uid") or ""), *[str(uid) for uid in window.get("uid_aliases") or []]}
+        changes = set()
+        for uid in identities:
+            changes.update(critical_changes.get((uid, str(window.get("target_actor_id") or ""), str(window.get("event_key") or "")), set()))
+        if changes:
+            window["critical_state_change_lines"] = sorted(changes)
+    for hit in hits:
+        hit["critical_context"] = build_critical_context(hit, hit.get("critical_observation"), critical_profiles, buff_windows)
+    rdps_preflight = _build_rdps_preflight(
+        buff_starts,
+        buff_windows,
+        hits=hits,
+        unresolved_hits=unresolved_hits,
+        unresolved_buff_actions=unresolved_buff_actions,
+        battle_start_ms=first_hit_ms,
+        battle_end_ms=last_hit_ms,
+        active_character_keys=set(battle_loadout_by_char),
+        root_lookup_cache=buff_root_action_indices,
+    )
     rdps_damage_basis = _build_rdps_damage_basis(hits, rdps_damage, int(total_damage))
     rdps_damage_basis["rdps_preflight_ok"] = bool(rdps_preflight.get("ok"))
     rdps_damage_basis["rdps_strict_ok"] = bool(rdps_preflight.get("ok")) and bool(rdps_damage_basis.get("rdps_conservation_ok"))
     rdps_damage_basis["preflight_blocker_count"] = int(rdps_preflight.get("blocker_count") or 0)
+    rdps_damage_basis["unresolved_damage_actor_count"] = sum(
+        first_hit_ms <= int(row.get("ts_ms") or 0) <= last_hit_ms for row in unresolved_hits
+    )
     _assign_skill_timeline_group_keys(hits)
 
     participants = []
@@ -11493,6 +13612,7 @@ def parse_raw_battle_log_text(
                 "packet_modifier_uids": hit.get("packet_modifier_uids") or {"attacker": [], "defender": []},
                 "packet_attr_details": hit.get("packet_attr_details") or {"attacker": [], "defender": []},
                 "poise_damage": hit.get("poise_damage"),
+                "hit_context": {"critical": hit["critical_context"]},
                 "duration_ms": None,
                 "actual_start_ms_from_start": (
                     battle_offset_ms_unclamped(actual_start_ms) if actual_start_ms is not None else None
@@ -11619,6 +13739,7 @@ def parse_raw_battle_log_text(
                 "skill_key": cast_skill,
                 "skill_name": _resolve_skill_name(cast_skill) or cast_skill,
                 "skill_source": str(cast.get("skill_source") or "") or None,
+                "dynamic_bb_events": list(cast.get("dynamic_bb_events") or []),
                 # 技力增加归属回填（下方），默认 False；老客户端无 ATB_UPDATE 恒 False。
                 "recovers_energy": False,
             }
@@ -11753,6 +13874,11 @@ def parse_raw_battle_log_text(
             "timer_end_seen": timer_end_seen,
             "official_timer_start_seen": official_timer_start_ms is not None,
             "official_timer_end_seen": official_timer_end_ms is not None,
+            "official_timer_observed_elapsed_ms": official_timer_observed_elapsed_ms,
+            "packet_timer_elapsed_ms": packet_timer_elapsed_ms,
+            "timer_integrity_ok": timer_integrity_ok,
+            "timer_integrity_reasons": timer_integrity_reasons,
+            "timer_evidence": timer_evidence,
             "timer_start_inferred": timer_start_inferred,
             "timer_window_valid": timer_window_valid,
             "clear_flag": clear_flag,
@@ -11790,10 +13916,16 @@ def parse_raw_battle_log_text(
         "loadout": loadout,
         "buff_events": buff_events,
         "timeline_events": timeline_events,
+        "dynamic_bb_events": dynamic_bb_events,
+        "buff_attribute_refresh_events": buff_attribute_refresh_events,
         "role_skill_stats": role_skill_stats,
         "debug_hits": debug_hits,
+        **({'debug_context': {'start_ts_ms': first_hit_ms, 'end_ts_ms': last_hit_ms,
+                              'buff_windows': buff_windows}} if include_rdps_debug else {}),
         "rdps_damage_basis": rdps_damage_basis,
         "rdps_preflight": rdps_preflight,
+        "unresolved_hits": unresolved_hits,
+        "unresolved_buff_actions": unresolved_buff_actions,
         "casts": casts_export,
         "char_skills": {
             character_key: [
@@ -11803,3 +13935,27 @@ def parse_raw_battle_log_text(
             for character_key, levels in char_skill_levels.items()
         },
     }
+# Compatibility stubs: heuristic identity inference was removed. Callers must
+# treat a missing result as unresolved evidence.
+def _same_frame_trigger_buff_for_runtime_skill(*args: Any, **kwargs: Any) -> None:
+    return None
+
+
+def _runtime_skill_trigger_chain_mapping(*args: Any, **kwargs: Any) -> None:
+    return None
+
+
+def _trigger_damage_identity_from_buff(*args: Any, **kwargs: Any) -> tuple[str, str]:
+    return ("unknown_skill", "unknown_skill")
+
+
+def _infer_context_enemy_hint(*args: Any, **kwargs: Any) -> None:
+    return None
+
+
+def _buff_semantically_reaches_buff(*args: Any, **kwargs: Any) -> bool:
+    return False
+
+
+def _skill_semantically_reaches_buff(*args: Any, **kwargs: Any) -> bool:
+    return False

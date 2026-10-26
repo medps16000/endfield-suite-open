@@ -5,6 +5,7 @@ class TcpStreamReassembler:
     def __init__(self) -> None:
         self._segments: dict[int, bytes] = {}
         self._next_seq: int | None = None
+        self.observer_overlap_conflicts = 0
 
     def reset(self) -> None:
         self._segments.clear()
@@ -35,6 +36,16 @@ class TcpStreamReassembler:
         if seq < self._next_seq:
             payload = payload[self._next_seq - seq :]
             seq = self._next_seq
+
+        # Quality accounting only: retain the established reassembly behavior.
+        # A conflict must not become invisible merely because the pending
+        # segment later drains and gap_state()/pending counts become empty.
+        for start, pending in self._segments.items():
+            overlap_start, overlap_end = max(seq, start), min(seq + len(payload), start + len(pending))
+            if (overlap_start < overlap_end and
+                    payload[overlap_start - seq:overlap_end - seq] != pending[overlap_start - start:overlap_end - start]):
+                self.observer_overlap_conflicts += 1
+                break
 
         existing = self._segments.get(seq)
         if existing is None or len(payload) > len(existing):

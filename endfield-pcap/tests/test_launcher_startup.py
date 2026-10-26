@@ -102,11 +102,15 @@ def test_default_launch_surfaces_invisible_startup_failure(monkeypatch, tmp_path
 
 
 def test_runner_launches_uploader_only_after_service_start_and_stops_it(monkeypatch, tmp_path: Path) -> None:
+    import hashlib
+    import json
+
     events: list[str] = []
 
     class ServiceSpy:
-        def __init__(self, config) -> None:
+        def __init__(self, config, observer=None) -> None:
             self.stop_requested = False
+            assert callable(observer.on_event) and callable(observer.on_state_change)
 
         async def run(self) -> None:
             events.append("service_run")
@@ -147,6 +151,11 @@ def test_runner_launches_uploader_only_after_service_start_and_stops_it(monkeypa
         game_exe="Endfield.exe",
     )
     process = ProcessSpy()
+    config.dll_dir.mkdir()
+    (config.dll_dir / "GameAssembly.dll").write_bytes(b"actual-game-dll")
+    metadata = config.dll_dir / "Endfield_Data/il2cpp_data/Metadata/global-metadata.dat"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_bytes(b"actual-game-metadata")
 
     monkeypatch.setattr(runner, "DamageLogService", ServiceSpy)
     monkeypatch.setattr(runner, "bundle_root", lambda: tmp_path)
@@ -166,13 +175,22 @@ def test_runner_launches_uploader_only_after_service_start_and_stops_it(monkeypa
     assert events.index("uploader_launch") < events.index("overlay_run")
     assert "uploader_terminate" in events
     assert "service_stop" in events
+    diagnostics = json.loads(trace_file.with_suffix(".log.overlay-startup.json").read_text(encoding="utf-8"))
+    assert diagnostics["gameHashes"] == {
+        "gameAssemblySha256": hashlib.sha256(b"actual-game-dll").hexdigest(),
+        "metadataSha256": hashlib.sha256(b"actual-game-metadata").hexdigest(),
+    }
+    assert len(diagnostics["implementationSha256"]) == 64
+    assert diagnostics["lifecycleEvidence"]["clientFinishExact"]["state"] == "unavailable"
+    assert all(value is None for value in diagnostics["resourceHashes"].values())
+    assert not any(key in diagnostics for key in ("session_id", "flow", "account", "packet"))
 
 
 def test_runner_does_not_launch_uploader_when_service_start_fails(monkeypatch, tmp_path: Path) -> None:
     launched: list[bool] = []
 
     class FailingService:
-        def __init__(self, config) -> None:
+        def __init__(self, config, observer=None) -> None:
             pass
 
         async def run(self) -> None:
@@ -202,3 +220,43 @@ def test_runner_does_not_launch_uploader_when_service_start_fails(monkeypatch, t
     with pytest.raises(RuntimeError, match="npcap open failed"):
         runner.run_with_overlay(config)
     assert launched == []
+
+
+def test_optional_overlay_observer_failure_cannot_stop_original_capture(monkeypatch, tmp_path):
+    import threading
+    observed = threading.Event()
+    calls = []
+
+    class FaultyBroker:
+        def on_state_change(self, *args):
+            raise RuntimeError("optional context failed")
+
+        def on_event(self, payload):
+            raise RuntimeError("optional projection failed")
+
+    class Capture:
+        def __init__(self, config, observer=None):
+            self.observer = observer
+            self.stopped = False
+
+        async def run(self):
+            self.observer.on_event({"type": "test"})
+            observed.set()
+            while not self.stopped:
+                await asyncio.sleep(.001)
+
+        def wait_started(self, timeout=None):
+            return observed.wait(timeout)
+
+        def request_stop(self):
+            self.stopped = True
+
+    config = SimpleNamespace(trace_file=tmp_path / "trace.log", status_file=None, log_dir=tmp_path,
+                             dll_dir=tmp_path, game_exe="Endfield.exe")
+    monkeypatch.setattr(runner, "get_overlay_broker", lambda: FaultyBroker())
+    monkeypatch.setattr(runner, "DamageLogService", Capture)
+    monkeypatch.setattr(runner, "bundle_root", lambda: tmp_path)
+    monkeypatch.setattr(runner, "_launch_managed_uploader", lambda *args: None)
+    monkeypatch.setattr(runner.runpy, "run_path", lambda *args, **kwargs: calls.append("original_overlay"))
+    assert runner.run_with_overlay(config) == 0
+    assert calls == ["original_overlay"] and observed.is_set()

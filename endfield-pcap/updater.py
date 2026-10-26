@@ -537,6 +537,12 @@ def _apply_patch_package(
 
 
 def _replace_installation(package_root: Path, target_dir: Path) -> Path:
+    component_manifest = package_root / "components.json"
+    if component_manifest.exists():
+        # Every component must be present and match one release before any live
+        # file is renamed. Legacy full archives without this metadata still work.
+        from endfield_pcap.component_updates import verify_installation
+        verify_installation(package_root)
     target_dir = target_dir.resolve()
     backup_dir = target_dir.with_name(f"{target_dir.name}.old-{datetime.now():%Y%m%d%H%M%S}")
     if backup_dir.exists():
@@ -545,6 +551,8 @@ def _replace_installation(package_root: Path, target_dir: Path) -> Path:
     _rename_with_retries(target_dir, backup_dir)
     try:
         shutil.move(str(package_root), str(target_dir))
+        if component_manifest.exists() or (target_dir / "components.json").exists():
+            verify_installation(target_dir)
     except Exception:
         if target_dir.exists():
             shutil.rmtree(target_dir, ignore_errors=True)

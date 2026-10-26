@@ -5,8 +5,8 @@ const INTERNAL_API_BASE_URL =
   process.env.NEXT_PUBLIC_API_BASE_URL?.trim().replace(/\/+$/, "") ||
   "http://127.0.0.1:8000";
 
-export async function fetchPublicApiServer<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${INTERNAL_API_BASE_URL}${path}`, init);
+export async function fetchPublicApiServer<T>(path: string, init?: RequestInit, baseUrl = INTERNAL_API_BASE_URL): Promise<T> {
+  const response = await fetch(`${baseUrl}${path}`, init);
 
   if (!response.ok) {
     let message = `接口请求失败：${response.status}`;

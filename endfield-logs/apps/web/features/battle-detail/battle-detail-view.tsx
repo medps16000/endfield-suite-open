@@ -6,11 +6,13 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { CharacterAvatar } from "../../components/character-avatar";
 import { ContractTagSummary } from "../../components/contract-tag-summary";
+import { CriticalLuckPanel } from "./critical-luck-panel";
 import { buildApiUrl } from "../../lib/api/client";
 import type { BattleDetailResponse } from "../../lib/api/types";
 import { hasContractTagData } from "../../lib/contract-tags";
 import { formatBossDisplayName, formatBossEyebrow } from "../../lib/format/boss-display";
 import { formatDurationMs } from "../../lib/format/duration";
+import { ROTATIONS_ENABLED } from "../../lib/feature-flags";
 import {
   getBattleSkillCategory,
   getBattleSkillCategoryLabel,
@@ -1185,15 +1187,15 @@ export function BattleDetailView({ detail, metric, axisOnly = false }: BattleDet
       detail.roleSkillStats.length > 0
         ? detail.roleSkillStats
             .filter((stat) => !selectedCharacterName || stat.characterName === selectedCharacterName)
-            .map((stat) => ({
+            .map((stat, index) => ({
               characterName: stat.characterName,
               skillKey: stat.skillKey ?? null,
-              skillName: stat.skillName,
+              displayGroupKey: stat.displayGroupKey ?? (stat.skillKey ? `skill:${stat.skillKey}` : `row:${index}`),
+              skillName: stat.displayGroupName ?? stat.skillName,
               skillCategoryLabel: getBattleSkillCategoryLabel(stat.skillName, stat.skillKey),
-              castCount: stat.castCount,
+              hitCount: stat.hitCount ?? null,
               totalDamage: stat.totalDamage,
-              avgDamage: stat.avgDamage,
-              maxDamage: stat.maxDamage,
+              maxHit: stat.maxHit ?? null,
             }))
         : detail.timelineEvents
             .filter(
@@ -1203,40 +1205,56 @@ export function BattleDetailView({ detail, metric, axisOnly = false }: BattleDet
                 Boolean(event.sourceCharacterName) &&
                 (event.value ?? 0) > 0,
             )
-            .map((event) => {
+            .map((event, index) => {
               const skillName = getPreferredBattleSkillDisplayName(event.eventName, event.eventKey);
               const totalDamage = event.value ?? 0;
               return {
                 characterName: event.sourceCharacterName ?? "未知",
                 skillKey: event.eventKey ?? null,
+                displayGroupKey: event.eventKey ? `skill:${event.eventKey}` : `event:${index}`,
                 skillName,
                 skillCategoryLabel: getAnalysisSkillCategoryLabel(event),
-                castCount: 1,
+                hitCount: 1,
                 totalDamage,
-                avgDamage: totalDamage,
-                maxDamage: totalDamage,
+                maxHit: totalDamage,
               };
             });
 
+    const groupedStats = new Map<string, (typeof sourceStats)[number]>();
     const characterTotals = new Map<string, number>();
     for (const stat of sourceStats) {
       characterTotals.set(
         stat.characterName,
         (characterTotals.get(stat.characterName) ?? 0) + stat.totalDamage,
       );
+      // Official group identity joins damage branches. Unknown skills only join
+      // their identical internal ID; labels and nearby timestamps are not proof.
+      const groupKey = JSON.stringify([stat.characterName, stat.displayGroupKey]);
+      const current = groupedStats.get(groupKey);
+      if (!current) {
+        groupedStats.set(groupKey, { ...stat });
+        continue;
+      }
+      current.totalDamage += stat.totalDamage;
+      current.hitCount = current.hitCount !== null && stat.hitCount !== null
+        ? current.hitCount + stat.hitCount
+        : null;
+      current.maxHit = current.maxHit !== null && stat.maxHit !== null
+        ? Math.max(current.maxHit, stat.maxHit)
+        : null;
     }
 
-    return sourceStats
+    return Array.from(groupedStats.values())
       .map((stat) => ({
         characterName: stat.characterName,
         skillKey: stat.skillKey,
         skillName: stat.skillName,
         skillCategoryLabel: stat.skillCategoryLabel,
-        castCount: stat.castCount,
+        hitCount: stat.hitCount,
         totalDamage: stat.totalDamage,
         damageShare: stat.totalDamage / Math.max(characterTotals.get(stat.characterName) ?? 0, 1),
-        avgDamage: stat.avgDamage,
-        maxDamage: stat.maxDamage,
+        avgDamage: stat.hitCount !== null && stat.hitCount > 0 ? stat.totalDamage / stat.hitCount : null,
+        maxHit: stat.maxHit,
       }))
       .sort((left, right) => {
         if (left.characterName !== right.characterName) {
@@ -2059,18 +2077,18 @@ export function BattleDetailView({ detail, metric, axisOnly = false }: BattleDet
             </p>
           </div>
           <div style={{ display: "grid", gap: 8, justifyItems: "end" }}>
-            <Link className="button-primary" href={`/axis/${detail.battle.id}/editor`}>
+            {ROTATIONS_ENABLED ? <Link className="button-primary" href={`/axis/${detail.battle.id}/editor`}>
               排轴编辑器
-            </Link>
-            {!axisOnly ? (
+            </Link> : null}
+            {ROTATIONS_ENABLED && !axisOnly ? (
               <Link className="button-secondary" href={`/axis/${detail.battle.id}`}>
                 排轴视图
               </Link>
-            ) : (
+            ) : axisOnly ? (
               <Link className="button-secondary" href={`/battle/${detail.battle.id}`}>
                 战斗详情
               </Link>
-            )}
+            ) : null}
             {detail.viewerCapabilities.canDelete ? (
               <button
                 className="button-danger"
@@ -2190,11 +2208,25 @@ export function BattleDetailView({ detail, metric, axisOnly = false }: BattleDet
                       : "旧记录未提供审计结果"}
                 </span>
                 <span>
-                  rDPS 审计：
+                  计时完整性：
+                  {detail.battle.timerIntegrityOk === true
+                    ? `通过（官方 ${detail.battle.durationMs}ms；观测 ${detail.battle.officialTimerObservedElapsedMs ?? "-"}ms；战斗包 ${detail.battle.packetTimerElapsedMs ?? "-"}ms）`
+                    : detail.battle.timerIntegrityOk === false
+                      ? `未通过（${detail.battle.timerIntegrityReasons.join("、") || "时序不一致"}）`
+                      : "旧记录未提供审计结果"}
+                </span>
+                <span>
+                  rDPS 算法准入：
+                  {detail.battle.rdpsRankingEligible === true
+                    ? "符合现行准入规则"
+                    : "未达到现行准入要求"}
+                </span>
+                <span>
+                  详细证据：
                   {detail.battle.rdpsStrictOk === true
-                    ? "通过"
+                    ? "完整"
                     : detail.battle.rdpsStrictOk === false
-                      ? `未通过（${detail.battle.rdpsPreflightBlockerCount ?? 0} 个阻断项）`
+                      ? `仍有 ${detail.battle.rdpsPreflightBlockerCount ?? 0} 项待确认`
                       : "旧记录未提供审计结果"}
                 </span>
                 <span>
@@ -2225,6 +2257,7 @@ export function BattleDetailView({ detail, metric, axisOnly = false }: BattleDet
         </aside>
 
         <div className="detail-stack">
+          {!axisOnly && <CriticalLuckPanel events={detail.timelineEvents} durationMs={detail.battle.durationMs} characterName={selectedCharacterName} />}
           {!axisOnly ? (
           <section className="panel contribution-section">
             <div className="table-toolbar contribution-section-head">
@@ -2686,7 +2719,7 @@ export function BattleDetailView({ detail, metric, axisOnly = false }: BattleDet
                   <div className="eyebrow">技能分布</div>
                   <h2 style={{ margin: "6px 0 0" }}>角色技能构成</h2>
                 </div>
-                <span className="muted">按时间轴技能块合并，次数、平均和最大都按单次施放口径统计。</span>
+                <span className="muted">同一角色的技能分支按正式技能归并；命中数、平均和最大按单次伤害命中统计，缺少完整命中记录时显示 —。</span>
               </div>
               <div className="table-wrap">
                 <table className="data-table">
@@ -2694,11 +2727,11 @@ export function BattleDetailView({ detail, metric, axisOnly = false }: BattleDet
                     <tr>
                       <th>角色</th>
                       <th>技能</th>
-                      <th>次数</th>
+                      <th>命中数</th>
                       <th>总伤</th>
                       <th>占比</th>
-                      <th>平均</th>
-                      <th>最大</th>
+                      <th>平均命中</th>
+                      <th>最大命中</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -2718,11 +2751,11 @@ export function BattleDetailView({ detail, metric, axisOnly = false }: BattleDet
                           </span>
                         </td>
                         <td>{getPreferredBattleSkillDisplayName(stat.skillName, stat.skillKey)}</td>
-                        <td>{stat.castCount}</td>
+                        <td>{stat.hitCount ?? "—"}</td>
                         <td>{stat.totalDamage.toLocaleString()}</td>
                         <td>{formatSkillDamageShare(stat.damageShare)}</td>
-                        <td>{Math.round(stat.avgDamage).toLocaleString()}</td>
-                        <td>{stat.maxDamage.toLocaleString()}</td>
+                        <td>{stat.avgDamage === null ? "—" : Math.round(stat.avgDamage).toLocaleString()}</td>
+                        <td>{stat.maxHit === null ? "—" : stat.maxHit.toLocaleString()}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -2767,7 +2800,7 @@ export function BattleDetailView({ detail, metric, axisOnly = false }: BattleDet
                         <td>{Math.round(participant.rdps).toLocaleString()}</td>
                         <td>{participant.totalDamage.toLocaleString()}</td>
                         <td>{participant.maxHit?.toLocaleString() ?? "-"}</td>
-                        <td>{participant.critRate ? `${Math.round(participant.critRate * 100)}%` : "-"}</td>
+                        <td>{participant.critRate != null ? `${Math.round(participant.critRate * 100)}%` : "-"}</td>
                       </tr>
                     ))}
                   </tbody>

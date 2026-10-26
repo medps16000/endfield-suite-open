@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from datetime import datetime
 from functools import lru_cache
@@ -257,6 +258,7 @@ class TraceBridge:
         self._char_skills_emitted: set[tuple[str, tuple[str, ...]]] = set()
         self.skill_owner_by_int: dict[int, str] = {}
         self.buff_id_by_uid: dict[int, str] = {}
+        self.buff_actor_ids_by_uid: dict[int, tuple[int | None, int | None]] = {}
         self.buff_values_by_uid: dict[int, dict[str, float]] = {}
         self.buff_keys_by_uid: dict[int, set[str]] = {}
         self.actor_alias_by_raw_id: dict[int, str] = {}
@@ -268,6 +270,7 @@ class TraceBridge:
         self.loadout_actor_order: list[str] = []
         self._next_loadout_actor_index = 0
         self.recent_dynamic_bb_by_inst: dict[int, list[tuple[int, float]]] = {}
+        self._keyword_value_serials: dict[tuple[str, str, str], tuple[int, float | None]] = {}
         self.recent_calc_bb_by_inst: dict[int, list[tuple[int, str, float]]] = {}
         self.hit_seq = 0
         self.buff_seq = 0
@@ -298,7 +301,54 @@ class TraceBridge:
 
     def handle_event(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("type") or "")
-        ts_ms = _intish(event.get("timestamp_ms")) or int(datetime.now().timestamp() * 1000)
+        if event_type in {
+            "SC_EFFECT_SNAPSHOT", "SC_OBJECT_LEAVE_VIEW",
+            "SC_CHAR_BAG_SYNC_PERSISTENT_BUFFS", "SC_SCENE_RESET_ENTITY",
+            "SC_SYNC_RACING_DUNGEON_BUFF_MODIFY", "SC_SYNC_RACING_DUNGEON_RECONNECT",
+            "CAPTURE_SESSION_START", "CAPTURE_SESSION_END",
+        }:
+            # Overlay evidence is isolated from legacy statistics. It must not
+            # advance gameplay timestamps or partition pending Buff groups.
+            return
+        ts_ms = _intish(event.get("timestamp_ms"))
+        if event_type in {
+            "GAME_CLOCK_TICK", "CS_PING", "SC_PING",
+            "CS_GAME_TIME_FREEZE_START_REQ", "CS_GAME_TIME_FREEZE_END_REQ",
+            "SC_GAME_TIME_FREEZE_START_RSP", "SC_GAME_TIME_FREEZE_END_RSP",
+        }:
+            # Clock observations are a side channel. They cannot become the
+            # last gameplay timestamp or flush/partition pending Buff evidence.
+            # Missing receipt timestamps remain absent instead of becoming now.
+            if ts_ms is None:
+                return
+            if event_type == "GAME_CLOCK_TICK":
+                tick = _intish(event.get("tick_ms"))
+                seq = _intish(event.get("seq_id"))
+                if event.get("source") == "CS_BATTLE_OP" and tick is not None and tick > 0:
+                    self._append_line(ts_ms, f"GAME_CLOCK_TICK source=CS_BATTLE_OP tickMs={tick} seq={seq if seq is not None else 'unknown'}")
+            elif event_type in {"CS_PING", "SC_PING"}:
+                parts = [f"GAME_CLOCK_SYNC source={event_type}", f"msgId={event.get('msg_id', 'unknown')}", f"captureMs={ts_ms}"]
+                for key, output_key in (("client_ts", "clientTs"), ("server_ts", "serverTs"), ("logical_ts", "logicalTs")):
+                    value = _intish(event.get(key))
+                    if value is not None and value >= 0:
+                        parts.append(f"{output_key}={value}")
+                if isinstance(event.get("raw_body_hex"), str):
+                    parts.append(f"rawBodyHex={event['raw_body_hex'] or 'empty'}")
+                self._append_line(ts_ms, " ".join(parts))
+            elif event_type in {"CS_GAME_TIME_FREEZE_START_REQ", "CS_GAME_TIME_FREEZE_END_REQ"}:
+                reason = _intish(event.get("reason"))
+                raw_body = event.get("raw_body_hex")
+                raw_token = (raw_body or "empty") if isinstance(raw_body, str) else "unknown"
+                self._append_line(ts_ms, f"GAME_TIME_FREEZE_REQUEST source={event_type} reason={reason if reason is not None else 'unknown'} msgId={event.get('msg_id', 'unknown')} rawBodyHex={raw_token}")
+            else:
+                reason = _intish(event.get("reason"))
+                frozen = event.get("in_time_freeze")
+                raw_body = event.get("raw_body_hex")
+                raw_token = (raw_body or "empty") if isinstance(raw_body, str) else "unknown"
+                self._append_line(ts_ms, f"GAME_TIME_FREEZE_STATE source={event_type} inTimeFreeze={int(frozen) if type(frozen) is bool else 'unknown'} reason={reason if reason is not None else 'unknown'} msgId={event.get('msg_id', 'unknown')} rawBodyHex={raw_token}")
+            return
+        if ts_ms is None:
+            ts_ms = int(datetime.now().timestamp() * 1000)
         self._last_ts_ms = ts_ms
         action = event.get("action") if event_type == "BattleOpTriggerAction" else None
         action_type = str(action.get("action_type") or "") if isinstance(action, dict) else ""
@@ -381,6 +431,79 @@ class TraceBridge:
                     self._pending_create_buff_events.append(event)
             else:
                 self._handle_trigger_action(event, ts_ms)
+        elif event_type == 'BattleOpTriggerKeyword':
+            updates = []
+            errors = []
+            raw_updates = event.get('modify')
+            if not isinstance(raw_updates, list):
+                errors.append('missing_keyword_modify_list')
+            for row in raw_updates if isinstance(raw_updates, list) else []:
+                value = None
+                if isinstance(row, dict) and type(row.get('modify_value')) in (int, float):
+                    try:
+                        value = float(row['modify_value'])
+                    except (OverflowError, ValueError):
+                        pass
+                if (not isinstance(row, dict) or type(row.get('config_index')) is not int
+                        or row['config_index'] < 0 or value is None or not math.isfinite(value)):
+                    errors.append('invalid_keyword_modify_row')
+                    continue
+                updates.append({'configIndex': row['config_index'], 'rateAfter': value})
+            observation = {
+                'schemaVersion': 1, 'sessionId': event.get('session_id'),
+                'ownerId': str(event['owner_id']) if type(event.get('owner_id')) in (int, str) else None,
+                'generation': event.get('generation'), 'operationSeq': event.get('seq_id'),
+                'clientTickMs': str(event['client_tick_tms']) if type(event.get('client_tick_tms')) in (int, str) else None,
+                'buffUid': str(event['buff_inst_id']) if type(event.get('buff_inst_id')) in (int, str) else None,
+                'addedBuffNumId': event.get('add_buff_num_id'), 'modify': updates,
+                'operationPayloadCase': event.get('operation_payload_case'),
+            }
+            if observation['operationPayloadCase'] != 'trigger_keyword_op_data':
+                errors.append('keyword_operation_presence_unverified')
+            for field in ('ownerId', 'buffUid'):
+                value = observation[field]
+                if (not isinstance(value, str) or not re.fullmatch(r'[1-9][0-9]*', value)
+                        or int(value) >= 2**64):
+                    errors.append('invalid_' + field)
+            for field in ('generation', 'operationSeq', 'addedBuffNumId'):
+                if type(observation[field]) is not int or observation[field] < 0:
+                    errors.append('invalid_' + field)
+            if not isinstance(observation['sessionId'], str) or not observation['sessionId']:
+                errors.append('missing_sessionId')
+            if errors:
+                observation['validationErrors'] = errors
+            elif updates:
+                # The native list contains consecutive absolute rate results.
+                # Keep the ordinary create-row de-duplication cache current,
+                # without emitting a fabricated new Buff or lifetime.
+                uid = int(observation['buffUid'])
+                owner = int(observation['ownerId'])
+                indices = [row['configIndex'] for row in updates]
+                cache_key = (observation['sessionId'], observation['ownerId'], observation['buffUid'])
+                previous = self._keyword_value_serials.get(cache_key)
+                seq = observation['operationSeq']
+                if (uid in self.buff_values_by_uid and self.buff_actor_ids_by_uid.get(uid, (None, None))[0] == owner
+                        and indices == sorted(set(indices))):
+                    final_rate = updates[-1]['rateAfter']
+                    if previous is None or seq > previous[0]:
+                        self._keyword_value_serials[cache_key] = (seq, final_rate)
+                        self.buff_values_by_uid[uid]['rate'] = final_rate
+                        self.buff_keys_by_uid.setdefault(uid, set()).add('rate')
+                    elif seq == previous[0] and previous[1] != final_rate:
+                        self._keyword_value_serials[cache_key] = (seq, None)
+                        self.buff_values_by_uid[uid].pop('rate', None)
+            self._line(ts_ms, ('BUFF_KEYWORD_UPDATE_UNRESOLVED ' if errors else 'BUFF_KEYWORD_UPDATE ')
+                       + json.dumps(observation, ensure_ascii=False, separators=(',', ':'), allow_nan=False))
+        elif event_type == 'BattleOpSetBuffEnableState':
+            states = event.get('states')
+            if isinstance(states, dict):
+                for uid, enabled in states.items():
+                    self._line(ts_ms, 'BUFF_ENABLE ' + json.dumps({
+                        'schemaVersion': 1, 'buffUid': str(uid), 'enabled': enabled,
+                        'ownerId': str(event.get('owner_id')) if event.get('owner_id') is not None else None,
+                        'operationSeq': event.get('seq_id'), 'clientTickMs': event.get('client_tick_tms'),
+                        'generation': event.get('generation'),
+                    }, separators=(',', ':')))
         elif event_type == "BattleOpEntityDie":
             self._line(ts_ms, f"ENTITY_DIE id={event.get('entity_inst_id')}")
         elif event_type == "BattleOpEntityValueModify":
@@ -448,6 +571,7 @@ class TraceBridge:
         self._char_skills_emitted.clear()
         self.skill_owner_by_int.clear()
         self.buff_id_by_uid.clear()
+        self.buff_actor_ids_by_uid.clear()
         self.buff_values_by_uid.clear()
         self.buff_keys_by_uid.clear()
         self.actor_alias_by_raw_id.clear()
@@ -928,7 +1052,7 @@ class TraceBridge:
             weapon_template = str(row.get("weapon_template") or "unknown_weapon")
             weapon_sync_source = str(row.get("weapon_sync_source") or "missing")
             weapon_lv = int(_intish(row.get("weapon_lv")) or 0)
-            refine = int(_intish(row.get("refine")) or 0)
+            refine = _intish(row.get("refine"))
             breakthrough = int(_intish(row.get("breakthrough")) or 0)
             weapon_base_atk = row.get("weapon_base_atk")
             weapon_base_atk_lv1 = row.get("weapon_base_atk_lv1")
@@ -942,6 +1066,10 @@ class TraceBridge:
             weapon_source_skills = str(row.get("weapon_source_skills") or "")
             equip_inst_ids = str(row.get("equip_inst_ids") or "{}")
             equips = str(row.get("equips") or "{}")
+            equip_complete = (f'equipsComplete={int(row["equipment_snapshot_complete"])} '
+                              if type(row.get('equipment_snapshot_complete')) is bool else '')
+            unplaced_equips = ('unplacedEquipInstIds=[' + ','.join(str(value) for value in row['unresolved_equip_inst_ids']) + '] '
+                               if isinstance(row.get('unresolved_equip_inst_ids'), list) else '')
             equip_suit = str(row.get("equip_suit") or "{}")
             skill_int_ids = str(row.get("skill_int_ids") or "")
             self._line(
@@ -950,8 +1078,10 @@ class TraceBridge:
                     f"LOADOUT slot={slot} char={char} slotCharInstId={char_inst_id} "
                     f"resolvedCharInstId={char_inst_id} character=packet charInfo.instId={char_inst_id} "
                     f"template={char} charLv={char_level} potential={potential} weaponInstId={weapon_inst_id} "
-                    f"weaponTemplate={weapon_template} weaponLv={weapon_lv} refine={refine} break={breakthrough} "
+                    f"weaponTemplate={weapon_template} weaponLv={weapon_lv} refine={refine if refine is not None else 'unknown'} break={breakthrough} "
                     f"attachedGem={attached_gem} equipInsts={equip_inst_ids} equips={equips} "
+                    f"{equip_complete}"
+                    f"{unplaced_equips}"
                     f"equipSuit={equip_suit} skillIntIds=[{skill_int_ids}]"
                 ),
             )
@@ -1121,7 +1251,7 @@ class TraceBridge:
                 f"SKILL_CAST_START seq={seq} startMs={client_tick} inst={skill_inst_id} "
                 f"owner={owner} ownerId={owner_id if owner_id is not None else 'unknown'} "
                 f"skill={skill or 'unknown_skill'} "
-                f"skillSource={self.skill_source_by_inst.get(skill_inst_id) or 'unknown'}"
+                f"skillSource={self.skill_source_by_inst.get(skill_inst_id) or 'unknown'} captureMs={ts_ms}"
             ),
         )
 
@@ -1319,10 +1449,10 @@ class TraceBridge:
         buff_id, owner, src, src_id, target_id = self._resolve_add_buff_event(event, ts_ms)
         existing = self.buff_id_by_uid.get(buff_uid, "")
         if existing and existing != "unknown_buff" and not existing.isdigit():
-            self._write_buff_start(ts_ms, existing, buff_uid, owner, src, event.get("assigned_items"))
+            self._write_buff_start(ts_ms, existing, buff_uid, owner, src, event.get("assigned_items"), target_id=target_id, src_id=src_id, creation_event=event)
             return
         self._remember_actor_alias_for_buff(src_id, target_id, _intish(event.get("int_id")), buff_id)
-        self._write_buff_start(ts_ms, buff_id, buff_uid, owner, src, event.get("assigned_items"))
+        self._write_buff_start(ts_ms, buff_id, buff_uid, owner, src, event.get("assigned_items"), target_id=target_id, src_id=src_id, creation_event=event)
 
     def _resolve_add_buff_event(self, event: dict[str, Any], ts_ms: int) -> tuple[str, str, str, int | None, int | None]:
         src_id = _intish(event.get("src_inst_id"))
@@ -1387,7 +1517,11 @@ class TraceBridge:
         if not self._pending_add_buff_events:
             self._pending_add_buff_ts_ms = None
             return
-        ts_ms = self._pending_add_buff_ts_ms or self._last_ts_ms or int(datetime.now().timestamp() * 1000)
+        ts_ms = self._pending_add_buff_ts_ms
+        if ts_ms is None:
+            ts_ms = self._last_ts_ms
+        if ts_ms is None:
+            ts_ms = int(datetime.now().timestamp() * 1000)
         resolved_rows: list[dict[str, Any]] = []
         for event in self._pending_add_buff_events:
             buff_uid = _intish(event.get("buff_inst_id"))
@@ -1428,149 +1562,32 @@ class TraceBridge:
                 _intish(event.get("int_id")),
                 buff_id,
             )
-            self._write_buff_start(ts_ms, buff_id, int(row["buff_uid"]), owner, src, event.get("assigned_items"))
+            self._write_buff_start(ts_ms, buff_id, int(row["buff_uid"]), owner, src, event.get("assigned_items"), target_id=row.get("target_id"), src_id=row.get("src_id"), creation_event=event)
 
         self._pending_add_buff_events.clear()
         self._pending_add_buff_ts_ms = None
 
     def _flush_pending_create_buff_triggers(self) -> None:
-        if not self._pending_create_buff_events:
-            self._pending_create_buff_ts_ms = None
-            return
-        groups: dict[int, list[dict[str, Any]]] = {}
-        passthrough: list[dict[str, Any]] = []
-        for event in self._pending_create_buff_events:
-            inst_id = _intish(event.get("inst_id"))
-            if inst_id is None:
-                passthrough.append(event)
-                continue
-            groups.setdefault(inst_id, []).append(event)
-        for event in passthrough:
-            self._handle_trigger_action(event, self._pending_create_buff_ts_ms or self._last_ts_ms or int(datetime.now().timestamp() * 1000))
-        ts_ms = self._pending_create_buff_ts_ms or self._last_ts_ms or int(datetime.now().timestamp() * 1000)
-        for group_events in groups.values():
-            self._handle_grouped_create_buff_events(group_events, ts_ms)
+        if self._pending_create_buff_events:
+            ts_ms = self._pending_create_buff_ts_ms
+            if ts_ms is None:
+                ts_ms = self._last_ts_ms
+            if ts_ms is None:
+                raise ValueError("pending buff actions have no timestamp")
+            self._handle_grouped_create_buff_events(self._pending_create_buff_events, ts_ms)
         self._pending_create_buff_events.clear()
         self._pending_create_buff_ts_ms = None
 
     def _handle_grouped_create_buff_events(self, events: list[dict[str, Any]], ts_ms: int) -> None:
-        if not events:
-            return
-        merged_details: list[dict[str, Any]] = []
+        # Preserve each operation's phase and order, including Execute/End
+        # pairs for the same instance in one timestamp group.
         for event in events:
             action = event.get("action")
-            if not isinstance(action, dict):
-                continue
-            create = action.get("create_buff_action")
-            if not isinstance(create, dict):
-                continue
-            for detail in create.get("details") or []:
-                if isinstance(detail, dict):
-                    merged_details.append(detail)
-        representative = events[0]
-        inferred_parent_id, inferred_children = self._infer_unresolved_parent_graph(representative, merged_details)
-        if inferred_parent_id:
-            parent_uid = _intish(representative.get("inst_id"))
-            if parent_uid:
-                self.buff_id_by_uid[parent_uid] = inferred_parent_id
-                self._remember_learned_buff_mapping_from_keys(
-                    _intish(representative.get("template_int_id")),
-                    self._name_for_id((merged_details[0].get("target_id") if merged_details else None) or representative.get("owner_id")),
-                    self._name_for_id((merged_details[0].get("source_id") if merged_details else None) or representative.get("owner_id")),
-                    self.buff_keys_by_uid.get(parent_uid),
-                    inferred_parent_id,
-                    target_id=(merged_details[0].get("target_id") if merged_details else None) or representative.get("owner_id"),
-                    src_id=(merged_details[0].get("source_id") if merged_details else None) or representative.get("owner_id"),
-                )
-                owner = self._name_for_id((merged_details[0].get("target_id") if merged_details else None) or representative.get("owner_id"))
-                src = self._name_for_id((merged_details[0].get("source_id") if merged_details else None) or representative.get("owner_id"))
-                self._write_buff_start(ts_ms, inferred_parent_id, parent_uid, owner, src, {})
-        for event in events:
-            action = event.get("action")
-            if not isinstance(action, dict):
-                continue
-            create = action.get("create_buff_action")
-            if not isinstance(create, dict):
-                continue
-            details = create.get("details") or []
-            if not isinstance(details, list):
-                continue
-            for detail in details:
-                if not isinstance(detail, dict):
-                    continue
-                buff_uid = _intish(detail.get("buff_inst_id"))
-                if not buff_uid:
-                    continue
-                owner = self._name_for_id(detail.get("target_id"))
-                src = self._name_for_id(detail.get("source_id"))
-                has_explicit_template = bool(_template_id(detail.get("buff_id"))) or _intish(detail.get("buff_num_id")) is not None
-                buff_id = (
-                    self._resolve_created_buff_template(event, detail, buff_uid, owner=owner, src=src)
-                    if has_explicit_template
-                    else inferred_children.get(buff_uid)
-                    or self._resolve_created_buff_template(event, detail, buff_uid, owner=owner, src=src)
-                )
-                self._remember_learned_buff_mapping(
-                    _intish(detail.get("buff_num_id")),
-                    owner,
-                    src,
-                    detail.get("assigned_items"),
-                    buff_id,
-                    target_id=_intish(detail.get("target_id")),
-                    src_id=_intish(detail.get("source_id")),
-                )
-                assigned = {"blackboard": self._assigned_list_to_blackboard(detail.get("assigned_items"))}
-                self._write_buff_start(ts_ms, buff_id, buff_uid, owner, src, assigned)
+            if isinstance(action, dict):
+                self._write_create_buffs(ts_ms, event, action.get("create_buff_action"))
 
     def _apply_group_companion_inference(self, rows: list[dict[str, Any]]) -> None:
-        if not rows:
-            return
-        companion_candidates: list[tuple[str, str]] = []
-        for row in rows:
-            buff_id = str(row.get("buff_id") or "")
-            if not buff_id or buff_id == "unknown_buff" or buff_id.isdigit():
-                continue
-            family = _character_family_from_any(buff_id)
-            if not family:
-                continue
-            for parent in (self.resolver.semantic_indexes.get("referenced_buff_parent_index") or {}).get(buff_id, []):
-                if not isinstance(parent, dict):
-                    continue
-                if str(parent.get("parent_type") or "") != "buff":
-                    continue
-                candidate_id = str(parent.get("parent_id") or "")
-                if not candidate_id or _character_family_from_any(candidate_id) != family:
-                    continue
-                candidate_rules = self.resolver.parent_rules("buff", candidate_id)
-                if not candidate_rules:
-                    continue
-                if candidate_rules.get("blackboard_keys"):
-                    continue
-                companion_candidates.append((family, candidate_id))
-
-        if not companion_candidates:
-            return
-
-        by_family: dict[str, set[str]] = {}
-        for family, candidate_id in companion_candidates:
-            by_family.setdefault(family, set()).add(candidate_id)
-
-        for row in rows:
-            buff_id = str(row.get("buff_id") or "")
-            owner = str(row.get("owner") or "")
-            src = str(row.get("src") or "")
-            if buff_id and not buff_id.isdigit() and buff_id != "unknown_buff":
-                continue
-            if owner != src:
-                continue
-            family_candidates = by_family.get(owner) if owner.startswith("chr_") else None
-            if family_candidates is None:
-                all_family_candidates = list(by_family.values())
-                if len(all_family_candidates) == 1:
-                    family_candidates = all_family_candidates[0]
-            if not family_candidates or len(family_candidates) != 1:
-                continue
-            row["buff_id"] = next(iter(family_candidates))
+        return
 
     def _handle_finish_buff_op(self, event: dict[str, Any], ts_ms: int) -> None:
         buff_uid = _intish(event.get("buff_inst_id"))
@@ -1580,19 +1597,139 @@ class TraceBridge:
         self.buff_seq += 1
         self._line(ts_ms, f'BUFF_END #{self.buff_seq} id="{buff_id}" uid={buff_uid}')
         self.buff_id_by_uid.pop(buff_uid, None)
+        self.buff_actor_ids_by_uid.pop(buff_uid, None)
+        self.buff_values_by_uid.pop(buff_uid, None)
+        self.buff_keys_by_uid.pop(buff_uid, None)
 
     def _handle_trigger_action(self, event: dict[str, Any], ts_ms: int) -> None:
         action = event.get("action")
         if not isinstance(action, dict):
             return
         action_type = str(action.get("action_type") or "")
+        if action_type in {"BattleActionModifyDynamicBlackboard", "BattleActionRefreshBuffAttrModifierValue",
+                           "BattleActionReadSkillActionToBb"}:
+            template = event.get("template_id")
+            template = template if isinstance(template, dict) else {}
+            template_cases = [key for key in ("int_id", "str_id") if key in template]
+            template_case = template_cases[0] if len(template_cases) == 1 else None
+            identity = {
+                "schemaVersion": 1, "sessionId": event.get("session_id"),
+                "operationSeq": event.get("seq_id"),
+                "operationOwnerId": event.get("operation_owner_id"),
+                "ownerType": event.get("owner_type"),
+                "ownerId": event.get("trigger_owner_id"),
+                "environmentInstId": event.get("trigger_inst_id"),
+                "generation": event.get("generation"),
+                "clientTickMs": (str(event["client_tick_tms"])
+                                 if event.get("client_tick_tms") is not None else None),
+                "templateType": template.get("type"), "templateIdCase": template_case,
+                "templateIntId": template.get("int_id"), "templateStrId": template.get("str_id"),
+                "actionId": action.get("action_id"), "triggerType": event.get("trigger_type"),
+                "actionType": {"BattleActionModifyDynamicBlackboard": 7,
+                               "BattleActionRefreshBuffAttrModifierValue": 31,
+                               "BattleActionReadSkillActionToBb": 35}[action_type],
+                "actionRuntimeCase": event.get("action_runtime_case"),
+                "operationPayloadCase": event.get("operation_payload_case"),
+            }
+            # Older decoded NDJSON preserved these fields but not the later
+            # envelope. Keep original names without inventing missing metadata.
+            if all(event.get(key) is None for key in ('operation_owner_id', 'trigger_owner_id', 'trigger_inst_id', 'generation', 'template_id')):
+                identity['eventContext'] = {key: event[key] for key in (
+                    'owner_id', 'inst_id', 'owner_type', 'template_type',
+                    'template_int_id', 'template_str_id', 'seq_id') if key in event}
+            for field in ("operationOwnerId", "ownerId", "environmentInstId"):
+                value = identity[field]
+                if type(value) in (int, str):
+                    identity[field] = str(value)
+            if action_type == "BattleActionReadSkillActionToBb":
+                # Preserve the packet's computed values and all detail rows.
+                # The matching typed action defines their meaning (e.g. combo
+                # layers/rate); this event alone does not authorize rDPS.
+                runtime_field = "read_skill_setting_to_bb_action"
+                runtime = action.get(runtime_field)
+                errors = []
+                if ({key for key in action if key.endswith("_action")} != {runtime_field}
+                        or not isinstance(runtime, dict)
+                        or not isinstance(runtime.get("runtime_details"), list)):
+                    errors.append("invalid_skill_setting_runtime")
+                if event.get("action_runtime_case") != runtime_field:
+                    errors.append("skill_setting_runtime_presence_unverified")
+                if event.get("operation_payload_case") != "trigger_action_op_data":
+                    errors.append("trigger_operation_presence_unverified")
+                if template_case is None or event.get("template_id_case") != template_case:
+                    errors.append("invalid_template_oneof")
+                identity["runtime"] = runtime
+                identity["actionSerialization"] = event.get("action_serialization")
+                identity["buffUid"] = (identity["environmentInstId"]
+                    if type(identity["ownerType"]) in (int, str) and str(identity["ownerType"]) == "1"
+                    and template.get("type") == "Buff"
+                    and identity["environmentInstId"] not in (None, "0") else None)
+                if errors:
+                    identity["validationErrors"] = errors
+                self._line(ts_ms, ("BB_READ_SKILL_SETTING_UNRESOLVED " if errors else "BB_READ_SKILL_SETTING ")
+                           + json.dumps(identity, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
+                return
+            if action_type == "BattleActionRefreshBuffAttrModifierValue":
+                errors = []
+                runtime_field = "refresh_buff_attr_modifier_value_action"
+                runtime_fields = {key for key in action if key.endswith("_action")}
+                if runtime_fields != {runtime_field} or action.get(runtime_field) != {}:
+                    errors.append("invalid_refresh_runtime_oneof")
+                if event.get("action_runtime_case") != runtime_field:
+                    errors.append("refresh_runtime_presence_unverified")
+                if event.get("operation_payload_case") != "trigger_action_op_data":
+                    errors.append("trigger_operation_presence_unverified")
+                if template_case is None or event.get("template_id_case") != template_case:
+                    errors.append("invalid_template_oneof")
+                if template_case == "int_id" and type(template.get("int_id")) is not int:
+                    errors.append("invalid_template_int_id")
+                if template_case == "str_id" and not isinstance(template.get("str_id"), str):
+                    errors.append("invalid_template_str_id")
+                if type(identity["ownerType"]) not in (int, str) or str(identity["ownerType"]) not in {"0", "1", "2", "3"}:
+                    errors.append("invalid_ownerType")
+                for field in ("operationOwnerId", "ownerId", "environmentInstId"):
+                    value = identity[field]
+                    if (not isinstance(value, str) or not value.isascii() or not value.isdecimal()
+                            or not 0 <= int(value) < 2**64):
+                        errors.append("invalid_" + field)
+                for field in ("operationSeq", "generation", "actionId", "triggerType"):
+                    if type(identity[field]) is not int:
+                        errors.append("invalid_" + field)
+                tick = event.get("client_tick_tms")
+                if (type(tick) not in (int, str)
+                        or not re.fullmatch(r"-?[0-9]+", str(tick))
+                        or not -(2**63) <= int(tick) < 2**63):
+                    errors.append("invalid_clientTickMs")
+                if not isinstance(identity["sessionId"], str) or not identity["sessionId"]:
+                    errors.append("missing_sessionId")
+                # A skill or standalone environment can report this action too;
+                # its environment ID must never be relabeled as a Buff UID.
+                identity["buffUid"] = (identity["environmentInstId"]
+                    if type(identity["ownerType"]) in (int, str) and str(identity["ownerType"]) == "1"
+                    and template.get("type") == "Buff"
+                    and identity["environmentInstId"] not in (None, "0") else None)
+                if errors:
+                    identity["validationErrors"] = errors
+                self._line(ts_ms, ("BUFF_ATTR_REFRESH_UNRESOLVED " if errors else "BUFF_ATTR_REFRESH ")
+                           + json.dumps(identity, ensure_ascii=False, separators=(",", ":"), allow_nan=False))
+                return
         if action_type == "BattleActionModifyDynamicBlackboard":
+            runtime_field = "modify_dynamic_blackboard_action"
+            if ({key for key in action if key.endswith("_action")} != {runtime_field}
+                    or event.get("action_runtime_case") not in (None, runtime_field)):
+                return
             inst_id = _intish(event.get("inst_id"))
             action_id = int(_intish(action.get("action_id")) or 0)
             modify_action = action.get("modify_dynamic_blackboard_action")
             if inst_id and isinstance(modify_action, dict):
-                value = _floatish(modify_action.get("client_value"))
-                if value is not None:
+                raw_value = modify_action.get("client_value")
+                value = None
+                if type(raw_value) in (int, float):
+                    try:
+                        value = float(raw_value)
+                    except (OverflowError, ValueError):
+                        pass
+                if value is not None and math.isfinite(value):
                     rows = self.recent_dynamic_bb_by_inst.setdefault(inst_id, [])
                     rows.append((action_id, value))
                     del rows[:-8]
@@ -1601,7 +1738,8 @@ class TraceBridge:
                         "BB_MODIFY_DYNAMIC",
                         event,
                         action_id,
-                        f"value={value:.6g}",
+                        f"value={value!r} identity=" + json.dumps(
+                            identity, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
                     )
         if action_type == "BattleActionSimpleCalcBb":
             inst_id = _intish(event.get("inst_id"))
@@ -1676,14 +1814,15 @@ class TraceBridge:
         skill = str(event.get("template_str_id") or "")
         if skill:
             return skill
-        return (
-            self._resolve_skill_template(
-                None,
-                event.get("template_int_id"),
-                owner_hint=self._character_from_template(owner_name) or "",
-            )
-            or "unknown_skill"
-        )
+        number = _intish(event.get("template_int_id"))
+        if number is None:
+            return "unknown_skill"
+        namespace = str(event.get("template_type") or "").lower()
+        if namespace == "buff":
+            return self.resolver.resolve_buff(int_id=number)
+        if namespace == "skill":
+            return self.resolver.resolve_skill(int_id=number) or f"skill_{number}"
+        return f"skill_{number}"
 
     def _write_blackboard_trace(
         self,
@@ -1787,33 +1926,29 @@ class TraceBridge:
             return
         attacker_id = _intish(damage_action.get("attacker_id")) or _intish(event.get("owner_id"))
         attacker = self._name_for_id(attacker_id)
-        skill = str(event.get("template_str_id") or "")
-        if not skill:
-            skill = (
-                self._resolve_skill_template(
-                    None,
-                    event.get("template_int_id"),
-                    owner_hint=self._character_from_template(attacker) or "",
-                )
-                or _template_id(damage_action.get("original_source_template_id"))
-                or "unknown_skill"
-            )
-        skill_owner = self._character_from_template(skill)
-        if not skill_owner and skill.startswith("skill_"):
-            attacker_char = self._character_from_template(attacker)
-            if attacker_char:
-                skill_owner = attacker_char
-                skill = f"{attacker_char}_{skill}"
-        if attacker_id and skill_owner and self.id_to_name.get(attacker_id) is None:
-            self.id_to_name[attacker_id] = skill_owner
-            attacker = skill_owner
-            self._line(ts_ms, f"ACTOR_MAP id={attacker_id} template={skill_owner} source=damage_skill skill={skill}")
+        skill = self._trigger_skill_template(event, attacker)
         skill_level = int(_intish(event.get("level")) or 0)
         template_int_id = int(_intish(event.get("template_int_id")) or 0)
         action_payload = event.get("action") if isinstance(event.get("action"), dict) else {}
-        action_id = int(_intish(action_payload.get("action_id")) or 0)
+        action_id = _intish(action_payload.get("action_id"))
         original_template = damage_action.get("original_source_template_id")
         original_template_int_id = int(_intish((original_template or {}).get("int_id")) or 0) if isinstance(original_template, dict) else 0
+        original_source_skill = self._resolve_skill_template(
+            (original_template or {}).get("str_id") if isinstance(original_template, dict) else None,
+            original_template_int_id,
+        )
+        # Only the explicit original-source template is identity evidence for
+        # an otherwise unknown attacker ID. The event's display skill alone
+        # must not fabricate an actor mapping.
+        actor_template = self._character_from_template(original_source_skill)
+        if attacker_id and actor_template and self.id_to_name.get(attacker_id) is None:
+            self.id_to_name[attacker_id] = actor_template
+            self._line(
+                ts_ms,
+                f"ACTOR_MAP id={attacker_id} template={actor_template} "
+                f"source=damage_original_skill skill={original_source_skill or skill}",
+            )
+        attacker = self._name_for_id(attacker_id)
         event_inst_id = int(_intish(event.get("inst_id")) or 0)
         dynamic_bb_rows = list(self.recent_dynamic_bb_by_inst.get(event_inst_id, [])) if event_inst_id else []
         dynamic_bb_text = ",".join(f"{bb_action}:{bb_value:.6g}" for bb_action, bb_value in dynamic_bb_rows)
@@ -1837,7 +1972,7 @@ class TraceBridge:
             target = self._name_for_damage_target(target_id, attacker)
             cur_hp = _floatish(detail.get("cur_hp")) or 0.0
             is_crit = bool(detail.get("is_crit"))
-            damage_unit_index = int(_intish(detail.get("damage_unit_index")) or 0)
+            damage_unit_index = _intish(detail.get("damage_unit_index"))
             part_inst_id = int(_intish(detail.get("part_inst_id")) or 0)
             detail_presence = (
                 detail_presence_rows[detail_index]
@@ -1867,6 +2002,15 @@ class TraceBridge:
                     if value is not None:
                         calc_tokens.append(f"{token_name}={value:.6g}")
             shared = 3 if is_crit else 2
+            packet_identity_tokens = []
+            if isinstance(event.get('session_id'), str) and event['session_id']:
+                packet_identity_tokens.append('packetSessionId=' + _trace_string(event['session_id']))
+            packet_owner = event.get('operation_owner_id')
+            if (type(packet_owner) in (int, str) and re.fullmatch(r'[0-9]+', str(packet_owner))
+                    and 0 <= int(packet_owner) < 2**64):
+                packet_identity_tokens.append('packetOwnerId=' + str(packet_owner))
+            if type(event.get('generation')) is int and 0 <= event['generation'] < 2**32:
+                packet_identity_tokens.append('packetGeneration=' + str(event['generation']))
             self.hit_seq += 1
             self._line(
                 ts_ms,
@@ -1876,9 +2020,10 @@ class TraceBridge:
                     f'pHP=0 eHP={cur_hp:.0f} skill="{skill}" hits=1 '
                     f"skillLv={skill_level if skill_level > 0 else 'unknown'} "
                     f"templateIntId={template_int_id if template_int_id > 0 else 'unknown'} "
-                    f"actionId={action_id if action_id > 0 else 'unknown'} "
+                    f"templateType={event.get('template_type') or 'unknown'} "
+                    f"actionId={action_id if action_id is not None else 'unknown'} "
                     f"origTemplateIntId={original_template_int_id if original_template_int_id > 0 else 'unknown'} "
-                    f"damageUnitIndex={damage_unit_index} "
+                    f"damageUnitIndex={damage_unit_index if damage_unit_index is not None else 'unknown'} "
                     f"partInstId={part_inst_id if part_inst_id > 0 else 'unknown'} "
                     f"dynBB={dynamic_bb_text if dynamic_bb_text else 'unknown'} "
                     f"calcBB={calc_bb_text if calc_bb_text else 'unknown'} "
@@ -1886,6 +2031,12 @@ class TraceBridge:
                     f"atkId={attacker_id if attacker_id else 'unknown'} "
                     f"tgtId={target_id if target_id else 'unknown'} seg=0 "
                     f"shared={shared} critFlag={1 if is_crit else 0} critDmg=-1.0000"
+                    " "
+                    f"eventInstId={event_inst_id if event_inst_id > 0 else 'unknown'} "
+                    f"eventOwnerId={_intish(event.get('owner_id')) or 'unknown'} "
+                    f"packetSeq={event.get('seq_id') if type(event.get('seq_id')) is int else 'unknown'} "
+                    f"clientTick={event.get('client_tick_tms') if type(event.get('client_tick_tms')) is int else 'unknown'} "
+                    f"{(' '.join(packet_identity_tokens) + ' ') if packet_identity_tokens else ''}"
                     f"{(' ' + ' '.join(calc_tokens)) if calc_tokens else ''}"
                 ),
             )
@@ -1897,7 +2048,25 @@ class TraceBridge:
                     ts_ms,
                     f"PKT_MOD #{self.hit_seq} atk=[{' '.join(atk_mods)}] def=[{' '.join(def_mods)}]",
                 )
+                # Keep each handle's processor index and debug arguments;
+                # UID-only display tokens cannot identify the applied entry.
+                self._line(ts_ms, f"PKT_MOD_DETAIL #{self.hit_seq} " + json.dumps({
+                    'attacker': modifier_args.get('attacker_modifiers') or [],
+                    'defender': modifier_args.get('defender_modifiers') or [],
+                    'packetSessionId': event.get('session_id'),
+                    'packetSeq': event.get('seq_id'),
+                    'damageUnitIndex': detail.get('damage_unit_index'),
+                    'partInstId': detail.get('part_inst_id'),
+                }, ensure_ascii=False, separators=(',', ':'), allow_nan=False))
             battle_report_info = detail.get("battle_report_info") if isinstance(detail.get("battle_report_info"), dict) else {}
+            report_present = (detail_presence.get('has_battle_report_info')
+                              if type(detail_presence.get('has_battle_report_info')) is bool
+                              else True if isinstance(detail.get('battle_report_info'), dict) else None)
+            if type(report_present) is bool:
+                self._line(ts_ms, f"PKT_ATTR_INFO #{self.hit_seq} " + json.dumps({
+                    'reportPresent': report_present, 'packetSeq': event.get('seq_id'),
+                    'packetSessionId': event.get('session_id'),
+                }, ensure_ascii=False, separators=(',', ':')))
             atk_attrs = _attr_info_tokens(battle_report_info, "attacker_attr_modify_info")
             def_attrs = _attr_info_tokens(battle_report_info, "defender_attr_modify_info")
             if atk_attrs or def_attrs:
@@ -1951,6 +2120,24 @@ class TraceBridge:
         details = create_buff_action.get("details") or []
         if not isinstance(details, list):
             return
+        trigger_type = event.get('trigger_type')
+        if type(trigger_type) is int and trigger_type == 2:
+            # Current native CreateBuffAction.OnEnd emits these same detail
+            # rows as an explicit finish list (BATTLE_TRIGGER_TYPE.End).
+            self._write_finish_buffs(ts_ms, {'finish_buffs': details})
+            return
+        if type(trigger_type) is not int or trigger_type != 0:
+            for detail in details:
+                if not isinstance(detail, dict) or not _intish(detail.get('buff_inst_id')):
+                    continue
+                self._line(ts_ms, 'BUFF_ACTION_UNRESOLVED '
+                           f'uid={_intish(detail.get("buff_inst_id"))} '
+                           f'seq={event.get("seq_id", "unknown")} '
+                           f'triggerType={trigger_type if type(trigger_type) is int else "unknown"} '
+                           f'actionId={_intish((event.get("action") or {}).get("action_id"))} '
+                           f'ownerId={_intish(detail.get("target_id"))} '
+                           f'srcId={_intish(detail.get("source_id"))}')
+            return
         inferred_parent_id, inferred_children = self._infer_unresolved_parent_graph(event, details)
         if inferred_parent_id:
             parent_uid = _intish(event.get("inst_id"))
@@ -1975,102 +2162,23 @@ class TraceBridge:
                 or self._resolve_created_buff_template(event, detail, buff_uid, owner=owner, src=src)
             )
             assigned = {"blackboard": self._assigned_list_to_blackboard(detail.get("assigned_items"))}
-            self._write_buff_start(ts_ms, buff_id, buff_uid, owner, src, assigned)
+            self._write_buff_start(ts_ms, buff_id, buff_uid, owner, src, assigned, target_id=_intish(detail.get("target_id")), src_id=_intish(detail.get("source_id")), creation_event=event, creation_detail=detail)
+            # Preserve the create row's explicit environment/action relation.
+            # No inferred parent graph or neighboring event supplies fields.
+            origin = {
+                'schemaVersion': 1, 'buffUid': str(buff_uid), 'buffTemplate': buff_id,
+                'sourceActorId': str(detail.get('source_id')) if detail.get('source_id') is not None else None,
+                'targetActorId': str(detail.get('target_id')) if detail.get('target_id') is not None else None,
+                'environmentType': event.get('template_type'), 'ownerType': event.get('owner_type'),
+                'environmentInstId': str(event.get('inst_id')) if event.get('inst_id') is not None else None,
+                'templateStrId': event.get('template_str_id'), 'templateIntId': event.get('template_int_id'),
+                'actionId': (event.get('action') or {}).get('action_id'),
+                'operationSeq': event.get('seq_id'), 'triggerType': trigger_type,
+            }
+            self._line(ts_ms, 'BUFF_ORIGIN ' + json.dumps(origin, ensure_ascii=False, separators=(',', ':')))
 
     def _infer_unresolved_parent_graph(self, event: dict[str, Any], details: list[Any]) -> tuple[str | None, dict[int, str]]:
-        parent_type = str(event.get("template_type") or "").lower()
-        if parent_type != "buff":
-            return None, {}
-        parent_uid = _intish(event.get("inst_id"))
-        existing_parent = self.buff_id_by_uid.get(parent_uid) if parent_uid else ""
-        if existing_parent and existing_parent != "unknown_buff" and not existing_parent.isdigit():
-            return None, {}
-        parent_numeric = _intish(event.get("template_int_id"))
-        if parent_numeric is None:
-            return None, {}
-
-        rows: list[dict[str, Any]] = []
-        for detail in details:
-            if not isinstance(detail, dict):
-                continue
-            buff_uid = _intish(detail.get("buff_inst_id"))
-            if not buff_uid:
-                continue
-            rows.append(
-                {
-                    "buff_uid": buff_uid,
-                    "keys": self._assigned_items_to_keys(detail.get("assigned_items")),
-                }
-            )
-        if not rows:
-            return None, {}
-
-        parent_rules_index = ((self.resolver.semantic_indexes.get("parent_rules") or {}).get("buffs") or {})
-        best_parent = ""
-        best_score = -1
-        best_children: dict[int, str] = {}
-
-        for parent_id, rules in parent_rules_index.items():
-            if not isinstance(rules, dict):
-                continue
-            children = []
-            seen_children: set[str] = set()
-            for child_id in list(rules.get("created_buff_ids") or []) + list(rules.get("referenced_buff_ids") or []):
-                child = str(child_id or "")
-                if child and child not in seen_children:
-                    seen_children.add(child)
-                    children.append(child)
-            if not children:
-                continue
-            patterns = []
-            for item in rules.get("assignment_patterns") or []:
-                if not isinstance(item, dict):
-                    continue
-                child_id = str(item.get("buff_id") or "")
-                pattern_keys = set(str(key) for key in (item.get("input_keys") or []) if str(key))
-                if not pattern_keys:
-                    pattern_keys = set(str(key) for key in (item.get("target_keys") or []) if str(key))
-                patterns.append((child_id, pattern_keys))
-
-            matched_children: dict[int, str] = {}
-            used_child_ids: set[str] = set()
-            score = 0
-            unmatched_rows = 0
-            for row in rows:
-                actual_keys = set(row["keys"])
-                best_match: tuple[int, str] | None = None
-                for child_id, pattern_keys in patterns:
-                    if child_id in used_child_ids:
-                        continue
-                    if not pattern_keys:
-                        continue
-                    if not pattern_keys.issubset(actual_keys):
-                        continue
-                    match_score = 20 * len(pattern_keys) - max(len(actual_keys) - len(pattern_keys), 0)
-                    if best_match is None or match_score > best_match[0]:
-                        best_match = (match_score, child_id)
-                if best_match is None:
-                    unmatched_rows += 1
-                    continue
-                score += best_match[0]
-                used_child_ids.add(best_match[1])
-                matched_children[int(row["buff_uid"])] = best_match[1]
-
-            remaining_children = [child for child in children if child not in used_child_ids]
-            if unmatched_rows > len(remaining_children):
-                continue
-            if not matched_children:
-                continue
-            score += 15 * len(matched_children)
-            score -= 3 * max(len(remaining_children) - unmatched_rows, 0)
-            if score > best_score:
-                best_score = score
-                best_parent = parent_id
-                best_children = matched_children
-
-        if not best_parent:
-            return None, {}
-        return best_parent, best_children
+        return None, {}
 
     def _write_finish_buffs(self, ts_ms: int, finish_buff_action: Any) -> None:
         if not isinstance(finish_buff_action, dict):
@@ -2088,6 +2196,7 @@ class TraceBridge:
             self.buff_seq += 1
             self._line(ts_ms, f'BUFF_END #{self.buff_seq} id="{buff_id}" uid={buff_uid}')
             self.buff_id_by_uid.pop(buff_uid, None)
+            self.buff_actor_ids_by_uid.pop(buff_uid, None)
             self.buff_values_by_uid.pop(buff_uid, None)
             self.buff_keys_by_uid.pop(buff_uid, None)
 
@@ -2216,24 +2325,7 @@ class TraceBridge:
         target_id: int | None = None,
         src_id: int | None = None,
     ) -> None:
-        if numeric_id is None or not canonical_id or canonical_id == "unknown_buff" or canonical_id.isdigit():
-            return
-        signature = self._learned_buff_signature(
-            numeric_id,
-            owner,
-            src,
-            assigned_items,
-            target_id=target_id,
-            src_id=src_id,
-        )
-        if signature in self.learned_buff_mapping_conflicts:
-            return
-        existing = self.learned_buff_mapping_by_signature.get(signature)
-        if existing and existing != canonical_id:
-            self.learned_buff_mapping_conflicts.add(signature)
-            self.learned_buff_mapping_by_signature.pop(signature, None)
-            return
-        self.learned_buff_mapping_by_signature[signature] = canonical_id
+        return
 
     def _remember_learned_buff_mapping_from_keys(
         self,
@@ -2246,24 +2338,7 @@ class TraceBridge:
         target_id: int | None = None,
         src_id: int | None = None,
     ) -> None:
-        if numeric_id is None or not canonical_id or canonical_id == "unknown_buff" or canonical_id.isdigit():
-            return
-        signature = self._learned_buff_signature_from_keys(
-            numeric_id,
-            owner,
-            src,
-            keys,
-            target_id=target_id,
-            src_id=src_id,
-        )
-        if signature in self.learned_buff_mapping_conflicts:
-            return
-        existing = self.learned_buff_mapping_by_signature.get(signature)
-        if existing and existing != canonical_id:
-            self.learned_buff_mapping_conflicts.add(signature)
-            self.learned_buff_mapping_by_signature.pop(signature, None)
-            return
-        self.learned_buff_mapping_by_signature[signature] = canonical_id
+        return
 
     def _resolve_learned_buff_mapping(
         self,
@@ -2275,19 +2350,7 @@ class TraceBridge:
         target_id: int | None = None,
         src_id: int | None = None,
     ) -> str | None:
-        if numeric_id is None:
-            return None
-        signature = self._learned_buff_signature(
-            numeric_id,
-            owner,
-            src,
-            assigned_items,
-            target_id=target_id,
-            src_id=src_id,
-        )
-        if signature in self.learned_buff_mapping_conflicts:
-            return None
-        return self.learned_buff_mapping_by_signature.get(signature)
+        return None
 
     def _assigned_direct_buff_id(self, items: Any) -> str | None:
         if not isinstance(items, list):
@@ -2314,7 +2377,14 @@ class TraceBridge:
         owner: str,
         src: str,
         assigned_items: Any,
+        *,
+        target_id: int | None = None,
+        src_id: int | None = None,
+        creation_event: dict[str, Any] | None = None,
+        creation_detail: dict[str, Any] | None = None,
     ) -> None:
+        if target_id is not None or src_id is not None:
+            self.buff_actor_ids_by_uid[buff_uid] = (target_id, src_id)
         previous_id = self.buff_id_by_uid.get(buff_uid, "")
         previous_values = self.buff_values_by_uid.get(buff_uid, {})
         previous_keys = self.buff_keys_by_uid.get(buff_uid, set())
@@ -2349,21 +2419,51 @@ class TraceBridge:
                 {"blackboard": {key: {"float_value": value} for key, value in previous_values.items()}},
                 buff_id,
             )
-        if identity_unchanged and not values_add_information:
-            # TriggerAction callbacks revisit active instances. They must not
-            # erase the authoritative create-row BB or emit a second start.
-            return
-        if self._pending_buff_start_ts_ms is not None and self._pending_buff_start_ts_ms != ts_ms:
-            self._flush_pending_buff_starts()
-        self._pending_buff_start_ts_ms = ts_ms
-        existing = self._pending_buff_start_rows.get(buff_uid)
-        if existing is None:
-            self._pending_buff_start_order.append(buff_uid)
-            self._pending_buff_start_rows[buff_uid] = (buff_id, owner, src, assigned_items)
-        else:
-            prev_buff_id, prev_owner, prev_src, prev_assigned_items = existing
-            if self._prefer_buff_start(prev_buff_id, buff_id):
+        if not identity_unchanged or values_add_information:
+            # Repeated create callbacks need not be a newly allocated Buff.
+            # Preserve the observation without inventing another start row.
+            if self._pending_buff_start_ts_ms is not None and self._pending_buff_start_ts_ms != ts_ms:
+                self._flush_pending_buff_starts()
+            self._pending_buff_start_ts_ms = ts_ms
+            existing = self._pending_buff_start_rows.get(buff_uid)
+            if existing is None:
+                self._pending_buff_start_order.append(buff_uid)
                 self._pending_buff_start_rows[buff_uid] = (buff_id, owner, src, assigned_items)
+            else:
+                prev_buff_id, prev_owner, prev_src, prev_assigned_items = existing
+                if self._prefer_buff_start(prev_buff_id, buff_id):
+                    self._pending_buff_start_rows[buff_uid] = (buff_id, owner, src, assigned_items)
+        if creation_event is not None:
+            # generation belongs to the operation owner entity. Neither
+            # client create schema contains a generation for the new Buff.
+            observation = {
+                'schemaVersion': 1, 'buffUid': str(buff_uid), 'buffTemplate': buff_id,
+                'sourceActorId': str(src_id) if src_id is not None else None,
+                'targetActorId': str(target_id) if target_id is not None else None,
+                'sessionId': creation_event.get('session_id'),
+                'operationSeq': creation_event.get('seq_id'),
+                'operationOwnerId': creation_event.get('operation_owner_id'),
+                'operationGeneration': creation_event.get('generation'),
+                'generationScope': 'operation_owner', 'sourceEvent': creation_event.get('type'),
+                'buffNumId': ((creation_detail or {}).get('buff_num_id')
+                              if creation_detail is not None else creation_event.get('int_id')),
+                'buffId': ((creation_detail or {}).get('buff_id')
+                           if creation_detail is not None else creation_event.get('str_id')),
+                'buffTemplateId': creation_event.get('buff_template_id'),
+                'assignedItems': (creation_detail.get('assigned_items') if creation_detail is not None
+                                  else assigned_items if isinstance(assigned_items, list) else None),
+                'isNewInstance': None, 'priorUidObserved': bool(previous_id),
+                'observationKind': 'creation_or_refresh', 'enhanceMultiplier': None,
+            }
+            if creation_detail is not None:
+                observation['actionId'] = (creation_event.get('action') or {}).get('action_id')
+                observation['triggerType'] = creation_event.get('trigger_type')
+                observation['creationActionType'] = (creation_event.get('action') or {}).get('action_type')
+                observation['creationActionRuntimeCase'] = creation_event.get('action_runtime_case')
+            if type(observation['operationOwnerId']) in (int, str):
+                observation['operationOwnerId'] = str(observation['operationOwnerId'])
+            self._line(ts_ms, 'BUFF_CREATE_OBSERVED ' + json.dumps(
+                observation, ensure_ascii=False, separators=(',', ':'), allow_nan=False))
 
     def _packet_buff_mapping_applies(self, mapping: dict[str, Any], owner: str, src: str) -> bool:
         return self.resolver._packet_buff_mapping_applies(
@@ -2398,10 +2498,6 @@ class TraceBridge:
 
     def _resolve_skill_template(self, str_id: Any = None, int_id: Any = None, *, owner_hint: str = "") -> str | None:
         number = _intish(int_id)
-        if number is not None:
-            mapped = self.skill_id_by_inst.get(number)
-            if mapped:
-                return mapped
         return self.resolver.resolve_skill(
             str_id,
             number,
@@ -2423,9 +2519,6 @@ class TraceBridge:
         raw_template = _template_id(detail.get("buff_id"))
         if raw_template:
             return raw_template
-        direct_assigned_buff_id = self._assigned_direct_buff_id(detail.get("assigned_items"))
-        if direct_assigned_buff_id:
-            return direct_assigned_buff_id
         buff_num_id = _intish(detail.get("buff_num_id"))
         if buff_num_id is not None:
             resolved_numeric = self._resolve_buff_template(
@@ -2470,22 +2563,6 @@ class TraceBridge:
         if resolved_created:
             return resolved_created
 
-        if parent_type == "buff":
-            parent_uid = _intish(event.get("inst_id"))
-            parent_values = self.buff_values_by_uid.get(parent_uid, {}) if parent_uid else {}
-            child_values = self._assigned_items_to_values(detail.get("assigned_items"))
-            if (
-                parent_id
-                and parent_id != "unknown_buff"
-                and not parent_id.isdigit()
-                and parent_values
-                and child_values
-                and child_values == {key: parent_values.get(key) for key in child_values.keys()}
-            ):
-                return parent_id
-
-        if parent_type == "buff" and parent_id != "unknown_buff":
-            return parent_id
         return "unknown_buff"
 
     def _name_for_id(self, value: Any) -> str:
@@ -2519,47 +2596,11 @@ class TraceBridge:
         return self._name_for_id(battle_id)
 
     def _infer_actor_from_mapping(self, buff_num_id: int | None) -> str:
-        if buff_num_id is None:
-            return ""
-        mapping = self.resolver.buff_by_numeric.get(str(buff_num_id))
-        if not isinstance(mapping, dict):
-            return ""
-        char_id = str(mapping.get("character_id") or "")
-        if char_id:
-            return char_id
-        suit_id = str(mapping.get("suit_id") or "")
-        if suit_id:
-            holders = [char for char, suits in self.active_suits_by_char.items() if suit_id in suits]
-            if len(holders) == 1:
-                return holders[0]
-        weapon_id = str(mapping.get("weapon_id") or "")
-        if weapon_id:
-            holders = [char for char, active_weapon in self.active_weapons_by_char.items() if active_weapon == weapon_id]
-            if len(holders) == 1:
-                return holders[0]
         return ""
 
     def _remember_actor_alias_for_buff(self, src_id: int | None, target_id: int | None, buff_num_id: int | None, buff_id: str) -> None:
-        enemy_inferred = _enemy_family_from_any(buff_id)
-        if enemy_inferred:
-            self._set_enemy_hint(enemy_inferred, "buff")
-
-        inferred = ""
-        if enemy_inferred and self._enemy_hint_can_accept_buff_alias(enemy_inferred):
-            inferred = enemy_inferred
-        if not inferred:
-            inferred = _character_family_from_any(buff_id)
-        if not inferred:
-            inferred = self._infer_actor_from_mapping(buff_num_id)
-        if not inferred:
-            return
-        raw_ids = {src_id}
-        if target_id and (not src_id or target_id == src_id):
-            raw_ids.add(target_id)
-        for raw_id in raw_ids:
-            existing = self.id_to_name.get(raw_id) if raw_id else None
-            if raw_id and raw_id >= 1000 and (existing is None or existing == _UNKNOWN_ENEMY_KEY):
-                self.actor_alias_by_raw_id[raw_id] = inferred
+        # Buff names and nearby actor IDs do not prove entity identity.
+        return
 
     def _set_enemy_hint_from_dungeon_id(
         self,
@@ -2599,22 +2640,7 @@ class TraceBridge:
         return self._current_enemy_hint_source == "buff"
 
     def _upgrade_single_unknown_enemy_alias(self, enemy_key: str, *, source: str) -> None:
-        candidates = {
-            raw_id
-            for raw_id, name in self.id_to_name.items()
-            if name == _UNKNOWN_ENEMY_KEY
-        }
-        candidates.update(
-            raw_id
-            for raw_id, alias in self.actor_alias_by_raw_id.items()
-            if alias == _UNKNOWN_ENEMY_KEY
-        )
-        if len(candidates) != 1:
-            return
-        raw_id = next(iter(candidates))
-        self.id_to_name[raw_id] = enemy_key
-        self.actor_alias_by_raw_id[raw_id] = enemy_key
-        self._record_identity_inference(raw_id, enemy_key, source=f"single_unknown:{source}")
+        return
 
     def _record_identity_inference(self, raw_id: int, enemy_key: str, *, source: str) -> None:
         if self._last_ts_ms is None:
@@ -2647,18 +2673,23 @@ class TraceBridge:
         if not self._pending_buff_start_rows:
             self._pending_buff_start_ts_ms = None
             return
-        ts_ms = self._pending_buff_start_ts_ms or self._last_ts_ms or int(datetime.now().timestamp() * 1000)
+        if self._pending_buff_start_ts_ms is None:
+            raise ValueError("missing buff start timestamp")
+        ts_ms = self._pending_buff_start_ts_ms
         for buff_uid in self._pending_buff_start_order:
             row = self._pending_buff_start_rows.get(buff_uid)
             if row is None:
                 continue
             buff_id, owner, src, assigned_items = row
+            owner_id, source_id = self.buff_actor_ids_by_uid.get(buff_uid, (None, None))
             self.buff_seq += 1
             self._append_line(
                 ts_ms,
                 (
                     f'BUFF_START #{self.buff_seq} id="{buff_id}" uid={buff_uid} '
-                    f"owner={owner} src={src} dur=9999.00 lifeT=9999.00 passed=0.00 enh=1"
+                    f"owner={owner} src={src} ownerId={owner_id if owner_id is not None else 'unknown'} "
+                    f"srcId={source_id if source_id is not None else 'unknown'} "
+                    f"dur=unknown lifeT=unknown passed=unknown enh=unknown"
                 ),
             )
             pairs = _blackboard_pairs(assigned_items)
@@ -2670,49 +2701,13 @@ class TraceBridge:
         self._pending_buff_start_ts_ms = None
 
     def _maybe_map_next_loadout_actor(self, actor_id: int, ts_ms: int, *, source: str) -> None:
-        if actor_id in self.id_to_name:
-            return
-        if self._next_loadout_actor_index >= len(self.loadout_actor_order):
-            return
-        template = self.loadout_actor_order[self._next_loadout_actor_index]
-        self._next_loadout_actor_index += 1
-        if not template:
-            return
-        self.id_to_name[actor_id] = template
-        self._line(ts_ms, f"ACTOR_MAP id={actor_id} template={template} source={source}")
+        return
 
     def _name_for_damage_target(self, value: Any, attacker_name: str) -> str:
         battle_id = _intish(value)
-        if not battle_id:
+        if battle_id is None:
             return "?"
-        existing = self.id_to_name.get(battle_id)
-        if existing and existing != _UNKNOWN_ENEMY_KEY:
-            return existing
-        alias = self.actor_alias_by_raw_id.get(battle_id)
-        if alias:
-            self.id_to_name[battle_id] = alias
-            return alias
-        if existing == _UNKNOWN_ENEMY_KEY and self._current_enemy_hint:
-            self.id_to_name[battle_id] = self._current_enemy_hint
-            self._record_identity_inference(
-                battle_id,
-                self._current_enemy_hint,
-                source=f"damage_target:{self._current_enemy_hint_source or 'unknown'}",
-            )
-            return self._current_enemy_hint
-        if existing:
-            return existing
-        if self._character_from_template(attacker_name):
-            enemy_key = self._current_enemy_hint or _UNKNOWN_ENEMY_KEY
-            self.id_to_name[battle_id] = enemy_key
-            if enemy_key != _UNKNOWN_ENEMY_KEY:
-                self._record_identity_inference(
-                    battle_id,
-                    enemy_key,
-                    source=f"new_damage_target:{self._current_enemy_hint_source or 'unknown'}",
-                )
-            return enemy_key
-        return f"id_{battle_id}"
+        return self.id_to_name.get(battle_id) or self.actor_alias_by_raw_id.get(battle_id) or f"id_{battle_id}"
 
     def _line(self, ts_ms: int, body: str) -> None:
         self._flush_pending_buff_starts()

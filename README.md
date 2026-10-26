@@ -81,3 +81,22 @@ Source code in this repository is available under the MIT License. Game names,
 trademarks, and externally supplied runtime assets remain the property of their
 respective owners and are not licensed by this repository.
 
+
+## Current source snapshot
+
+The source includes the unified client's shared runtime roles, content-addressed
+client/runtime/game-data updates, bounded overlay diagnostics and renderer
+recovery, and native overlay settings in the main client's sidebar. Users author
+their own HTML pages; the HTML data API remains read-only. Rotation editing and
+its guidance strip are currently disabled. External-browser transport is deferred.
+
+The public checkout intentionally starts with empty game-resource adapters. The
+web/API source can start without distributing game artwork or extracted tables;
+resource-backed features need operator-supplied data. Source-only tests explicitly
+skip checks that require those external resources, native reverse-engineering
+artifacts, or private captured samples. A skipped integration test is not evidence
+that the corresponding live-game behavior was verified in this checkout.
+
+Local paths, deployment details and captured user records are excluded or replaced
+with examples. Public dependency security upgrades are preserved independently
+from private release packaging. See `SECURITY.md` and `THIRD_PARTY_NOTICES.md`.

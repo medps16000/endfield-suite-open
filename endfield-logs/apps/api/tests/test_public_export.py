@@ -1,15 +1,18 @@
+from timer_samples import official_timer_evidence
 """对外排轴导出 API（/api/v1/battles/{id}/export）契约测试。"""
 from uuid import uuid4
 
 from fastapi.testclient import TestClient
 
 from app.main import app
+from app.db.models import UploadedBattleRecord
+from app.db.session import SessionLocal
 
 UPLOADER_CLIENT_HEADERS = {
     "X-Endfield-Uploader-Name": "EndfieldLogsUploader",
-    "X-Endfield-Uploader-Version": "2026.08.02.1",
-    "X-Endfield-Parser-Version": "raw-log-parser-v43",
-    "X-Endfield-Rules-Version": "raw-log-parser-v37",
+    "X-Endfield-Uploader-Version": "2026.10.15.1",
+    "X-Endfield-Parser-Version": "raw-log-parser-v59",
+    "X-Endfield-Rules-Version": "raw-log-parser-v44",
 }
 
 
@@ -85,8 +88,16 @@ def _upload_battle(client: TestClient, *, with_casts: bool) -> str:
                 }
             ],
             "battleFingerprint": f"fp-export-{uuid4().hex}",
-            "parserVersion": "raw-log-parser-v43",
-            "rulesVersion": "raw-log-parser-v37",
+            "parserVersion": "raw-log-parser-v59",
+            "rulesVersion": "raw-log-parser-v44",
+            "timeSource": "game_timer",
+            "officialTimerStartSeen": True,
+            "officialTimerEndSeen": True,
+            "officialTimerObservedElapsedMs": 84_601,
+            "packetTimerElapsedMs": 80_000,
+            "timerIntegrityOk": True,
+            "timerIntegrityReasons": [],
+            "timerEvidence": official_timer_evidence(82601, "dung01_group_bossrush01"),
         },
         "participants": [
             {
@@ -143,7 +154,7 @@ def test_export_returns_schema_v1_with_casts_and_skills() -> None:
     payload = response.json()
     assert payload["schemaVersion"] == 1
     assert payload["battleId"] == battle_id
-    assert payload["parserVersion"] == "raw-log-parser-v43"
+    assert payload["parserVersion"] == "raw-log-parser-v59"
     assert payload["dungeon"]["bossKey"] == "eny_0051_rodin"
     assert payload["dungeon"]["dungeonSlug"] == "dung01_group_bossrush01"
     assert payload["durationMs"] == 82601
@@ -195,6 +206,24 @@ def test_export_unknown_battle_returns_404() -> None:
     client = TestClient(app)
     response = client.get("/api/v1/battles/btl_upload_nonexistent00/export")
     assert response.status_code == 404
+
+
+def test_saved_v58_battle_remains_readable_and_exports_its_original_version() -> None:
+    client = TestClient(app)
+    battle_id = _upload_battle(client, with_casts=True)
+    # Seed a historical stored record. The current upload endpoint must not be
+    # used to manufacture acceptance of an outdated parser version.
+    with SessionLocal() as session:
+        record = session.get(UploadedBattleRecord, battle_id)
+        assert record is not None
+        record.parser_version = "raw-log-parser-v58"
+        session.commit()
+    response = client.get(f"/api/v1/battles/{battle_id}/export")
+    assert response.status_code == 200
+    assert response.json()["parserVersion"] == "raw-log-parser-v58"
+    detail = client.get(f"/api/battles/{battle_id}")
+    assert detail.status_code == 200
+    assert detail.json()["battle"]["parserVersion"] == "raw-log-parser-v58"
 
 
 def test_export_allows_non_best_public_battle() -> None:

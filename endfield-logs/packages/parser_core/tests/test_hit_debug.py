@@ -2,6 +2,34 @@ from parser_core.hit_context import build_hit_context
 from parser_core.hit_debug import parse_hit_debug_log_text
 
 
+def test_hit_debug_uses_only_official_dungeon_context_for_stage_identity() -> None:
+    hit = (
+        '[10:00:00.500] HP_V2 #1 hit=100 cum=100 raw=100.00 pHP=5000 eHP=900000 '
+        'skill="chr_0028_wulfa_normal_skill" hits=1 skillLv=12 templateIntId=2132 actionId=97 '
+        'origTemplateIntId=2132 damageUnitIndex=0 src=chr_0028_wulfa tgt=eny_0051_rodin '
+        'atk=chr_0028_wulfa seg=0 shared=2 critFlag=0 critDmg=-1.0000'
+    )
+
+    without_context = parse_hit_debug_log_text(hit, file_name="missing-stage.log")
+    assert without_context["summary"]["boss_key"] == "eny_0051_rodin"
+    assert without_context["summary"]["dungeon_key"] == "unknown_dungeon"
+    assert without_context["summary"]["dungeon_identity_source"] == "missing_dungeon_context"
+
+    with_context = parse_hit_debug_log_text(
+        '\n'.join(
+            [
+                '[10:00:00.000] DUNGEON_CONTEXT dungeonId=indie_battletower004_ex',
+                hit,
+            ]
+        ),
+        file_name="official-stage.log",
+    )
+    assert with_context["summary"]["boss_key"] == "eny_0051_rodin"
+    assert with_context["summary"]["dungeon_key"] == "indie_battletower004_ex"
+    assert with_context["summary"]["dungeon_context_id"] == "indie_battletower004_ex"
+    assert with_context["summary"]["dungeon_identity_source"] == "dungeon_context"
+
+
 def test_hit_context_uses_damage_school_for_spell_vulnerability() -> None:
     spell_vuln_window = {
         "start_ts_ms": 0,
@@ -12,12 +40,14 @@ def test_hit_context_uses_damage_school_for_spell_vulnerability() -> None:
         "source_character_key": "chr_0004_pelica",
         "source_character_name": "佩丽卡",
         "target_character_key": "eny_0051_rodin",
+        "target_actor_id": "enemy-1",
         "target_character_name": "“碾骨之拳”罗丹",
         "zone_effects": [{"zone": "vuln_taken", "element": "spell", "rate": 0.12}],
     }
     base_hit = {
         "character_key": "chr_0028_wulfa",
         "target_enemy_key": "eny_0051_rodin",
+        "target_actor_id": "enemy-1",
         "ts_ms": 1_000,
         "hit_value": 112,
         "skill_key": "chr_0028_wulfa_normal_skill",
@@ -368,7 +398,8 @@ def test_parse_hit_debug_log_text_uses_raw_loadout_skill_ids_for_skill_evidence(
     assert parsed["loadout"][0]["skill_int_ids"] == ["170", "192"]
     assert mapping["status"] == "mapped"
     assert mapping["canonical_skill_id"] == "chr_0006_wolfgd_ultimate_skill"
-    assert mapping["confidence"] == "runtime_truth_global_alias"
+    assert mapping["evidence_kind"] == "canonical_parser_identity"
+    assert "confidence" not in mapping
     assert mapping["candidates"] == []
 
 
@@ -701,7 +732,7 @@ def test_parse_hit_debug_log_text_uses_dpd_damage_type_as_element_fallback() -> 
     assert vuln_zone["contributors"][0]["event_key"] == "buff_fire_taken_probe"
 
 
-def test_parse_hit_debug_log_text_spell_vuln_does_not_apply_to_physical_school_natural_hit() -> None:
+def test_parse_hit_debug_log_text_spell_vuln_does_not_apply_when_official_element_is_unresolved() -> None:
     content = "\n".join(
         [
             '[10:00:00.000] BUFF_START #1 id="buff_wpn_funnel_0008_magic_damage_taken_up" uid=1 owner=eny_0051_rodin src=chr_0023_antal dur=15.00 lifeT=15.00 passed=0.00 enh=1',
@@ -714,7 +745,7 @@ def test_parse_hit_debug_log_text_spell_vuln_does_not_apply_to_physical_school_n
     parsed = parse_hit_debug_log_text(content, file_name="spell-vuln-school-filter.log")
     hit = parsed["hits"][0]
 
-    assert hit["damage_element"] == "natural"
+    assert hit["damage_element"] is None
     assert hit["damage_school"] == "physical"
     assert hit["zones"] == []
 
@@ -1031,18 +1062,22 @@ def test_parse_hit_debug_log_text_treats_nonstacking_weapon_buff_as_refresh() ->
 def test_parse_hit_debug_log_text_does_not_double_count_seraph_heal_attack_wrapper() -> None:
     content = "\n".join(
         [
-            '[10:00:00.000] BUFF_START #1 id="buff_chr_0011_seraph_mainchr_heal" uid=10 owner=chr_0027_tangtang src=chr_0011_seraph dur=2.00 lifeT=2.00 passed=0.00 enh=1',
+            '[10:00:00.000] BUFF_START #1 id="buff_chr_0011_seraph_mainchr_heal" uid=10 owner=chr_0027_tangtang src=chr_0011_seraph ownerId=1001 srcId=2001 dur=2.00 lifeT=2.00 passed=0.00 enh=1',
             "[10:00:00.000]   BB[4]: atk_scale=0.1 heal_value=316.8 potential_1=0 atk_up=0.18",
             '[10:00:00.240] HP_V2 #2 hit=811 cum=811 raw=811.29 pHP=6721 eHP=6885 skill="buff_chr_0011_seraph_mainchr_heal" hits=1 src=chr_0011_seraph tgt=chr_0027_tangtang atk=? seg=-1 shared=2 critFlag=0 critDmg=-1.0000',
             '[10:00:00.240] ATTR_MOD buff="buff_wpn_funnel_0010_atk_up" i=0 attrType=2 modType=0 formula=6 useKey=1 val=0.0000 bbKey="atk_up"',
-            '[10:00:00.240] BUFF_START #3 id="buff_wpn_funnel_0010_atk_up" uid=20 owner=chr_0027_tangtang src=chr_0011_seraph dur=15.00 lifeT=15.00 passed=0.00 enh=1',
+            '[10:00:00.240] BUFF_START #3 id="buff_wpn_funnel_0010_atk_up" uid=20 owner=chr_0027_tangtang src=chr_0011_seraph ownerId=1001 srcId=2001 dur=15.00 lifeT=15.00 passed=0.00 enh=1',
             "[10:00:00.240]   BB[2]: atk_up=0.18 duration=15",
             '[10:00:00.240] ATTR_MOD buff="buff_wpn_funnel_0010_atk_up" i=0 attrType=2 modType=0 formula=6 useKey=1 val=0.0000 bbKey="atk_up"',
-            '[10:00:00.240] BUFF_START #30 id="buff_wpn_funnel_0010_atk_up" uid=30 owner=chr_0011_seraph src=chr_0011_seraph dur=15.00 lifeT=15.00 passed=0.00 enh=1',
+            '[10:00:00.240] BUFF_START #30 id="buff_wpn_funnel_0010_atk_up" uid=30 owner=chr_0011_seraph src=chr_0011_seraph ownerId=2001 srcId=2001 dur=15.00 lifeT=15.00 passed=0.00 enh=1',
             "[10:00:00.240]   BB[2]: atk_up=0.18 duration=15",
-            '[10:00:00.240] BUFF_START #4 id="buff_chr_0011_seraph_potential_1_atkup" uid=21 owner=chr_0027_tangtang src=chr_0011_seraph dur=25.00 lifeT=25.00 passed=0.00 enh=1',
+            '[10:00:00.240] BUFF_START #4 id="buff_chr_0011_seraph_potential_1_atkup" uid=21 owner=chr_0027_tangtang src=chr_0011_seraph ownerId=1001 srcId=2001 dur=25.00 lifeT=25.00 passed=0.00 enh=1',
             "[10:00:00.240]   BB[1]: atk_up=0.18",
-            '[10:00:01.000] HP_V2 #5 hit=1180 cum=1180 raw=1180.00 pHP=100 eHP=10000 skill="chr_0027_tangtang_attack1" hits=1 src=chr_0027_tangtang tgt=eny_0051_rodin atk=chr_0027_tangtang seg=0 shared=2 critFlag=0 critDmg=0.5000',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"10","ownerId":"1001","enabled":true,"operationSeq":1}',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"20","ownerId":"1001","enabled":true,"operationSeq":2}',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"30","ownerId":"2001","enabled":true,"operationSeq":3}',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"21","ownerId":"1001","enabled":true,"operationSeq":4}',
+            '[10:00:01.000] HP_V2 #5 hit=1180 cum=1180 raw=1180.00 pHP=100 eHP=10000 skill="chr_0027_tangtang_attack1_projhit" actionId=0 damageUnitIndex=0 hits=1 src=chr_0027_tangtang tgt=eny_0051_rodin atk=chr_0027_tangtang atkId=1001 tgtId=3001 seg=0 shared=2 critFlag=0 critDmg=0.5000',
         ]
     )
 
@@ -1068,22 +1103,34 @@ def test_parse_hit_debug_log_text_caps_weapon_buff_stack_limit() -> None:
     content = "\n".join(
         [
             '[10:00:00.000] ATTR_MOD buff="buff_wpn_sword_0012_atk_up" i=0 attrType=2 modType=0 formula=6 useKey=1 val=0.0000 bbKey="atk_up2"',
-            '[10:00:00.000] BUFF_START #1 id="buff_wpn_sword_0012_atk_up" uid=1 owner=chr_0016_laevat src=chr_0019_karin dur=20.00 lifeT=20.00 passed=0.00 enh=1',
-            "[10:00:00.000]   BB[4]: atk_up2=0.09 =0 duration=20 =0",
-            '[10:00:00.001] BUFF_START #101 id="buff_wpn_sword_0012_atk_up" uid=101 owner=chr_0019_karin src=chr_0019_karin dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            '[10:00:00.000] BUFF_START #1 id="buff_wpn_sword_0012_atk_up" uid=1 owner=chr_0016_laevat src=chr_0019_karin ownerId=1001 srcId=2001 dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            "[10:00:00.000]   BB[4]: atk_up2=0.09 duration=20 max_stack=2",
+            '[10:00:00.001] BUFF_START #101 id="buff_wpn_sword_0012_atk_up" uid=101 owner=chr_0019_karin src=chr_0019_karin ownerId=2001 srcId=2001 dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            '[10:00:00.001] BB[101]: atk_up2=0.09 duration=20 max_stack=2',
             '[10:00:00.100] ATTR_MOD buff="buff_wpn_sword_0012_atk_up" i=0 attrType=2 modType=0 formula=6 useKey=1 val=0.0000 bbKey="atk_up2"',
-            '[10:00:00.100] BUFF_START #2 id="buff_wpn_sword_0012_atk_up" uid=2 owner=chr_0016_laevat src=chr_0019_karin dur=20.00 lifeT=20.00 passed=0.00 enh=1',
-            "[10:00:00.100]   BB[4]: atk_up2=0.09 =0 duration=20 =0",
-            '[10:00:00.101] BUFF_START #102 id="buff_wpn_sword_0012_atk_up" uid=102 owner=chr_0019_karin src=chr_0019_karin dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            '[10:00:00.100] BUFF_START #2 id="buff_wpn_sword_0012_atk_up" uid=2 owner=chr_0016_laevat src=chr_0019_karin ownerId=1001 srcId=2001 dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            "[10:00:00.100]   BB[4]: atk_up2=0.09 duration=20 max_stack=2",
+            '[10:00:00.101] BUFF_START #102 id="buff_wpn_sword_0012_atk_up" uid=102 owner=chr_0019_karin src=chr_0019_karin ownerId=2001 srcId=2001 dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            '[10:00:00.101] BB[102]: atk_up2=0.09 duration=20 max_stack=2',
             '[10:00:00.200] ATTR_MOD buff="buff_wpn_sword_0012_atk_up" i=0 attrType=2 modType=0 formula=6 useKey=1 val=0.0000 bbKey="atk_up2"',
-            '[10:00:00.200] BUFF_START #3 id="buff_wpn_sword_0012_atk_up" uid=3 owner=chr_0016_laevat src=chr_0019_karin dur=20.00 lifeT=20.00 passed=0.00 enh=1',
-            "[10:00:00.200]   BB[4]: atk_up2=0.09 =0 duration=20 =0",
-            '[10:00:00.201] BUFF_START #103 id="buff_wpn_sword_0012_atk_up" uid=103 owner=chr_0019_karin src=chr_0019_karin dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            '[10:00:00.200] BUFF_START #3 id="buff_wpn_sword_0012_atk_up" uid=3 owner=chr_0016_laevat src=chr_0019_karin ownerId=1001 srcId=2001 dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            "[10:00:00.200]   BB[4]: atk_up2=0.09 duration=20 max_stack=2",
+            '[10:00:00.201] BUFF_START #103 id="buff_wpn_sword_0012_atk_up" uid=103 owner=chr_0019_karin src=chr_0019_karin ownerId=2001 srcId=2001 dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            '[10:00:00.201] BB[103]: atk_up2=0.09 duration=20 max_stack=2',
             '[10:00:00.300] ATTR_MOD buff="buff_wpn_sword_0012_atk_up" i=0 attrType=2 modType=0 formula=6 useKey=1 val=0.0000 bbKey="atk_up2"',
-            '[10:00:00.300] BUFF_START #4 id="buff_wpn_sword_0012_atk_up" uid=4 owner=chr_0016_laevat src=chr_0019_karin dur=20.00 lifeT=20.00 passed=0.00 enh=1',
-            "[10:00:00.300]   BB[4]: atk_up2=0.09 =0 duration=20 =0",
-            '[10:00:00.301] BUFF_START #104 id="buff_wpn_sword_0012_atk_up" uid=104 owner=chr_0019_karin src=chr_0019_karin dur=20.00 lifeT=20.00 passed=0.00 enh=1',
-            '[10:00:00.400] HP_V2 #10 hit=1180 cum=1180 raw=1180.00 pHP=100 eHP=10000 skill="chr_0016_laevat_attack1" hits=1 src=chr_0016_laevat tgt=eny_0051_rodin atk=chr_0016_laevat seg=0 shared=2 critFlag=0 critDmg=0.5000',
+            '[10:00:00.300] BUFF_START #4 id="buff_wpn_sword_0012_atk_up" uid=4 owner=chr_0016_laevat src=chr_0019_karin ownerId=1001 srcId=2001 dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            "[10:00:00.300]   BB[4]: atk_up2=0.09 duration=20 max_stack=2",
+            '[10:00:00.301] BUFF_START #104 id="buff_wpn_sword_0012_atk_up" uid=104 owner=chr_0019_karin src=chr_0019_karin ownerId=2001 srcId=2001 dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            '[10:00:00.301] BB[104]: atk_up2=0.09 duration=20 max_stack=2',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"1","ownerId":"1001","enabled":false,"operationSeq":1}',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"2","ownerId":"1001","enabled":false,"operationSeq":2}',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"3","ownerId":"1001","enabled":true,"operationSeq":3}',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"4","ownerId":"1001","enabled":true,"operationSeq":4}',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"101","ownerId":"2001","enabled":false,"operationSeq":5}',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"102","ownerId":"2001","enabled":false,"operationSeq":6}',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"103","ownerId":"2001","enabled":true,"operationSeq":7}',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"104","ownerId":"2001","enabled":true,"operationSeq":8}',
+            '[10:00:00.400] HP_V2 #10 hit=1180 cum=1180 raw=1180.00 pHP=100 eHP=10000 skill="chr_0016_laevat_attack1" hits=1 src=chr_0016_laevat tgt=eny_0051_rodin atk=chr_0016_laevat atkId=1001 tgtId=3001 seg=0 shared=2 critFlag=0 critDmg=0.5000',
         ]
     )
 
@@ -1097,7 +1144,16 @@ def test_parse_hit_debug_log_text_caps_weapon_buff_stack_limit() -> None:
     ]
 
     assert atk_zone["external_rate"] == 0.18
+    # The observed enable state selects these instances; UID order is not a FIFO proof.
     assert [row["uid"] for row in weapon_rows] == ["3", "4"]
+    inactive = {row["uid"]: row for row in parsed["buff_audit"] if row["uid"] in {"1", "2"}}
+    assert set(inactive) == {"1", "2"}
+    for uid, row in inactive.items():
+        assert row["enable_observations"][-1]["enabled"] is False
+        assert row["raw_end_ts_ms"] is None
+        assert row["raw_duration_ms"] == 20000
+    assert inactive["1"]["start_ts_ms"] == 36000000
+    assert inactive["2"]["start_ts_ms"] == 36000100
 
 
 def test_parse_hit_debug_log_text_drops_default_child_when_parent_has_effects() -> None:

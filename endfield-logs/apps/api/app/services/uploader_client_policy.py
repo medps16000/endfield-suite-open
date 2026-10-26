@@ -10,9 +10,9 @@ UPLOADER_CLIENT_NAME_HEADER = "x-endfield-uploader-name"
 UPLOADER_CLIENT_VERSION_HEADER = "x-endfield-uploader-version"
 PARSER_VERSION_HEADER = "x-endfield-parser-version"
 RULES_VERSION_HEADER = "x-endfield-rules-version"
-MIN_UPLOADER_CLIENT_VERSION = "2026.08.02.1"
-MIN_PARSER_VERSION = "raw-log-parser-v43"
-MIN_RULES_VERSION = "raw-log-parser-v37"
+MIN_UPLOADER_CLIENT_VERSION = "2026.10.15.1"
+MIN_PARSER_VERSION = "raw-log-parser-v59"
+MIN_RULES_VERSION = "raw-log-parser-v44"
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:

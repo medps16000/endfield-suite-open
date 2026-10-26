@@ -43,6 +43,8 @@ class MessageRegistry:
     def __init__(self, data_dir: Path, package_name: str = "endfield_pcap.proto_generated") -> None:
         self._package_name = package_name
         self._class_cache: dict[str, type[Message]] = {}
+        # Read-only observer quality accounting; legacy decoding is unchanged.
+        self.observer_framing_errors = 0
         self._maps = {
             "cs": self._load_map(data_dir / "message_ids_cs.json"),
             "sc": self._load_map(data_dir / "message_ids_sc.json"),
@@ -52,6 +54,12 @@ class MessageRegistry:
         self._interesting_class_names = {
             "CS_CONTINGENCY_CONTRACT_SET_TAGS",
             "CS_BATTLE_OP",
+            "CS_PING",
+            "SC_PING",
+            "CS_GAME_TIME_FREEZE_START_REQ",
+            "CS_GAME_TIME_FREEZE_END_REQ",
+            "SC_GAME_TIME_FREEZE_START_RSP",
+            "SC_GAME_TIME_FREEZE_END_RSP",
             "CS_DEV_CLEAR_BATTLE_INFO",
             "CS_ENTER_DUNGEON",
             "CS_GAME_MECHANICS_NTF_INST_PREPARE_FINISH",
@@ -75,6 +83,7 @@ class MessageRegistry:
             "SC_CHAR_BAG_SET_MAX_TEAM_MEMBER_COUNT",
             "SC_CHAR_BAG_SET_TEAM",
             "SC_CHAR_BAG_SET_TEAM_LEADER",
+            "SC_CHAR_BAG_SYNC_PERSISTENT_BUFFS",
             "SC_CONTINGENCY_CONTRACT_BATTLE_RESULT",
             "SC_CONTINGENCY_CONTRACT_SET_TAGS",
             "SC_CONTINGENCY_CONTRACT_TAGS_SYNC",
@@ -89,13 +98,18 @@ class MessageRegistry:
             "SC_OBJECT_ENTER_VIEW",
             "SC_OBJECT_LEAVE_VIEW",
             "SC_ATTACH_SERVER_SKILL",
+            "SC_ADD_SERVER_BUFF",
+            "SC_REMOVE_SERVER_BUFF",
             "SC_DETACH_SERVER_SKILL",
             "SC_ENTER_DUNGEON",
             "SC_RESET_BATTLE_STATUS",
+            "SC_SCENE_RESET_ENTITY",
             "SC_SCENE_SET_BATTLE",
             "SC_SELF_SCENE_INFO",
             "SC_SYNC_ATTR",
             "SC_SYNC_FULL_DUNGEON_STATUS",
+            "SC_SYNC_RACING_DUNGEON_BUFF_MODIFY",
+            "SC_SYNC_RACING_DUNGEON_RECONNECT",
             "SC_GAME_MECHANICS_MODIFY_INST_TIME_FREEZE",
             "SC_GAME_MECHANICS_SYNC_CHALLENGE_COMPLETE",
             "SC_GAME_MECHANICS_SYNC_CHALLENGE_START",
@@ -196,9 +210,15 @@ class MessageRegistry:
         if class_name.endswith("MERGE_MSG"):
             merged_bytes = getattr(message, "msg", b"")
             if merged_bytes:
-                for _, _, sub_head_bytes, sub_body in iter_merged_frames(merged_bytes):
+                consumed = 0
+                for offset, sub_head_len, sub_head_bytes, sub_body in iter_merged_frames(merged_bytes):
+                    consumed = offset + 3 + sub_head_len + len(sub_body)
                     sub_head = parse_head(sub_head_bytes)
+                    if "parse_error" in sub_head:
+                        self.observer_framing_errors += 1
                     sub_body = maybe_decompress_session_body(sub_head, sub_body)
                     decoded.extend(self.decode_messages(direction, sub_head, sub_body))
+                if consumed != len(merged_bytes):
+                    self.observer_framing_errors += 1
         return decoded
 

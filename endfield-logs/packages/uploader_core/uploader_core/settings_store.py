@@ -11,7 +11,7 @@ import sys
 _LOCAL_API_BASE_URL = "http://127.0.0.1:8000"
 _LOCAL_WEB_BASE_URL = "http://127.0.0.1:3000"
 _PUBLIC_BASE_URL = os.environ.get("ENDFIELD_LOGS_PUBLIC_BASE_URL") or "https://zmdlogs.com"
-_LEGACY_PUBLIC_BASE_URLS = {"http://zmdlogs.com"}
+_LEGACY_PUBLIC_BASE_URLS = {"http://192.0.2.10", "https://192.0.2.10", "http://zmdlogs.com"}
 
 
 def _is_frozen_build() -> bool:

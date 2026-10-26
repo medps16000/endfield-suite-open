@@ -17,12 +17,11 @@ dependencies = [
   "grpcio-tools==1.80.0",
   "websockets",
   "httpx[socks]",
+  "PySide6==6.11.0",
 ]
 
 [project.optional-dependencies]
-dev = [
-  "pytest>=8.0.0",
-]
+dev = ["pytest>=8.0.0"]
 
 [project.scripts]
 endfield-pcap = "endfield_pcap.cli:main"
@@ -34,4 +33,4 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-endfield_pcap = ["overlay_assets/*"]
+endfield_pcap = ["overlay_assets/*", "overlay_examples/*.html"]

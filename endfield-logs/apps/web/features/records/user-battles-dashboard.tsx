@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useMemo, useState } from "react";
 
 import { ContractTagSummary } from "../../components/contract-tag-summary";
+import { CharacterAvatar } from "../../components/character-avatar";
 import { buildApiUrl } from "../../lib/api/client";
 import type { AuthUser, UserBattlesResponse } from "../../lib/api/types";
 import { hasContractTagData } from "../../lib/contract-tags";
@@ -11,6 +12,7 @@ import { formatBossDisplayName } from "../../lib/format/boss-display";
 import { formatDurationMs } from "../../lib/format/duration";
 import { rankingGroups } from "./ranking-groups.generated";
 import type { RankingBossEntry, RankingGroupKey } from "./ranking-groups.generated";
+import { ROTATIONS_ENABLED } from "../../lib/feature-flags";
 
 type UserBattlesDashboardProps = {
   battles: UserBattlesResponse["battles"];
@@ -278,7 +280,19 @@ export function AccountRankingsPanel({
                         )}
                       </td>
                     ) : null}
-                    <td>{ranking?.rosterSummary.join(" / ") || <span className="muted">-</span>}</td>
+                    <td>
+                      {ranking?.rosterEntries?.length ? (
+                        <div className="ranking-roster-grid">
+                          {ranking.rosterEntries.map((entry, index) => (
+                            <span className="ranking-roster-chip" key={`${entry.characterKey ?? entry.characterName}-${index}`}>
+                              <CharacterAvatar name={entry.characterName} avatarUrl={entry.avatarUrl} size="sm"
+                                progression={{ potential: entry.characterPotential, refinement: entry.weaponRefine }} />
+                              <span>{entry.characterName}</span>
+                            </span>
+                          ))}
+                        </div>
+                      ) : ranking?.rosterSummary.join(" / ") || <span className="muted">-</span>}
+                    </td>
                     <td>
                       {ranking ? (
                         <Link className="button-secondary" href={`/battle/${ranking.battleId}`}>
@@ -583,9 +597,9 @@ export function UserBattlesDashboard({ battles: initialBattles, currentUser, ran
                             <Link className="button-secondary" href={`/battle/${battle.id}`}>
                               查看
                             </Link>
-                            <Link className="button-secondary" href={`/axis/${battle.id}/editor`}>
+                            {ROTATIONS_ENABLED ? <Link className="button-secondary" href={`/axis/${battle.id}/editor`}>
                               排轴
-                            </Link>
+                            </Link> : null}
                           </>
                         ) : null}
                         <button

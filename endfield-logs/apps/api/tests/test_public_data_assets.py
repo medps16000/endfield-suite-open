@@ -1,4 +1,10 @@
+from timer_samples import official_timer_evidence
 from datetime import UTC, datetime, timedelta
+import json
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
+from time import sleep
 
 import pytest
 
@@ -18,6 +24,23 @@ from app.services.public_data import (
     _normalize_role_skill_stat_character_identity,
     _normalize_timeline_event_character_identity,
 )
+from app.schemas.public import BossCharacterStatisticsResponse
+
+
+def test_critical_parameters_survive_public_detail_serialization():
+    battle = _make_test_battle("crit-context", duration_ms=1000, total_damage=100, total_dps=100)
+    context = {"critical": {"version": 1, "status": "verified", "isCritical": False,
+                            "critRate": 0.2, "critDamageBonus": 0.5, "uncappedDamage": 100,
+                            "damageCap": None, "source": "bound_entity_attributes_and_exact_damage_unit"}}
+    event = TimelineEventResponse(tsMsFromStart=0, laneType="skill", sourceCharacterName="测试角色",
+        targetCharacterName="测试首领", eventName="测试命中", value=100, important=True, hitContext=context)
+    battle.timeline_events = [TimelineEventResponse.model_validate(json.loads(event.model_dump_json()))]
+    service = DemoPublicDataService.__new__(DemoPublicDataService)
+    service._get_uploaded_battle = lambda battle_id, include_uncleared=False: battle
+    detail = service.get_battle_detail(battle.battle_id, viewer_user_id=None)
+    assert detail.timelineEvents[0].hitContext == context
+    assert detail.timelineEvents[0].value == 100
+    assert detail.battle.totalDamage == 100
 
 
 def _make_test_battle(
@@ -36,6 +59,7 @@ def _make_test_battle(
     parser_version: str = "raw-log-parser-v34",
     character_potential: int | None = 0,
     rdps_strict_ok: bool = True,
+    timer_integrity_ok: bool | None = None,
 ) -> DemoBattle:
     started_at = datetime(2026, 4, 30, 12, 0, tzinfo=UTC)
     participant = BattleParticipantResponse(
@@ -87,6 +111,7 @@ def _make_test_battle(
         rdps_preflight_ok=True,
         rdps_strict_ok=rdps_strict_ok,
         rdps_preflight_blocker_count=0,
+        timer_integrity_ok=timer_integrity_ok,
     )
 
 
@@ -331,6 +356,255 @@ def test_public_data_normalizes_physical_crush_trigger_damage() -> None:
     assert _normalize_skill_display_name("碎冰", "buff_common_cryst_triggered_physical_break") == "猛击"
 
 
+@pytest.mark.parametrize("existing_name", ["已审定技能名 / 派生", "A1", "Custom skill name"])
+def test_skill_display_preserves_existing_specific_name(monkeypatch, existing_name) -> None:
+    monkeypatch.setattr("app.services.public_data._resolve_skill_name", lambda key: "新的官方技能名")
+    assert _normalize_skill_display_name(existing_name, "chr_0035_liino_combo_skill") == existing_name
+
+
+@pytest.mark.parametrize("key", ["chr_0035_liino_normal_skill_projhit", "buff_chr_0030_zhuangfy_sword_triggerd"])
+@pytest.mark.parametrize("existing_name", [
+    "chr_0035_liino_normal_skill_projhit", "普攻", "普通攻击", "战技", "连携", "连携技", "终结技", "技能",
+])
+def test_skill_display_replaces_raw_or_generic_name_from_exact_mapping(monkeypatch, existing_name, key) -> None:
+    if existing_name == "chr_0035_liino_normal_skill_projhit":
+        existing_name = key
+    monkeypatch.setattr("app.services.public_data._resolve_skill_name", lambda value: "闪耀焦点" if value == key else None)
+    assert _normalize_skill_display_name(existing_name, key) == "闪耀焦点"
+
+
+def test_skill_display_keeps_unknown_id_without_name_inference(monkeypatch) -> None:
+    key = "chr_0035_liino_normal_skill_projhit_unmapped"
+    monkeypatch.setattr("app.services.public_data._resolve_skill_name", lambda value: None)
+    assert _normalize_skill_display_name(key, key) == key
+    assert _normalize_skill_display_name("战技", key) == "战技"
+
+
+def test_skill_display_does_not_change_non_skill_lane(monkeypatch) -> None:
+    monkeypatch.setattr("app.services.public_data._resolve_skill_name", lambda value: "闪耀焦点")
+    event = TimelineEventResponse(
+        tsMsFromStart=1000, laneType="buff", eventName="chr_0035_liino_normal_skill_projhit",
+        eventKey="chr_0035_liino_normal_skill_projhit", value=123, important=False,
+        sourceCharacterName="梨诺", targetCharacterName="梨诺",
+    )
+    assert _enrich_timeline_event_damage_identity(event) is event
+
+
+def test_battle_detail_repairs_live_names_without_rewriting_battle_evidence(monkeypatch) -> None:
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "skill_display_live_8307.json").read_text(encoding="utf-8"))
+    names = fixture["exactNames"]
+    monkeypatch.setattr("app.services.public_data._resolve_skill_name", lambda key: names.get(key))
+    battle = _make_test_battle(
+        fixture["sourceBattleId"], duration_ms=46673, total_damage=2292908,
+        total_dps=2292908 / 46.673,
+    )
+    battle.role_skill_stats = [RoleSkillStatResponse.model_validate(row) for row in fixture["roleSkillStats"]]
+    battle.timeline_events = [TimelineEventResponse.model_validate(row) for row in fixture["timelineEvents"]]
+    before_rows = [row.model_dump(mode="json") for row in battle.role_skill_stats]
+    before_events = [row.model_dump(mode="json") for row in battle.timeline_events]
+    service = DemoPublicDataService.__new__(DemoPublicDataService)
+    service._get_uploaded_battle = lambda battle_id, include_uncleared=False: battle
+
+    detail = service.get_battle_detail(battle.battle_id, viewer_user_id=None)
+
+    after_rows = [row.model_dump(mode="json") for row in detail.roleSkillStats]
+    after_events = [row.model_dump(mode="json") for row in detail.timelineEvents]
+    assert len(before_rows) == len(after_rows) == 23
+    assert len(before_events) == len(after_events) == 251
+    assert sum(before["skillName"] != after["skillName"] for before, after in zip(before_rows, after_rows)) == 18
+    for before, after in zip(before_rows, after_rows):
+        assert {key: value for key, value in before.items() if key != "skillName"} == {
+            key: value for key, value in after.items() if key != "skillName"
+        }
+        if before["skillKey"] in names:
+            assert after["skillName"] == names[before["skillKey"]]
+    for before, after in zip(before_events, after_events):
+        assert {key: value for key, value in before.items() if key != "eventName"} == {
+            key: value for key, value in after.items() if key != "eventName"
+        }
+        if before["laneType"] != "skill":
+            assert after == before
+        elif before["eventKey"] in names:
+            assert after["eventName"] == names[before["eventKey"]]
+    assert detail.battle.totalDamage == battle.total_damage == 2292908
+    assert detail.battle.durationMs == battle.duration_ms == 46673
+    # Read-time normalization must not mutate the stored record objects.
+    assert [row.model_dump(mode="json") for row in battle.role_skill_stats] == before_rows
+    assert [row.model_dump(mode="json") for row in battle.timeline_events] == before_events
+
+
+def _make_live_skill_group_battle() -> tuple[DemoBattle, DemoPublicDataService]:
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "skill_display_live_8307.json").read_text(encoding="utf-8"))
+    battle = _make_test_battle(
+        fixture["sourceBattleId"], duration_ms=46673, total_damage=2292908, total_dps=2292908 / 46.673,
+    )
+    battle.roster = [BattleRosterEntryResponse.model_validate(row) for row in fixture["roster"]]
+    battle.role_skill_stats = [RoleSkillStatResponse.model_validate(row) for row in fixture["roleSkillStats"]]
+    battle.timeline_events = [TimelineEventResponse.model_validate(row) for row in fixture["timelineEvents"]]
+    service = DemoPublicDataService.__new__(DemoPublicDataService)
+    service._get_uploaded_battle = lambda battle_id, include_uncleared=False: battle
+    return battle, service
+
+
+def test_battle_detail_exact_skill_groups_cover_live_hits_without_changing_legacy_statistics() -> None:
+    battle, service = _make_live_skill_group_battle()
+    before_stats = [row.model_dump() for row in battle.role_skill_stats]
+    before_events = [event.model_dump() for event in battle.timeline_events]
+
+    detail = service.get_battle_detail(battle.battle_id, viewer_user_id=None)
+
+    assert len(detail.roleSkillStats) == 23
+    assert all(row.displayGroupKey and row.displayGroupName for row in detail.roleSkillStats)
+    assert all(row.hitCount is not None and row.maxHit is not None for row in detail.roleSkillStats)
+    assert sum(row.hitCount for row in detail.roleSkillStats) == 127
+    assert sum(row.totalDamage for row in detail.roleSkillStats) == 2292908
+    groups: dict[str, list[RoleSkillStatResponse]] = {}
+    for before, row in zip(before_stats, detail.roleSkillStats):
+        assert all(before[key] == getattr(row, key) for key in (
+            "characterName", "skillKey", "castCount", "totalDamage", "avgDamage", "maxDamage",
+        ))
+        groups.setdefault(row.displayGroupKey, []).append(row)
+    normal = groups["official:chr_0035_liino:chr_0035_liino_NormalSkill"]
+    ultimate = groups["official:chr_0035_liino:chr_0035_liino_UltimateSkill"]
+    assert len(normal) == 3
+    assert {row.displayGroupName for row in normal} == {"闪耀焦点"}
+    assert (sum(row.hitCount for row in normal), sum(row.totalDamage for row in normal), max(row.maxHit for row in normal)) == (12, 18096, 2011)
+    assert len(ultimate) == 5
+    assert {row.displayGroupName for row in ultimate} == {"晨星的协奏曲"}
+    assert (sum(row.hitCount for row in ultimate), sum(row.totalDamage for row in ultimate), max(row.maxHit for row in ultimate)) == (26, 73456, 36742)
+    assert [row.model_dump() for row in battle.role_skill_stats] == before_stats
+    assert [event.model_dump() for event in battle.timeline_events] == before_events
+
+
+@pytest.mark.parametrize("source_mode", ["name_only", "key_only", "timestamp_changed", "zero_non_skill_added"])
+def test_skill_hit_statistics_use_explicit_identity_not_timestamps(source_mode) -> None:
+    battle, service = _make_live_skill_group_battle()
+    for event in battle.timeline_events:
+        if source_mode == "name_only":
+            event.sourceCharacterKey = None
+        elif source_mode == "key_only":
+            event.sourceCharacterName = None
+        elif source_mode == "timestamp_changed":
+            event.tsMsFromStart = 0
+    if source_mode == "zero_non_skill_added":
+        event = next(row for row in battle.timeline_events if row.laneType == "skill" and row.value)
+        battle.timeline_events.extend([
+            event.model_copy(update={"value": 0}),
+            event.model_copy(update={"value": -1}),
+            event.model_copy(update={"laneType": "buff"}),
+        ])
+    detail = service.get_battle_detail(battle.battle_id, viewer_user_id=None)
+    assert sum(row.hitCount for row in detail.roleSkillStats) == 127
+
+
+@pytest.mark.parametrize("missing_proof", [
+    "missing_hit", "wrong_total", "wrong_event_key", "conflicting_source_key", "conflicting_source_name",
+    "duplicate_stat", "ambiguous_roster", "missing_roster", "unknown_owner",
+])
+def test_skill_hit_statistics_leave_missing_or_conflicting_evidence_unknown(missing_proof) -> None:
+    battle, service = _make_live_skill_group_battle()
+    target = battle.role_skill_stats[0]
+    hit = next(event for event in battle.timeline_events if event.eventKey == target.skillKey and event.value)
+    if missing_proof == "missing_hit":
+        battle.timeline_events.remove(hit)
+    elif missing_proof == "wrong_total":
+        target.totalDamage += 1
+    elif missing_proof == "wrong_event_key":
+        hit.eventKey += "_unknown"
+    elif missing_proof == "conflicting_source_key":
+        hit.sourceCharacterKey = "chr_0035_liino"
+    elif missing_proof == "conflicting_source_name":
+        hit.sourceCharacterName = "梨诺"
+    elif missing_proof == "duplicate_stat":
+        battle.role_skill_stats.append(target.model_copy())
+    elif missing_proof == "ambiguous_roster":
+        battle.roster.append(battle.roster[0].model_copy(update={"characterKey": "chr_other"}))
+    elif missing_proof == "missing_roster":
+        battle.roster = []
+    elif missing_proof == "unknown_owner":
+        hit.sourceCharacterKey = hit.sourceCharacterName = None
+    detail = service.get_battle_detail(battle.battle_id, viewer_user_id=None)
+    result = detail.roleSkillStats[0]
+    assert result.hitCount is None
+    assert result.maxHit is None
+
+
+@pytest.mark.parametrize("invalid_catalog", [
+    "schema", "source", "game_assembly", "metadata", "conflict", "ambiguous_group", "other_character",
+    "missing_entry", "same_name_unknown_key", "bad_proof_kind", "non_object", "missing_file",
+])
+def test_skill_display_groups_require_version_matched_unique_official_character_path(monkeypatch, tmp_path, invalid_catalog) -> None:
+    from app.services import public_data
+
+    catalog = json.loads((public_data.REPO_ROOT / "data/local_static/skill/display_name_catalog.json").read_text(encoding="utf-8"))
+    battle, service = _make_live_skill_group_battle()
+    target = battle.role_skill_stats[0]
+    entry = catalog["entries"][target.skillKey]
+    if invalid_catalog == "schema":
+        catalog["schemaVersion"] = 2
+    elif invalid_catalog == "source":
+        catalog["source"] = "name_similarity"
+    elif invalid_catalog == "game_assembly":
+        catalog["decoder"]["gameAssemblySha256"] = "different_version"
+    elif invalid_catalog == "metadata":
+        catalog["decoder"]["metadataSha256"] = "different_version"
+    elif invalid_catalog == "conflict":
+        catalog["conflicts"][target.skillKey] = {"reason": "different_names"}
+    elif invalid_catalog == "ambiguous_group":
+        entry["paths"].append({**entry["paths"][0], "skillGroupId": "another_group"})
+    elif invalid_catalog == "other_character":
+        for path in entry["paths"]:
+            path["characterId"] = "chr_0035_liino"
+    elif invalid_catalog == "missing_entry":
+        del catalog["entries"][target.skillKey]
+    elif invalid_catalog == "same_name_unknown_key":
+        target.skillKey += "_unmapped"
+        target.skillName = entry["displayName"]
+    elif invalid_catalog == "bad_proof_kind":
+        entry["proofKind"] = "same_name"
+    elif invalid_catalog == "non_object":
+        catalog = []
+    catalog_path = tmp_path / "data/local_static/skill/display_name_catalog.json"
+    catalog_path.parent.mkdir(parents=True)
+    if invalid_catalog != "missing_file":
+        catalog_path.write_text(json.dumps(catalog), encoding="utf-8")
+    monkeypatch.setattr(public_data, "REPO_ROOT", tmp_path)
+    detail = service.get_battle_detail(battle.battle_id, viewer_user_id=None)
+    assert detail.roleSkillStats[0].displayGroupKey is None
+    assert detail.roleSkillStats[0].displayGroupName is None
+
+
+@pytest.mark.parametrize(
+    ("character_key", "event_key", "expected_element"),
+    [
+        ("chr_0032_lizhiyan", "chr_0032_lizhiyan_ultimate_skill_laser", "natural"),
+        ("chr_0035_liino", "chr_0035_liino_normal_skill_projhit", "pulse"),
+    ],
+)
+def test_public_data_backfills_damage_element_from_official_skilldata(
+    character_key: str,
+    event_key: str,
+    expected_element: str,
+) -> None:
+    event = TimelineEventResponse(
+        tsMsFromStart=1000,
+        laneType="skill",
+        sourceCharacterKey=character_key,
+        sourceCharacterName=character_key,
+        targetCharacterKey="eny_0051_rodin",
+        targetCharacterName="罗丹",
+        eventKey=event_key,
+        eventName=event_key,
+        value=100,
+        important=True,
+    )
+
+    enriched = _enrich_timeline_event_damage_identity(event)
+
+    assert enriched.damageElement == expected_element
+    assert enriched.damageSchool == "spell"
+
+
 def test_public_data_normalizes_raw_mifu_character_identity() -> None:
     participant = _enrich_participant_character_identity(
         BattleParticipantResponse(
@@ -392,7 +666,7 @@ def test_public_data_normalizes_raw_mifu_character_identity() -> None:
 
     assert participant.characterName == "弭弗"
     assert participant.characterProfession == "近卫"
-    assert participant.characterAvatarUrl == "/images/character/charremoteicon/icon_chr_0031_mifu.png"
+    assert participant.characterAvatarUrl == json.loads((Path(__file__).resolve().parents[3] / "apps/web/public/images/character/game-avatars/manifest.json").read_text("utf-8"))["avatars"]["chr_0031_mifu"]["url"]
     assert roster_entry.characterName == "弭弗"
     assert event.sourceCharacterName == "弭弗"
     assert event.targetCharacterName == "弭弗"
@@ -428,10 +702,10 @@ def test_public_data_normalizes_raw_camille_character_identity() -> None:
 
     assert participant.characterName == "卡缪"
     assert participant.characterProfession == "先锋"
-    assert participant.characterAvatarUrl == "/images/character/charremoteicon/icon_chr_0033_camille.png"
+    assert participant.characterAvatarUrl == json.loads((Path(__file__).resolve().parents[3] / "apps/web/public/images/character/game-avatars/manifest.json").read_text("utf-8"))["avatars"]["chr_0033_camille"]["url"]
     assert participant.characterElement == "fire"
     assert roster_entry.characterName == "卡缪"
-    assert roster_entry.characterAvatarUrl == "/images/character/charremoteicon/icon_chr_0033_camille.png"
+    assert roster_entry.characterAvatarUrl == json.loads((Path(__file__).resolve().parents[3] / "apps/web/public/images/character/game-avatars/manifest.json").read_text("utf-8"))["avatars"]["chr_0033_camille"]["url"]
 
 
 def test_clear_flag_requires_completion_signal_when_timer_fields_are_present() -> None:
@@ -499,6 +773,98 @@ def test_war_echo_clear_flag_requires_official_timer_end() -> None:
         )
         is True
     )
+
+
+def test_upload_timer_integrity_rejects_missing_official_evidence() -> None:
+    service = DemoPublicDataService.__new__(DemoPublicDataService)
+
+    with pytest.raises(AppError) as error:
+        service._validate_upload_timer_integrity(
+            boss_slug="dung01_group_bossrush01",
+            parser_version="raw-log-parser-v48",
+            clear_flag=True,
+            duration_ms=151,
+            official_observed_elapsed_ms=10_000,
+            packet_elapsed_ms=8_000,
+            timer_integrity_ok=False,
+            timer_integrity_reasons=[
+                "official_duration_below_5s",
+                "official_observed_elapsed_exceeds_duration",
+            ],
+        )
+
+    assert error.value.status_code == 422
+    assert error.value.code == "timer_integrity_failed"
+
+
+def test_upload_timer_integrity_accepts_consistent_clear() -> None:
+    service = DemoPublicDataService.__new__(DemoPublicDataService)
+
+    service._validate_upload_timer_integrity(
+        boss_slug="dung01_group_bossrush01",
+        parser_version="raw-log-parser-v48",
+        clear_flag=True,
+        duration_ms=47_211,
+        timer_evidence=official_timer_evidence(47_211, "dung01_group_bossrush01"),
+        dungeon_context_id="dung01_group_bossrush01",
+        official_observed_elapsed_ms=49_427,
+        packet_elapsed_ms=31_563,
+        timer_integrity_ok=True,
+        timer_integrity_reasons=[],
+    )
+
+
+def test_upload_timer_integrity_ignores_lingering_summon_cast_end() -> None:
+    service = DemoPublicDataService.__new__(DemoPublicDataService)
+
+    # 艾尔黛拉的召唤残留会在官方结算后数秒才收到 SKILL_CAST_END；
+    # 施法结束包是实体清理信号，不是挑战仍在计时的证据。
+    service._validate_upload_timer_integrity(
+        boss_slug="dung02_group_minibossrush02",
+        parser_version="raw-log-parser-v48",
+        clear_flag=True,
+        duration_ms=13_391,
+        timer_evidence=official_timer_evidence(13_391, "dung02_group_minibossrush02"),
+        dungeon_context_id="dung02_group_minibossrush02",
+        official_observed_elapsed_ms=13_393,
+        packet_elapsed_ms=None,
+        timer_integrity_ok=True,
+        timer_integrity_reasons=[],
+    )
+
+
+def test_rankings_require_confirmed_timer_instead_of_a_minimum_duration() -> None:
+    service = DemoPublicDataService.__new__(DemoPublicDataService)
+    valid = _make_test_battle(
+        "valid-v47",
+        uploader_user_id="valid",
+        duration_ms=10_000,
+        total_dps=200_000,
+        parser_version="raw-log-parser-v48",
+        timer_integrity_ok=True,
+    )
+    blocked_v47 = _make_test_battle(
+        "blocked-v47",
+        uploader_user_id="blocked-new",
+        duration_ms=9_000,
+        total_dps=220_000,
+        parser_version="raw-log-parser-v48",
+        timer_integrity_ok=False,
+    )
+    blocked_legacy = _make_test_battle(
+        "blocked-legacy-151ms",
+        uploader_user_id="blocked-old",
+        duration_ms=151,
+        total_dps=15_000_000,
+        parser_version="raw-log-parser-v57",
+        timer_integrity_ok=None,
+    )
+
+    ranked = service._best_public_battles_by_account(
+        [valid, blocked_v47, blocked_legacy]
+    )
+
+    assert [battle.battle_id for battle in ranked] == ["valid-v47"]
 
 
 def test_public_ranked_battles_keep_fastest_valid_clear_per_account() -> None:
@@ -696,11 +1062,90 @@ def test_rdps_rankings_require_per_battle_strict_audit() -> None:
     ]
 
 
-def test_character_statistics_catalog_has_fifteen_six_star_characters_and_one_admin() -> None:
-    assert len(SIX_STAR_STATISTICS_CATALOG) == 15
+@pytest.mark.parametrize("parser,rules,strict,eligible", [
+    (51, 44, False, True), (51, 44, None, True), (52, 45, False, True),
+    (50, 44, False, False), (51, 43, False, False), (51, None, False, False),
+    (24, 44, True, False), (25, None, True, True), (46, 40, True, True),
+])
+def test_rdps_algorithm_policy_matches_rankings_and_memory_statistics(parser, rules, strict, eligible) -> None:
+    battle = _make_test_battle(
+        "algorithm-policy", duration_ms=60_000, total_dps=100.0,
+        parser_version=f"raw-log-parser-v{parser}", rdps_strict_ok=strict,
+        timer_integrity_ok=True,
+    )
+    battle.rules_version = f"raw-log-parser-v{rules}" if rules is not None else ""
+    battle.rdps_preflight_ok = False
+    battle.rdps_preflight_blocker_count = 224
+    service = _make_statistics_service([battle])
+    service._list_uploaded_battles = lambda boss_slug=None: [battle]
+
+    ranked = service._list_public_ranked_battles("boss-test", metric="rdps")
+    statistics = service.get_boss_character_statistics("boss-test", "rdps", "all")
+    assert bool(ranked) is eligible
+    assert statistics.eligibleBattleCount == int(eligible)
+    assert battle.rdps_strict_ok is strict
+    assert battle.rdps_preflight_ok is False
+    assert battle.rdps_preflight_blocker_count == 224
+
+
+@pytest.mark.parametrize("field,value", [
+    ("official_timer_end_seen", False), ("time_source", "damage_span"),
+    ("timer_integrity_ok", False), ("timer_integrity_ok", None),
+])
+def test_accepted_rdps_algorithm_keeps_timer_ranking_gates(field, value) -> None:
+    battle = _make_test_battle(
+        "incomplete-new-algorithm", duration_ms=60_000, total_dps=100.0,
+        parser_version="raw-log-parser-v51", rdps_strict_ok=False, timer_integrity_ok=True,
+    )
+    battle.rules_version = "raw-log-parser-v44"
+    setattr(battle, field, value)
+    service = DemoPublicDataService.__new__(DemoPublicDataService)
+    service._list_uploaded_battles = lambda boss_slug=None: [battle]
+    assert service._list_public_ranked_battles("boss-test", metric="rdps") == []
+
+
+def test_confirmed_official_duration_is_not_excluded_by_a_five_second_threshold():
+    battle = _make_test_battle('official-short', duration_ms=4999, total_dps=100.0,
+                              parser_version='raw-log-parser-v57', rdps_strict_ok=False, timer_integrity_ok=True)
+    battle.rules_version = 'raw-log-parser-v44'
+    service = DemoPublicDataService.__new__(DemoPublicDataService)
+    service._list_uploaded_battles = lambda boss_slug=None: [battle]
+    assert service._list_public_ranked_battles('boss-test', metric='rdps') == [battle]
+
+
+def test_battle_detail_exposes_algorithm_eligibility_without_rewriting_strict_audit() -> None:
+    battle = _make_test_battle(
+        "detail-algorithm-policy", duration_ms=60_000, total_dps=100.0,
+        parser_version="raw-log-parser-v51", rdps_strict_ok=False, timer_integrity_ok=True,
+    )
+    battle.rules_version = "raw-log-parser-v44"
+    battle.rdps_preflight_ok = False
+    battle.rdps_preflight_blocker_count = 224
+    service = DemoPublicDataService.__new__(DemoPublicDataService)
+    service._get_uploaded_battle = lambda battle_id, include_uncleared=False: battle
+    detail = service.get_battle_detail(battle.battle_id, viewer_user_id=None)
+    assert detail.battle.rdpsRankingEligible is True
+    assert detail.battle.rdpsStrictOk is False
+    assert detail.battle.rdpsPreflightOk is False
+    assert detail.battle.rdpsPreflightBlockerCount == 224
+
+
+def test_character_statistics_catalog_includes_si_and_one_canonical_admin() -> None:
+    assert len(SIX_STAR_STATISTICS_CATALOG) == 18
     admin_rows = [entry for entry in SIX_STAR_STATISTICS_CATALOG if entry.name == "管理员"]
     assert len(admin_rows) == 1
     assert admin_rows[0].char_id == ADMIN_STATISTICS_CHARACTER_KEY
+    liino_rows = [entry for entry in SIX_STAR_STATISTICS_CATALOG if entry.char_id == "chr_0035_liino"]
+    assert len(liino_rows) == 1
+    assert liino_rows[0].name == "梨诺"
+    root = Path(__file__).resolve().parents[3]
+    avatars = json.loads((root / "apps/web/public/images/character/game-avatars/manifest.json").read_text("utf-8"))["avatars"]
+    assert liino_rows[0].avatar_url == avatars["chr_0035_liino"]["url"]
+    si = next(entry for entry in SIX_STAR_STATISTICS_CATALOG if entry.char_id == "chr_0036_jsspsi")
+    assert si.name == "祀"
+    assert si.avatar_url == avatars["chr_0036_jsspsi"]["url"]
+    assert (root / "apps/web/public" / si.avatar_url.lstrip("/")).is_file()
+    assert admin_rows[0].avatar_url == avatars[ADMIN_STATISTICS_CHARACTER_KEY]["url"]
 
 
 def test_character_statistics_keep_all_runs_and_sort_sufficient_samples_first() -> None:
@@ -738,7 +1183,7 @@ def test_character_statistics_keep_all_runs_and_sort_sufficient_samples_first() 
     assert statistics.scope == "boss"
     assert statistics.includedBossCount == 1
     assert statistics.totalSampleCount == 9
-    assert len(statistics.rows) == 15
+    assert len(statistics.rows) == len(SIX_STAR_STATISTICS_CATALOG)
     assert rows["汤汤"].sampleCount == 5
     assert rows["汤汤"].rank == 1
     assert rows["汤汤"].p10 == 14.0
@@ -933,6 +1378,95 @@ def test_all_character_statistics_combine_bosses_and_exclude_crisis_contract() -
     assert tangtang.median == 150.0
 
 
+def test_character_statistics_production_path_uses_lightweight_rows_only(monkeypatch) -> None:
+    service = DemoPublicDataService.__new__(DemoPublicDataService)
+    service.bosses_by_slug = {
+        "boss-test": BossSeed(
+            key="boss-test",
+            slug="boss-test",
+            name="测试首领",
+            dungeon_name="测试副本",
+            roster=("chr_0027_tangtang", "unknown", "unknown", "unknown"),
+            uploader_names=("a", "b", "c"),
+            base_duration_ms=60_000,
+            base_dps=100_000,
+            base_rdps=100_000,
+        )
+    }
+    service._character_statistics_cache = {}
+    service._character_statistics_cache_lock = Lock()
+    monkeypatch.setattr(
+        service,
+        "_list_uploaded_battle_summaries",
+        lambda *args, **kwargs: pytest.fail("production statistics must not hydrate DemoBattle summaries"),
+    )
+    # Instance overrides are reserved for legacy test services; remove this one so the
+    # production query path is exercised explicitly.
+    del service.__dict__["_list_uploaded_battle_summaries"]
+    monkeypatch.setattr(
+        service,
+        "_query_character_statistics_metadata",
+        lambda **kwargs: [],
+    )
+    monkeypatch.setattr(
+        service,
+        "_iter_character_statistics_payloads",
+        lambda battle_ids: iter(()),
+    )
+
+    result = service.get_boss_character_statistics("boss-test", "dps", "all")
+
+    assert result.eligibleBattleCount == 0
+    assert result.totalSampleCount == 0
+
+
+def test_character_statistics_cold_cache_is_single_flight(monkeypatch) -> None:
+    service = DemoPublicDataService.__new__(DemoPublicDataService)
+    service._character_statistics_cache = {}
+    service._character_statistics_cache_lock = Lock()
+    call_count = 0
+    call_count_lock = Lock()
+    expected = BossCharacterStatisticsResponse(
+        scope="all",
+        bossSlug="all",
+        bossName="全部副本",
+        dungeonName="角色统计总榜",
+        metric="dps",
+        range="all",
+        potential="all",
+        includedBossCount=0,
+        minimumSampleCount=5,
+        eligibleBattleCount=0,
+        totalSampleCount=0,
+        totalOutlierCount=0,
+        rows=[],
+    )
+
+    def compute(**kwargs) -> BossCharacterStatisticsResponse:
+        nonlocal call_count
+        with call_count_lock:
+            call_count += 1
+        sleep(0.05)
+        return expected
+
+    monkeypatch.setattr(service, "_compute_character_statistics_response", compute)
+    request_args = {
+        "scope": "all",
+        "boss_slug": "all",
+        "boss_name": "全部副本",
+        "dungeon_name": "角色统计总榜",
+        "metric": "dps",
+        "time_range": "all",
+        "potential_range": "all",
+    }
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: service._get_character_statistics_response(**request_args), range(16)))
+
+    assert call_count == 1
+    assert results == [expected] * 16
+
+
 def test_crisis_contract_rankings_sort_by_tag_score_before_kill_time() -> None:
     service = DemoPublicDataService.__new__(DemoPublicDataService)
     service.bosses_by_slug = {
@@ -1073,3 +1607,59 @@ def test_boss_rankings_show_team_total_metrics() -> None:
     assert dps_ranking.rows[0].characterName == "糖糖"
     assert dps_ranking.rows[0].dps == 154_916
     assert rdps_ranking.rows[0].rdps == 154_916
+
+
+@pytest.mark.parametrize("mode", ["known", "missing_levels", "missing_lead", "duplicate_lead"])
+def test_rankings_expose_battle_loadout_without_reinterpreting_refinement(monkeypatch, mode) -> None:
+    import app.services.public_data as module
+    from app.schemas.public import BattleRosterWeaponResponse
+
+    battle = _make_test_battle("progression", duration_ms=60_000, total_dps=300)
+    lead = battle.participants[0]
+    lead.dps, lead.rdps = 200, 100
+    support = lead.model_copy(update={"characterKey": "chr_0004_pelica", "characterName": "佩丽卡", "dps": 100, "rdps": 200})
+    battle.participants = [lead, support]
+    # Exercise the same raw-to-display conversion as persisted battle reads:
+    # raw 0 -> display 1, raw 5 -> display 6, and potential 0 is meaningful.
+    main_roster = battle.roster[0].model_copy(update={
+        "characterPotential": 0,
+        "weapon": BattleRosterWeaponResponse(weaponName="测试武器", weaponRefine=0),
+    })
+    support_roster = main_roster.model_copy(update={
+        "slot": 2, "characterKey": support.characterKey, "characterName": support.characterName,
+        "characterPotential": 5,
+        "weapon": BattleRosterWeaponResponse(weaponName="测试武器", weaponRefine=5),
+    })
+    battle.roster = module._normalize_roster_weapon_refine([support_roster, main_roster])
+    if mode == "missing_levels":
+        battle.roster[1].characterPotential = None
+        battle.roster[1].weapon = None
+    elif mode == "missing_lead":
+        battle.roster[1].characterKey = "different-key-with-same-name"
+    elif mode == "duplicate_lead":
+        battle.roster.append(battle.roster[1].model_copy(deep=True))
+    original_roster = [entry.model_dump() for entry in battle.roster]
+    seed = BossSeed(key="boss-test", slug="boss-test", name="测试首领", dungeon_name="测试副本",
+                    roster=(lead.characterKey, support.characterKey, "unknown", "unknown"),
+                    uploader_names=("a", "b", "c"), base_duration_ms=60_000, base_dps=300, base_rdps=300)
+    service = DemoPublicDataService.__new__(DemoPublicDataService)
+    service.bosses_by_slug = {seed.slug: seed}
+    service._hot_bosses_cache = None
+    service._iter_boss_battles = lambda boss_slug, metric="dps": [battle]
+    service._list_public_ranked_battles_by_boss = lambda: {seed.slug: [battle]}
+    service._sync_uploaded_boss_catalog = lambda: None
+    monkeypatch.setattr(module, "BOSS_SEEDS", [seed])
+
+    dps = service.get_boss_rankings(seed.slug, "dps").rows[0]
+    rdps = service.get_boss_rankings(seed.slug, "rdps").rows[0]
+    hot = service.list_hot_bosses()[0].topSpeedRuns[0]
+    personal = service._list_user_boss_rankings(battle.uploader_user_id)[0]
+    expected_lead = (0, 1) if mode == "known" else (None, None)
+    assert (dps.characterPotential, dps.weaponRefine) == expected_lead
+    assert (hot.characterPotential, hot.weaponRefine) == expected_lead
+    assert rdps.characterKey == support.characterKey
+    assert (rdps.characterPotential, rdps.weaponRefine) == (5, 6)
+    assert (dps.rosterEntries[0].characterPotential, dps.rosterEntries[0].weaponRefine) == (5, 6)
+    assert personal.rosterEntries == dps.rosterEntries
+    assert dps.dps == dps.rdps == rdps.dps == rdps.rdps == 300
+    assert [entry.model_dump() for entry in battle.roster] == original_roster

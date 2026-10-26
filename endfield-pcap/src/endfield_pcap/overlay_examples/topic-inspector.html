@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>实时数据检查器</title>
+<style>
+:root{color-scheme:dark;font:13px "Microsoft YaHei",sans-serif;color:#e0ebef}*{box-sizing:border-box}body{margin:0;padding:15px;background:rgba(12,24,31,.96)}header{display:flex;align-items:center;gap:12px}h1{font-size:17px;margin:0;flex:1}#status{color:#e2bf65;font-size:11px}p{color:#93acb8;font-size:11px;line-height:1.7}select,input,button{font:inherit;background:#152d39;color:inherit;border:1px solid #3d5e6b;border-radius:4px;padding:7px}select{width:100%}.filters{display:flex;gap:7px;margin:8px 0}.filters input{min-width:0;flex:1}pre{font:12px/1.6 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere;background:#0c171e;border:1px solid #2c444f;border-radius:6px;padding:12px;min-height:220px;margin:12px 0}button{cursor:pointer}#note{color:#8da8b7;font-size:11px}
+</style>
+<header><h1>实时数据检查器</h1><span id="status">等待客户端</span></header>
+<p>查看只读订阅快照。准确 ID 可复制到效果监控设置；未知值保留 null，未观测到不代表不存在。</p>
+<select id="topic" aria-label="订阅主题"></select>
+<div class="filters"><input id="effect" placeholder="准确效果 ID，可选"><input id="target" placeholder="准确目标 ID，可选"><button id="apply">应用筛选</button></div>
+<div id="note"></div><pre id="data">等待订阅接口</pre>
+<script>
+(()=>{'use strict';const $=id=>document.getElementById(id);let cancel=null;const api=window.endfieldOverlay;
+if(!api){$('status').textContent='未连接客户端';$('data').textContent='请在客户端悬浮窗设置中添加此页面。';return;}
+function subscribe(){if(cancel)cancel();$('data').textContent='等待当前快照';const filter={};if($('effect').value.trim())filter.effectIds=[$('effect').value.trim()];if($('target').value.trim())filter.targetIds=[$('target').value.trim()];
+ cancel=api.subscribe({topic:$('topic').value,filter},envelope=>{
+  $('status').textContent=envelope.state==='ready'?'快照可用':'不可用 · 已清空';
+  const text=JSON.stringify(envelope,(key,value)=>key==='icon'&&typeof value==='string'?`[图标数据 ${value.length} 字符]`:value,2);
+  $('data').textContent=text.slice(0,200000);$('note').textContent=`序号 ${envelope.sequence} · 接收时间 ${envelope.receivedAtMs}${text.length>200000?' · 页面仅展示前200000字符，请使用准确ID筛选':''}`;
+ });}
+api.getTopics().then(topics=>{for(const row of topics){const option=document.createElement('option');option.value=row.topic;option.textContent=`${row.topic} · ${row.description||''}`;$('topic').append(option);}subscribe();}).catch(()=>{$('data').textContent='无法读取主题列表，请重载窗口。';});
+$('topic').onchange=subscribe;$('apply').onclick=subscribe;window.addEventListener('pagehide',()=>{if(cancel)cancel();});
+})();
+</script></html>

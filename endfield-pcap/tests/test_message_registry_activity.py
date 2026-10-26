@@ -114,6 +114,34 @@ def test_contingency_contract_messages_are_decodable() -> None:
     ]
 
 
+def test_server_buff_messages_are_decodable():
+    registry = MessageRegistry(Path(__file__).resolve().parents[1] / "data")
+    message_class = registry.load_message_class("SC_ADD_SERVER_BUFF")
+    assert message_class is not None
+    decoded = registry.decode_messages(
+        "sc",
+        {"msgid": 1177},
+        message_class(inst_id=100290).SerializeToString(),
+    )
+    assert len(decoded) == 1
+    assert decoded[0].class_name == "SC_ADD_SERVER_BUFF"
+    assert decoded[0].message.inst_id == 100290
+
+
+def test_server_buff_remove_messages_are_decodable():
+    registry = MessageRegistry(Path(__file__).resolve().parents[1] / "data")
+    message_class = registry.load_message_class("SC_REMOVE_SERVER_BUFF")
+    assert message_class is not None
+    decoded = registry.decode_messages(
+        "sc",
+        {"msgid": 1178},
+        message_class(inst_id=100290, del_inst_ids=[100291]).SerializeToString(),
+    )
+    assert len(decoded) == 1
+    assert decoded[0].class_name == "SC_REMOVE_SERVER_BUFF"
+    assert list(decoded[0].message.del_inst_ids) == [100291]
+
+
 def test_compressed_session_body_failure_is_not_treated_as_plain_protobuf() -> None:
     with pytest.raises(SessionBodyDecompressionError):
         maybe_decompress_session_body({"msgid": 1952, "is_compress": True}, b"not-compressed")

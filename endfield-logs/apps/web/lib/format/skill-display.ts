@@ -20,9 +20,6 @@ export function getPreferredBattleSkillDisplayName(skillName: string, skillKey?:
   if (skillNameOverride) {
     return skillNameOverride;
   }
-  if (skillKey && COMBO_SKILL_KEY_RE.test(skillKey)) {
-    return "连携技";
-  }
   return skillName;
 }
 

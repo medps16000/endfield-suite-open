@@ -1,20 +1,100 @@
 import json
 from pathlib import Path
+import parser_core.battle_log_parser as parser
 
 from parser_core.battle_log_parser import (
     _canonical_num_table_skill_id,
     _collect_buff_labels,
     _collect_zone_effects,
+    _effect_condition_failure,
     _is_arts_strength_damage_hit,
+    _infer_skill_action_damage_element,
+    _infer_skill_damage_element,
     _packet_mapping_stack_limit,
     _packet_numeric_effects,
+    _rdps_registry_stack_limit,
+    _rdps_registry_known_non_rdps_entry,
     _merge_loadout_snapshot,
     _parse_loadout_slot_snapshot,
     _parse_loadout_stats_snapshot,
     _repair_weapon_puton_loadout_groups,
     parse_raw_battle_log_text,
 )
+
+
+def test_typed_empty_buff_root_is_exact_non_rdps_marker(monkeypatch) -> None:
+    monkeypatch.setattr(
+        parser,
+        "_load_current_buff_roots",
+        lambda: {
+            "buff_test_marker": {
+                "abilityEventAction": [], "buffEventAction": [],
+                "attributeModifier": {"attributeModifiers": []},
+                "damageModifier": [], "globalModifier": [], "healModifier": [],
+            }
+        },
+    )
+    record = {"event_key": "buff_test_marker", "raw_event_key": "buff_test_marker", "bb_keys": [], "bb_values": {}}
+    entry = _rdps_registry_known_non_rdps_entry(record)
+    assert entry is not None
+    assert entry["proof_kind"] == "typed_root_structural"
+
+
+def test_local_table_catalogs_cover_new_weapon_and_equipment() -> None:
+    from parser_core.battle_log_parser import _load_equip_item_catalog, _load_weapon_catalog
+
+    assert _load_weapon_catalog()["wpn_funnel_0019"]["weapon_name"] == "寒夜幽影"
+    equip = _load_equip_item_catalog()["item_equip_t4_suit_spellburst_body_01"]
+    assert equip["suit_name"] == "险关"
+    assert equip["main_attr"]["value"] == 56
+    assert _load_equip_item_catalog()["item_equip_t4_suit_usp02_body_03"]["suit_name"] == "长息"
+    assert _load_equip_item_catalog()["item_equip_t4_suit_fire_natr01_hand_04"]["suit_name"] == "动火用"
+
+
+def test_dynamic_blackboard_modify_events_are_preserved_as_observations() -> None:
+    parsed = parse_raw_battle_log_text(
+        "[10:00:00.100] BB_MODIFY_DYNAMIC seq=7 tick=11 inst=101 ownerId=202 "
+        "owner=chr_0016_laevat skill=chr_0016_laevat_attack1 actionId=3 value=-3.6\n"
+        "[10:00:00.200] HP_V2 #1 hit=100 cum=100 raw=100.00 pHP=5000 "
+        "eHP=900000 skill=chr_0016_laevat_attack1 hits=1 src=chr_0016_laevat "
+        "tgt=eny_0051_rodin atk=chr_0016_laevat seg=0 shared=2 critFlag=0 critDmg=0.5000 "
+        "dynBB=29:1,38:1 calcBB=2:duration_corrupt_final=7",
+        include_rdps_debug=True,
+    )
+    assert parsed["dynamic_bb_events"] == [{
+        "line_no": 1,
+        "ts_ms": 36000100,
+        "seq": 7,
+        "tick": 11,
+        "instance_id": "101",
+        "owner_id": "202",
+        "owner": "chr_0016_laevat",
+        "skill_key": "chr_0016_laevat_attack1",
+        "action_id": 3,
+        "blackboard_key": None,
+        "value": -3.6,
+        "state_error": "missing_dynamic_identity",
+    }]
+    assert parsed["debug_hits"][0]["dynamic_bb_observations"] == []
+    assert parsed["debug_hits"][0]["dynamic_bb_values"] == {29: 1.0, 38: 1.0}
+    assert parsed["debug_hits"][0]["calc_bb_values"] == {2: {"duration_corrupt_final": 7.0}}
+    assert parser._load_skill_item_metadata("chr_0016_laevat_ult_attack2")["dynamic_action_keys"][29] == "stopped1"
 from parser_core.unified import rdps_totals_from_raw_report
+
+
+def test_official_skilldata_catalog_resolves_only_direct_damage_templates() -> None:
+    assert _infer_skill_damage_element("chr_0032_lizhiyan_attack1", "chr_0032_lizhiyan") == "natural"
+    assert _infer_skill_damage_element("chr_0032_lizhiyan_attack1_projhit", "chr_0032_lizhiyan") == "natural"
+    assert _infer_skill_action_damage_element("chr_0032_lizhiyan_normal_skill_abilityrange2", 17, 0) == "natural"
+    assert _infer_skill_damage_element("chr_0035_liino_normal_skill_projhit", "chr_0035_liino") == "pulse"
+    # Current official root has DamageAction 3: unit0 is Pulse/Hp, unit1
+    # Pulse/Poise. Action2 has no direct DamageAction; no neighboring fallback.
+    assert _infer_skill_action_damage_element("chr_0035_liino_normal_skill_projhit", 3, 0) == "pulse"
+    assert _infer_skill_action_damage_element("chr_0035_liino_normal_skill_projhit", 2, 0) is None
+    assert _infer_skill_action_damage_element("chr_0035_liino_normal_skill_projhit", 3, 1) is None
+    assert _infer_skill_action_damage_element("chr_0035_liino_normal_skill_projhit", 3, 2) is None
+    assert _infer_skill_damage_element("chr_0035_liino_unknown", "chr_0035_liino") is None
+    assert _infer_skill_damage_element("chr_0035_liino_normal_skill", "chr_0035_liino") is None
 
 
 def test_packaged_num_id_table_contains_pograni_fracture_alias() -> None:
@@ -25,16 +105,77 @@ def test_packaged_num_id_table_contains_pograni_fracture_alias() -> None:
     assert payload["buff_id"]["dic"]["1211"] == "buff_physical_do_fracture"
 
 
+def test_packaged_num_id_table_contains_typhoea_combo_debuff() -> None:
+    repo_root = Path(__file__).resolve().parents[3]
+    table_path = repo_root / "data" / "local_tables" / "NumIdStrTable.json"
+    payload = json.loads(table_path.read_text(encoding="utf-8"))
+
+    assert payload["buff_id"]["dic"]["3619"] == "buff_chr_0034_typhoea_combo_enemy_debuff"
+
+
+def test_typhoea_condition_requires_observed_damage_decorate_mask() -> None:
+    effect = {
+        "condition": {
+            'type': 'damage_decorate_mask', 'source': 'CheckDamageDecorateMask',
+            'mask': 33554432, 'check': 'HasAll',
+        }
+    }
+
+    assert _effect_condition_failure(
+        effect,
+        {"skill_key": "buff_common_natural_natural_triggered"},
+    )['reason_group'] == 'condition_unobservable'
+    assert _effect_condition_failure(effect, {'damage_decorate_mask': 33554432}) is None
+    failure = _effect_condition_failure(effect, {'damage_decorate_mask': 128})
+    assert failure['reason_group'] == 'condition_unsatisfied'
+
+
+def test_current_typhoea_combo_debuff_exposes_exact_mask_condition() -> None:
+    record = {
+        "event_key": "buff_chr_0034_typhoea_combo_enemy_debuff",
+        "raw_event_key": "3619",
+        "source_character_key": "chr_0034_typhoea",
+        "target_enemy_key": "eny_test",
+        "bb_values": {"damage_up": 0.1, "slow_down": 0.4, "duration": 6},
+        "bb_keys": ["damage_up", "slow_down", "duration"],
+        "attr_mods": [],
+    }
+
+    effects = _collect_zone_effects(record)
+    assert len(effects) == 1
+    assert (effects[0]['zone'], effects[0]['rate'], effects[0]['bb_key']) == ('vuln_taken', 0.1, 'damage_up')
+    assert effects[0]['rdps_whitelist_keys'] == ['buff_chr_0034_typhoea_combo_enemy_debuff']
+    assert _effect_condition_failure(effects[0], {'damage_decorate_mask': 33554432}) is None
+    assert _effect_condition_failure(effects[0], {'damage_decorate_mask': 128})['reason_group'] == 'condition_unsatisfied'
+
+
+def test_legacy_registry_rows_require_current_typed_effects() -> None:
+    rows = [
+        {'event_key': 'buff_chr_0035_liino_spellenhance', 'source_character_key': 'chr_0035_liino', 'target_character_key': 'chr_0027_tangtang', 'bb_values': {'spellenhance_rate': 0.12}, 'bb_keys': ['spellenhance_rate'], 'attr_mods': []},
+        {'event_key': 'buff_wpn_lance_0014_damageup', 'source_character_key': 'chr_0035_liino', 'target_character_key': 'chr_0027_tangtang', 'packet_mapping': {'weapon_id': 'wpn_lance_0014'}, 'bb_values': {'atk_up': 0.08}, 'bb_keys': ['atk_up'], 'attr_mods': []},
+    ]
+    liino, weapon = rows
+    assert _collect_zone_effects(liino) == []
+    assert not liino.get('rdps_unresolved_semantic_condition')
+    assert _rdps_registry_known_non_rdps_entry(liino)['proof_kind'] == 'typed_root_structural'
+    # The parent has no direct attribute modifier. Its current child UID
+    # carries PulseEnhancedDmgIncrease; do not credit both parent and child.
+    child = {'event_key': 'buff_common_affixes_enhance_pulse',
+             'source_character_key': 'chr_0035_liino',
+             'target_character_key': 'chr_0027_tangtang',
+             'bb_values': {'rate': 0.12}, 'bb_keys': ['rate'], 'attr_mods': []}
+    effects = _collect_zone_effects(child)
+    assert [(e['zone'], e['element'], e['rate'], e['attr_type']) for e in effects] == [
+        ('amp', 'pulse', 0.12, 66)]
+    assert _collect_zone_effects(weapon) == [{
+        'zone': 'atk', 'element': 'all', 'rate': 0.08, 'attr_type': 2,
+        'bb_key': 'atk_up', 'semantic_source': 'typed_current_attributeModifier',
+        'external_rdps_allowed': True, 'rdps_whitelist_keys': ['buff_wpn_lance_0014_damageup']}]
+
+
 def test_arts_strength_damage_classifier_covers_all_physical_anomalies_but_not_no_guard() -> None:
-    for skill_key in (
-        "buff_physical_airborne",
-        "buff_physical_crushed",
-        "buff_physical_knockdown",
-        "buff_physical_do_fracture",
-        "buff_common_cryst_triggered_physical_break",
-    ):
-        assert _is_arts_strength_damage_hit({"skill_key": skill_key, "skill_name": ""}) is True
-    assert _is_arts_strength_damage_hit({"skill_key": "buff_physical_no_guard", "skill_name": "破防"}) is False
+    assert _is_arts_strength_damage_hit({"skill_key": "buff_physical_airborne"}) is False
+    assert _is_arts_strength_damage_hit({"skill_key": "arbitrary_name", "arts_strength_damage_observed": True}) is True
 
 
 def test_repair_weapon_puton_swaps_complete_weapon_state_and_propagates_to_battle() -> None:
@@ -131,13 +272,13 @@ def test_packet_mapping_stack_limit_prefers_runtime_max_stack() -> None:
     assert _packet_mapping_stack_limit(record) == 2
 
 
-def test_rdps_preflight_accepts_registry_known_non_rdps_external_buff() -> None:
+def test_rdps_preflight_accepts_version_bound_typed_non_rdps_root() -> None:
     content = "\n".join(
         [
             "[10:00:00.000] GAME_TIMER_START seq=1 source=ChallengeStart startMs=0 expireMs=0",
             '[10:00:00.100] BUFF_START #1 id="buff_chr_0013_aglina_talent_0_effectbuff_Add" uid=1 owner=chr_0028_wulfa src=chr_0013_aglina dur=5.00 lifeT=5.00 passed=0.00 enh=1',
             "[10:00:00.100]   BB[1]: add=0.08",
-            '[10:00:00.500] HP_V2 #2 hit=100 cum=100 raw=100.00 packetFinalValue=100.0 pHP=5000 eHP=900000 skill="chr_0028_wulfa_attack1" hits=1 src=chr_0028_wulfa tgt=eny_0051_rodin atk=chr_0028_wulfa seg=0 shared=2 critFlag=0 critDmg=0.5000',
+            '[10:00:00.500] HP_V2 #2 hit=100 cum=100 raw=100.00 packetFinalValue=100.0 pHP=5000 eHP=900000 skill="chr_0028_wulfa_attack1" actionId=6 damageUnitIndex=0 hits=1 src=chr_0028_wulfa tgt=eny_0051_rodin atk=chr_0028_wulfa seg=0 shared=2 critFlag=0 critDmg=0.5000',
             "[10:00:01.000] GAME_TIMER_END seq=1 source=ChallengeComplete elapsedMs=1000 startMs=0 endMs=1000 expireMs=0 sane=1",
         ]
     )
@@ -146,7 +287,6 @@ def test_rdps_preflight_accepts_registry_known_non_rdps_external_buff() -> None:
     preflight = parsed["rdps_preflight"]
 
     assert preflight["ok"] is True
-    assert preflight["checked_external_buff_count"] == 1
     assert preflight["accepted_non_rdps_buff_count"] == 1
     assert parsed["rdps_damage_basis"]["rdps_strict_ok"] is True
 
@@ -156,7 +296,7 @@ def test_rdps_preflight_blocks_unknown_external_buff_before_allocation() -> None
         [
             "[10:00:00.000] GAME_TIMER_START seq=1 source=ChallengeStart startMs=0 expireMs=0",
             '[10:00:00.100] BUFF_START #1 id="buff_chr_9999_unknown_marker" uid=1 owner=chr_0028_wulfa src=chr_0013_aglina dur=5.00 lifeT=5.00 passed=0.00 enh=1',
-            '[10:00:00.500] HP_V2 #2 hit=100 cum=100 raw=100.00 packetFinalValue=100.0 pHP=5000 eHP=900000 skill="chr_0028_wulfa_attack1" hits=1 src=chr_0028_wulfa tgt=eny_0051_rodin atk=chr_0028_wulfa seg=0 shared=2 critFlag=0 critDmg=0.5000',
+            '[10:00:00.500] HP_V2 #2 hit=100 cum=100 raw=100.00 packetFinalValue=100.0 pHP=5000 eHP=900000 skill="chr_0028_wulfa_attack1" actionId=6 damageUnitIndex=0 hits=1 src=chr_0028_wulfa tgt=eny_0051_rodin atk=chr_0028_wulfa seg=0 shared=2 critFlag=0 critDmg=0.5000',
             "[10:00:01.000] GAME_TIMER_END seq=1 source=ChallengeComplete elapsedMs=1000 startMs=0 endMs=1000 expireMs=0 sane=1",
         ]
     )
@@ -170,38 +310,28 @@ def test_rdps_preflight_blocks_unknown_external_buff_before_allocation() -> None
     assert parsed["rdps_damage_basis"]["rdps_strict_ok"] is False
 
 
-def test_verified_weapon_mapping_uses_runtime_packet_value_only() -> None:
-    content = "\n".join(
-        [
-            "[09:59:59.000] SQUAD size=2 members=[chr_0013_aglina chr_0004_pelica]",
-            "[09:59:59.000] LOADOUT slot=0 char=chr_0013_aglina weaponTemplate=wpn_sword_0012 weaponLv=90 refine=9 break=0 attachedGem=0 equipInsts={} equips={} equipSuit={}",
-            "[09:59:59.000] LOADOUT slot=1 char=chr_0004_pelica weaponTemplate=wpn_funnel_0001 weaponLv=90 refine=9 break=0 attachedGem=0 equipInsts={} equips={} equipSuit={}",
-            "[10:00:00.000] GAME_TIMER_START seq=1 source=ChallengeStart startMs=0 expireMs=0",
-            '[10:00:00.100] BUFF_START #1 id="1699" uid=1 owner=chr_0004_pelica src=chr_0013_aglina dur=20.00 lifeT=20.00 passed=0.00 enh=1',
-            "[10:00:00.100]   BB[1]: atk_up=0.28 atk_up2=0.14 duration=20 max_stack=2",
-            '[10:00:00.500] HP_V2 #2 hit=114 cum=114 raw=114.00 packetFinalValue=114.0 pHP=5000 eHP=899886 skill="chr_0004_pelica_attack1" hits=1 src=chr_0004_pelica tgt=eny_0051_rodin atk=chr_0004_pelica seg=0 shared=2 critFlag=0 critDmg=0.5000',
-            "[10:00:01.000] GAME_TIMER_END seq=1 source=ChallengeComplete elapsedMs=1000 startMs=0 endMs=1000 expireMs=0 sane=1",
-        ]
-    )
-
-    parsed = parse_raw_battle_log_text(content, include_rdps_debug=True, file_name="wpn-sword-0012-runtime.log")
-    buff_event = next(event for event in parsed["buff_events"] if event["event_key"] == "buff_wpn_sword_0012_atk_up")
-
-    assert parsed["rdps_preflight"]["ok"] is True
-    assert parsed["rdps_damage_basis"]["rdps_strict_ok"] is True
-    assert buff_event["zone_effects"] == [{"zone": "atk", "element": "all", "rate": 0.14}]
+def test_verified_weapon_mapping_without_current_typed_effect_blocks_strict() -> None:
+    content = "\n".join([
+        '[10:00:00.100] BUFF_START #1 id="1699" uid=1 owner=chr_0004_pelica src=chr_0013_aglina dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+        '[10:00:00.500] HP_V2 #2 hit=114 cum=114 raw=114.00 packetFinalValue=114.0 pHP=5000 eHP=899886 skill="chr_0004_pelica_attack1_projhit" actionId=0 damageUnitIndex=0 hits=1 src=chr_0004_pelica tgt=eny_0051_rodin atk=chr_0004_pelica seg=0 shared=2 critFlag=0 critDmg=0.5000',
+    ])
+    parsed = parse_raw_battle_log_text(content, include_rdps_debug=True, file_name='legacy-typed-effect-missing.log')
+    assert parsed['rdps_preflight']['ok'] is False
+    assert parsed['rdps_damage_basis']['rdps_strict_ok'] is False
+    event = next(event for event in parsed['buff_events'] if event['uid'] == '1')
+    assert event['zone_effects'] == []
 
 
 def test_verified_weapon_mapping_without_runtime_value_blocks_strict() -> None:
     content = "\n".join(
         [
             "[09:59:59.000] SQUAD size=2 members=[chr_0013_aglina chr_0004_pelica]",
-            "[09:59:59.000] LOADOUT slot=0 char=chr_0013_aglina weaponTemplate=wpn_sword_0012 weaponLv=90 refine=9 break=0 attachedGem=0 equipInsts={} equips={} equipSuit={}",
-            "[09:59:59.000] LOADOUT slot=1 char=chr_0004_pelica weaponTemplate=wpn_funnel_0001 weaponLv=90 refine=9 break=0 attachedGem=0 equipInsts={} equips={} equipSuit={}",
+            "[09:59:59.000] LOADOUT slot=0 char=chr_0013_aglina weaponTemplate=wpn_sword_0012 weaponLv=90 refine=5 break=0 attachedGem=0 equipInsts={} equips={} equipSuit={}",
+            "[09:59:59.000] LOADOUT slot=1 char=chr_0004_pelica weaponTemplate=wpn_funnel_0001 weaponLv=90 refine=5 break=0 attachedGem=0 equipInsts={} equips={} equipSuit={}",
             "[10:00:00.000] GAME_TIMER_START seq=1 source=ChallengeStart startMs=0 expireMs=0",
             '[10:00:00.100] BUFF_START #1 id="1699" uid=1 owner=chr_0004_pelica src=chr_0013_aglina dur=20.00 lifeT=20.00 passed=0.00 enh=1',
             "[10:00:00.100]   BB[1]: atk_up=0.28 duration=20 max_stack=2",
-            '[10:00:00.500] HP_V2 #2 hit=100 cum=100 raw=100.00 packetFinalValue=100.0 pHP=5000 eHP=899900 skill="chr_0004_pelica_attack1" hits=1 src=chr_0004_pelica tgt=eny_0051_rodin atk=chr_0004_pelica seg=0 shared=2 critFlag=0 critDmg=0.5000',
+            '[10:00:00.500] HP_V2 #2 hit=100 cum=100 raw=100.00 packetFinalValue=100.0 pHP=5000 eHP=899900 skill="chr_0004_pelica_attack1_projhit" actionId=0 damageUnitIndex=0 hits=1 src=chr_0004_pelica tgt=eny_0051_rodin atk=chr_0004_pelica seg=0 shared=2 critFlag=0 critDmg=0.5000',
             "[10:00:01.000] GAME_TIMER_END seq=1 source=ChallengeComplete elapsedMs=1000 startMs=0 endMs=1000 expireMs=0 sane=1",
         ]
     )
@@ -217,12 +347,12 @@ def test_unresolved_formula_weapon_mapping_blocks_strict() -> None:
     content = "\n".join(
         [
             "[09:59:59.000] SQUAD size=2 members=[chr_0013_aglina chr_0004_pelica]",
-            "[09:59:59.000] LOADOUT slot=0 char=chr_0013_aglina weaponTemplate=wpn_sword_0013 weaponLv=90 refine=9 break=0 attachedGem=0 equipInsts={} equips={} equipSuit={}",
-            "[09:59:59.000] LOADOUT slot=1 char=chr_0004_pelica weaponTemplate=wpn_funnel_0001 weaponLv=90 refine=9 break=0 attachedGem=0 equipInsts={} equips={} equipSuit={}",
+            "[09:59:59.000] LOADOUT slot=0 char=chr_0013_aglina weaponTemplate=wpn_sword_0013 weaponLv=90 refine=5 break=0 attachedGem=0 equipInsts={} equips={} equipSuit={}",
+            "[09:59:59.000] LOADOUT slot=1 char=chr_0004_pelica weaponTemplate=wpn_funnel_0001 weaponLv=90 refine=5 break=0 attachedGem=0 equipInsts={} equips={} equipSuit={}",
             "[10:00:00.000] GAME_TIMER_START seq=1 source=ChallengeStart startMs=0 expireMs=0",
             '[10:00:00.100] BUFF_START #1 id="1812" uid=1 owner=chr_0004_pelica src=chr_0013_aglina dur=20.00 lifeT=20.00 passed=0.00 enh=1',
             "[10:00:00.100]   BB[1]: atk_up=0.28 atk_up_add=0.14 atk_up_mult=0.07 duration=20",
-            '[10:00:00.500] HP_V2 #2 hit=100 cum=100 raw=100.00 packetFinalValue=100.0 pHP=5000 eHP=899900 skill="chr_0004_pelica_attack1" hits=1 src=chr_0004_pelica tgt=eny_0051_rodin atk=chr_0004_pelica seg=0 shared=2 critFlag=0 critDmg=0.5000',
+            '[10:00:00.500] HP_V2 #2 hit=100 cum=100 raw=100.00 packetFinalValue=100.0 pHP=5000 eHP=899900 skill="chr_0004_pelica_attack1_projhit" actionId=0 damageUnitIndex=0 hits=1 src=chr_0004_pelica tgt=eny_0051_rodin atk=chr_0004_pelica seg=0 shared=2 critFlag=0 critDmg=0.5000',
             "[10:00:01.000] GAME_TIMER_END seq=1 source=ChallengeComplete elapsedMs=1000 startMs=0 endMs=1000 expireMs=0 sane=1",
         ]
     )
@@ -234,29 +364,17 @@ def test_unresolved_formula_weapon_mapping_blocks_strict() -> None:
     assert parsed["rdps_damage_basis"]["rdps_strict_ok"] is False
 
 
-def test_eminent_repute_uses_runtime_formula_buff_value() -> None:
-    content = "\n".join(
-        [
-            "[09:59:59.000] SQUAD size=2 members=[chr_0013_aglina chr_0004_pelica]",
-            "[09:59:59.000] LOADOUT slot=0 char=chr_0013_aglina weaponTemplate=wpn_sword_0013 weaponLv=90 refine=9 break=0 attachedGem=0 equipInsts={} equips={} equipSuit={}",
-            "[09:59:59.000] LOADOUT slot=1 char=chr_0004_pelica weaponTemplate=wpn_funnel_0001 weaponLv=90 refine=9 break=0 attachedGem=0 equipInsts={} equips={} equipSuit={}",
-            "[10:00:00.000] GAME_TIMER_START seq=1 source=ChallengeStart startMs=0 expireMs=0",
-            '[10:00:00.100] BUFF_START #1 id="1812" uid=1 owner=chr_0004_pelica src=chr_0013_aglina dur=20.00 lifeT=20.00 passed=0.00 enh=1',
-            "[10:00:00.100]   BB[1]: atk_up=0.28 atk_up_add=0.14 atk_up_mult=0.07 consume_layer=2 duration=20",
-            '[10:00:00.500] HP_V2 #2 hit=114 cum=114 raw=114.00 packetFinalValue=114.0 pHP=5000 eHP=899886 skill="chr_0004_pelica_attack1" hits=1 src=chr_0004_pelica tgt=eny_0051_rodin atk=chr_0004_pelica seg=0 shared=2 critFlag=0 critDmg=0.5000',
-            "[10:00:01.000] GAME_TIMER_END seq=1 source=ChallengeComplete elapsedMs=1000 startMs=0 endMs=1000 expireMs=0 sane=1",
-        ]
-    )
-
-    parsed = parse_raw_battle_log_text(content, include_rdps_debug=True, file_name="wpn-sword-0013-formula.log")
-    buff_event = next(event for event in parsed["buff_events"] if event["event_key"] == "buff_wpn_sword_0013_atk_up")
-    participants = {entry["character_key"]: entry for entry in parsed["participants"]}
-
-    assert parsed["rdps_preflight"]["ok"] is True
-    assert parsed["rdps_damage_basis"]["rdps_strict_ok"] is True
-    assert buff_event["zone_effects"] == [{"zone": "atk", "element": "all", "rate": 0.14}]
-    assert participants["chr_0004_pelica"]["rdps"] == 100.0
-    assert participants["chr_0013_aglina"]["rdps"] == 14.0
+def test_legacy_formula_buff_value_requires_current_typed_effect() -> None:
+    content = "\n".join([
+        '[10:00:00.100] BUFF_START #1 id="1812" uid=1 owner=chr_0004_pelica src=chr_0013_aglina dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+        '[10:00:00.100] BB[1]: atk_up=0.28 atk_up_add=0.14 atk_up_mult=0.07 consume_layer=2 duration=20',
+        '[10:00:00.500] HP_V2 #2 hit=114 cum=114 raw=114.00 packetFinalValue=114.0 pHP=5000 eHP=899886 skill="chr_0004_pelica_attack1_projhit" actionId=0 damageUnitIndex=0 hits=1 src=chr_0004_pelica tgt=eny_0051_rodin atk=chr_0004_pelica seg=0 shared=2 critFlag=0 critDmg=0.5000',
+    ])
+    parsed = parse_raw_battle_log_text(content, include_rdps_debug=True, file_name='legacy-formula-effect-missing.log')
+    assert parsed['rdps_preflight']['ok'] is False
+    assert parsed['rdps_damage_basis']['rdps_strict_ok'] is False
+    event = next(event for event in parsed['buff_events'] if event['uid'] == '1')
+    assert event['zone_effects'] == []
 
 
 def test_merge_loadout_snapshot_merges_incremental_equips_by_slot() -> None:
@@ -286,7 +404,7 @@ def test_merge_loadout_snapshot_merges_incremental_equips_by_slot() -> None:
     ]
 
 
-def test_merge_loadout_snapshot_preserves_edc_when_suit_count_stays_active() -> None:
+def test_partial_equipment_update_does_not_invent_another_slot_from_suit_count() -> None:
     base = _parse_loadout_slot_snapshot(
         "[10:00:00.000] LOADOUT slot=0 char=chr_0017_yvonne "
         "weaponTemplate=wpn_pistol_0010 weaponLv=0 refine=0 break=0 "
@@ -310,11 +428,10 @@ def test_merge_loadout_snapshot_preserves_edc_when_suit_count_stays_active() -> 
         (0, "item_equip_t4_suit_criti01_hand_03"),
         (1, "item_equip_t4_suit_criti01_body_02"),
         (2, "item_equip_t4_suit_heal01_edc_03"),
-        (3, "item_equip_t4_suit_criti01_edc_03"),
     ]
 
 
-def test_loadout_stats_refine_inference_ignores_character_potential_hint() -> None:
+def test_ambiguous_third_skill_does_not_override_explicit_loadout_refine() -> None:
     slot = _parse_loadout_slot_snapshot(
         "[10:00:00.000] LOADOUT slot=3 char=chr_0011_seraph "
         "weaponTemplate=wpn_funnel_0008 weaponLv=0 refine=5 break=0 "
@@ -333,10 +450,11 @@ def test_loadout_stats_refine_inference_ignores_character_potential_hint() -> No
 
     assert slot is not None
     assert stats is not None
-    assert stats["weapon_refine"] == 0
+    assert stats["weapon_refine"] is None
     merged = _merge_loadout_snapshot(slot, stats)
-    assert merged["weapon_refine"] == 0
-    assert _merge_loadout_snapshot(merged, slot)["weapon_refine"] == 0
+    assert merged["weapon_refine"] == 5
+    assert merged["weapon_refine_source"] == "loadout"
+    assert _merge_loadout_snapshot(merged, slot)["weapon_refine"] == 5
 
 
 def test_collect_buff_labels_distinguishes_fragile_from_vuln_taken() -> None:
@@ -382,13 +500,18 @@ def test_collect_zone_effects_builds_check_hp_condition_from_semantics() -> None
             "element": "all",
             "rate": 0.2,
             "condition": {
-                "type": "target_hp_ratio_lte",
+                "type": "target_hp_compare",
                 "source": "CheckHp",
+                "compare": "LT",
+                "is_ratio": True,
                 "threshold": 0.5,
                 "threshold_key": "hp_remain",
+                "subject_side": "defender",
             },
-            "semantic_source": "damageEffects",
+            "semantic_source": "typed_current_damageModifier",
             "bb_key": "extra_dmg",
+            "recipient_side": "attacker",
+            'external_rdps_allowed': False, 'rdps_whitelist_keys': [],
         }
     ]
 
@@ -405,20 +528,11 @@ def test_collect_zone_effects_builds_check_damage_type_condition_from_decoded_de
 
     effects = _collect_zone_effects(record)
 
-    assert effects == [
-        {
-            "zone": "vuln_taken",
-            "element": "cryst",
-            "rate": 0.3,
-            "condition": {
-                "type": "damage_type_in",
-                "source": "CheckDamageType",
-                "elements": ["cryst"],
-            },
-            "semantic_source": "damageEffects",
-            "bb_key": "cryst_up",
-        }
-    ]
+    assert len(effects) == 1
+    assert (effects[0]['zone'], effects[0]['element'], effects[0]['rate']) == ('vuln_taken', 'cryst', 0.3)
+    assert effects[0]['rdps_whitelist_keys'] == ['buff_chr_0011_seraph_talent_1_crystup']
+    assert _effect_condition_failure(effects[0], {'damage_element': 'cryst'}) is None
+    assert _effect_condition_failure(effects[0], {'damage_element': 'fire'})['reason_group'] == 'condition_unsatisfied'
 
 
 def test_parse_raw_battle_log_text_gates_check_hp_damage_scale() -> None:
@@ -437,12 +551,10 @@ def test_parse_raw_battle_log_text_gates_check_hp_damage_scale() -> None:
     parsed = parse_raw_battle_log_text(content, include_rdps_debug=True, file_name="check-hp-condition.log")
     chen_hits = [hit for hit in parsed["debug_hits"] if hit["character_key"] == "chr_0005_chen"]
 
-    assert chen_hits[0]["target_enemy_hp_ratio_before"] == 1.0
-    assert chen_hits[0]["ignored_effects"][0]["reason"] == "target_hp_above_threshold"
-    assert chen_hits[1]["target_enemy_hp_ratio_before"] == 0.4
-    zones = {zone["zone"]: zone for zone in chen_hits[1]["zones"]}
-    assert zones["dmg_inc"]["self_rate"] == 0.2
-    assert zones["dmg_inc"]["contributors"][0]["condition"]["source"] == "CheckHp"
+    assert all("target_enemy_hp_ratio_before" not in hit for hit in chen_hits)
+    assert parsed["rdps_damage_basis"]["rdps_strict_ok"] is False
+    assert any(row["reason"] == "unresolved_effect_condition"
+               for row in parsed["rdps_preflight"]["blockers"])
 
 
 def test_parse_raw_battle_log_text_gates_check_damage_type_damage_scale() -> None:
@@ -462,12 +574,9 @@ def test_parse_raw_battle_log_text_gates_check_damage_type_damage_scale() -> Non
     parsed = parse_raw_battle_log_text(content, include_rdps_debug=True, file_name="check-damage-type-condition.log")
     debug_hits = parsed["debug_hits"]
 
-    assert debug_hits[0]["damage_element"] == "fire"
-    assert debug_hits[0]["ignored_effects"][0]["condition"]["source"] == "CheckDamageType"
-    assert debug_hits[1]["damage_element"] == "cryst"
-    zones = {zone["zone"]: zone for zone in debug_hits[1]["zones"]}
-    assert zones["vuln_taken"]["external_rate"] == 0.3
-    assert zones["vuln_taken"]["contributors"][0]["source_character_key"] == "chr_0011_seraph"
+    assert all(hit["damage_element"] is None for hit in debug_hits)
+    assert parsed["rdps_damage_basis"]["rdps_strict_ok"] is False
+    assert not any(zone.get("external_rate") for hit in debug_hits for zone in hit["zones"])
 
 
 def test_parse_raw_battle_log_text_uses_dpd_damage_type_as_element_fallback() -> None:
@@ -489,9 +598,9 @@ def test_parse_raw_battle_log_text_uses_dpd_damage_type_as_element_fallback() ->
         for contribution in damage_event["rdps_contributions"]
     }
 
-    assert damage_event["damage_element"] == "fire"
-    assert rdps_by_key["chr_0004_pelica"] == 20.0
-    assert rdps_by_key["chr_9999_dummy"] == 100.0
+    assert damage_event["damage_element"] is None
+    assert rdps_by_key == {"chr_9999_dummy": 120.0}
+    assert parsed["rdps_damage_basis"]["rdps_strict_ok"] is False
 
 
 def test_parse_raw_battle_log_text_prefers_game_timer_window() -> None:
@@ -629,7 +738,7 @@ def test_parse_raw_battle_log_text_uses_official_timer_start_without_timer_end()
     assert damage_events[0]["ts_ms_from_start"] == 5000
 
 
-def test_parse_raw_battle_log_text_accepts_game_timer_end_after_official_start_without_official_end() -> None:
+def test_packet_phase_end_without_official_completion_stays_unfinished() -> None:
     content = "\n".join(
         [
             "[10:00:00.000] OFFICIAL_TIMER_START source=SC_GAME_MECHANICS_SYNC_CHALLENGE_START gameId=indie_hard007_s challengeStartTs=1000",
@@ -642,12 +751,12 @@ def test_parse_raw_battle_log_text_accepts_game_timer_end_after_official_start_w
 
     parsed = parse_raw_battle_log_text(content, file_name="official-start-game-end.log")
 
-    assert parsed["battle"]["duration_ms"] == 5000
+    assert parsed["battle"]["duration_ms"] == 4000
     assert parsed["battle"]["timer_start_seen"] is True
-    assert parsed["battle"]["timer_end_seen"] is True
+    assert parsed["battle"]["timer_end_seen"] is False
     assert parsed["battle"]["official_timer_start_seen"] is True
     assert parsed["battle"]["official_timer_end_seen"] is False
-    assert parsed["battle"]["clear_flag"] is True
+    assert parsed["battle"]["clear_flag"] is False
 
 
 def test_parse_raw_battle_log_text_keeps_hits_until_official_timer_end_when_pass_time_is_shorter_than_wall_clock() -> None:
@@ -957,33 +1066,20 @@ def test_parse_raw_battle_log_text_ignores_hits_outside_game_timer_window() -> N
     assert [event["value"] for event in damage_events] == [4000, 5000]
 
 
-def test_parse_raw_battle_log_text_ignores_enemy_buffs_outside_game_timer_window() -> None:
-    content = "\n".join(
-        [
-            '[10:00:01.000] ATTR_MOD buff="buff_chr_0013_aglina_ultimate_spell_vulnerable" i=0 attrType=85 modType=0 formula=0 useKey=1 val=0.0000 bbKey="rate"',
-            '[10:00:01.000] BUFF_START #1 id="buff_chr_0013_aglina_ultimate_spell_vulnerable" uid=old owner=eny_0051_rodin src=chr_0013_aglina dur=9999.00 lifeT=9999.00 passed=0.00 enh=1',
-            "[10:00:01.000]   BB[1]: rate=0.36",
-            "[10:00:10.000] GAME_TIMER_START seq=1 source=OnSrvStart self=0 startMs=100 expireMs=0",
-            '[10:00:11.000] HP_V2 #2 hit=1000 cum=1000 raw=1000.00 pHP=5000 eHP=899000 skill="chr_0028_wulfa_attack1" hits=1 src=chr_0028_wulfa tgt=eny_0051_rodin atk=chr_0028_wulfa seg=0 shared=2 critFlag=0 critDmg=0.5000',
-            '[10:00:12.000] ATTR_MOD buff="buff_chr_0013_aglina_ultimate_spell_vulnerable" i=0 attrType=85 modType=0 formula=0 useKey=1 val=0.0000 bbKey="rate"',
-            '[10:00:12.000] BUFF_START #2 id="buff_chr_0013_aglina_ultimate_spell_vulnerable" uid=new owner=eny_0051_rodin src=chr_0013_aglina dur=9999.00 lifeT=9999.00 passed=0.00 enh=1',
-            "[10:00:12.000]   BB[1]: rate=0.42",
-            '[10:00:13.000] HP_V2 #3 hit=1000 cum=2000 raw=1000.00 pHP=5000 eHP=898000 skill="chr_0028_wulfa_attack1" hits=2 src=chr_0028_wulfa tgt=eny_0051_rodin atk=chr_0028_wulfa seg=0 shared=2 critFlag=0 critDmg=0.5000',
-            "[10:00:15.000] GAME_TIMER_END seq=1 source=OnSrvComplete self=0 elapsedMs=5000 startMs=100 expireMs=0 sane=1",
-        ]
-    )
-
+def test_legacy_enemy_buff_without_current_typed_effect_stays_unknown_outside_window() -> None:
+    content = "\n".join([
+        '[10:00:01.000] BUFF_START #1 id="buff_chr_0013_aglina_ultimate_spell_vulnerable" uid=old owner=eny_0051_rodin src=chr_0013_aglina dur=9999.00 lifeT=9999.00 passed=0.00 enh=1',
+        '[10:00:10.000] GAME_TIMER_START seq=1 source=OnSrvStart self=0 startMs=100 expireMs=0',
+        '[10:00:11.000] HP_V2 #2 hit=1000 cum=1000 raw=1000.00 pHP=5000 eHP=899000 skill="chr_0028_wulfa_attack1" actionId=0 damageUnitIndex=0 hits=1 src=chr_0028_wulfa tgt=eny_0051_rodin atk=chr_0028_wulfa seg=0 shared=2 critFlag=0 critDmg=0.5000',
+        '[10:00:12.000] BUFF_START #2 id="buff_chr_0013_aglina_ultimate_spell_vulnerable" uid=new owner=eny_0051_rodin src=chr_0013_aglina dur=9999.00 lifeT=9999.00 passed=0.00 enh=1',
+        '[10:00:13.000] HP_V2 #3 hit=1000 cum=2000 raw=1000.00 pHP=5000 eHP=898000 skill="chr_0028_wulfa_attack1" actionId=0 damageUnitIndex=0 hits=2 src=chr_0028_wulfa tgt=eny_0051_rodin atk=chr_0028_wulfa seg=0 shared=2 critFlag=0 critDmg=0.5000',
+        '[10:00:15.000] GAME_TIMER_END seq=1 source=OnSrvComplete self=0 elapsedMs=5000 startMs=100 expireMs=0 sane=1',
+    ])
     parsed = parse_raw_battle_log_text(content)
-
-    buff_events = [
-        event
-        for event in parsed["timeline_events"]
-        if event["lane_type"] == "buff"
-        and event["event_key"] == "buff_chr_0013_aglina_ultimate_spell_vulnerable"
-    ]
-    assert len(buff_events) == 2
-    assert [event["actual_start_ms_from_start"] for event in buff_events] == [-9000, 2000]
-    assert [event["ts_ms_from_start"] for event in buff_events] == [0, 2000]
+    events = [event for event in parsed['buff_events'] if event['event_key'] == 'buff_chr_0013_aglina_ultimate_spell_vulnerable']
+    assert len(events) == 2
+    assert all(event['zone_effects'] == [] for event in events)
+    assert parsed['rdps_damage_basis']['rdps_strict_ok'] is False
 
 
 def test_parse_raw_battle_log_text_can_infer_timer_start_from_end_elapsed() -> None:
@@ -1078,20 +1174,20 @@ def test_parse_raw_battle_log_text_builds_structured_payload() -> None:
 
 
 def test_parse_raw_battle_log_text_uses_packet_dungeon_context_for_high_difficulty_stage() -> None:
-    content = "\n".join(
-        [
-            "[10:00:00.000] DUNGEON_CONTEXT dungeonId=indie_hard008_s source=SC_SELF_SCENE_INFO scene=210 isReward=1 isCalc=0 isPass=0",
-            '[10:00:00.000] HP_V2 #1 hit=100 cum=100 raw=100.00 pHP=5000 eHP=733631 skill="chr_0027_tangtang_attack1" hits=1 src=chr_0027_tangtang tgt=eny_0085_hsrogue_hard atk=chr_0027_tangtang seg=0 shared=2 critFlag=0 critDmg=0.5000',
-        ]
-    )
+    for stage, name in [('indie_hard008_s', '怨憎雾海·苦难'), ('indie_hard026_s', '兽影生杀·苦难'), ('indie_hard026', '兽影生杀'), ('indie_hard027_s', '暗曜白霆·苦难'), ('indie_hard027', '暗曜白霆'), ('indie_hard028_s', '沛然轰鸣·苦难'), ('indie_hard028', '沛然轰鸣'), ('indie_hard029_s', '三角定位·苦难'), ('indie_hard029', '三角定位')]:
+        content = "\n".join(
+            [
+                f"[10:00:00.000] DUNGEON_CONTEXT dungeonId={stage} source=SC_SELF_SCENE_INFO scene=210 isReward=1 isCalc=0 isPass=0",
+                '[10:00:00.000] HP_V2 #1 hit=100 cum=100 raw=100.00 pHP=5000 eHP=733631 skill="chr_0027_tangtang_attack1" hits=1 src=chr_0027_tangtang tgt=eny_0085_hsrogue_hard atk=chr_0027_tangtang seg=0 shared=2 critFlag=0 critDmg=0.5000',
+            ]
+        )
 
-    parsed = parse_raw_battle_log_text(content)
+        parsed = parse_raw_battle_log_text(content)
 
-    assert parsed["battle"]["dungeon_key"] == "indie_hard008_s"
-    assert parsed["battle"]["dungeon_name"] == "怨憎雾海·苦难"
-    assert parsed["battle"]["dungeon_context_id"] == "indie_hard008_s"
-    assert parsed["battle"]["dungeon_identity_source"] == "dungeon_context"
-
+        assert parsed["battle"]["dungeon_key"] == stage
+        assert parsed["battle"]["dungeon_name"] == name
+        assert parsed["battle"]["dungeon_context_id"] == stage
+        assert parsed["battle"]["dungeon_identity_source"] == "dungeon_context"
 
 def test_parse_raw_battle_log_text_uses_official_game_id_even_when_boss_belongs_elsewhere() -> None:
     content = "\n".join(
@@ -1118,6 +1214,17 @@ def test_parse_raw_battle_log_text_exposes_official_stage_before_first_hit() -> 
     assert parsed["battle"]["dungeon_key"] == "indie_battletower004_ex"
     assert parsed["battle"]["dungeon_name"] == "斧柄纪年·残酷"
     assert parsed["battle"]["boss_key"] == "unknown_boss"
+    assert parsed["participants"] == []
+
+
+def test_parse_raw_battle_log_text_uses_generated_activity_child_name() -> None:
+    parsed = parse_raw_battle_log_text(
+        "[10:00:00.000] DUNGEON_CONTEXT dungeonId=dung01_takestwo007 source=SC_SELF_SCENE_INFO"
+    )
+
+    assert parsed["battle"]["dungeon_key"] == "dung01_takestwo007"
+    assert parsed["battle"]["dungeon_name"] == "什么！还有动物！"
+    assert parsed["battle"]["dungeon_context_id"] == "dung01_takestwo007"
     assert parsed["participants"] == []
 
 
@@ -1253,7 +1360,12 @@ def test_parse_raw_battle_log_text_keeps_registry_leaf_character_effect() -> Non
     )
 
     buff_event = next(event for event in parsed["buff_events"] if event["event_key"] == "buff_chr_0004_pelica_potential_3_atkup")
-    assert buff_event["zone_effects"] == [{"zone": "atk", "element": "all", "rate": 0.2}]
+    assert buff_event["zone_effects"] == [{
+        "zone": "atk", "element": "all", "rate": 0.2,
+        "attr_type": 2, "bb_key": "atk_up",
+        "semantic_source": "typed_current_attributeModifier",
+        "external_rdps_allowed": False, "rdps_whitelist_keys": [],
+    }]
 
 
 def test_parse_raw_battle_log_text_maps_display_skill_names_to_generic_labels() -> None:
@@ -1385,25 +1497,13 @@ def test_parse_raw_battle_log_text_allocates_external_rdps_to_support() -> None:
     )
 
     participants = {entry["character_key"]: entry for entry in parsed["participants"]}
-    assert set(participants) == {"chr_0027_tangtang", "chr_0004_pelica"}
+    assert set(participants) == {"chr_0027_tangtang"}
     assert participants["chr_0027_tangtang"]["dps"] == 150.0
-    assert participants["chr_0027_tangtang"]["rdps"] == 100.0
-    assert participants["chr_0004_pelica"]["dps"] == 0.0
-    assert participants["chr_0004_pelica"]["rdps"] == 50.0
+    assert participants["chr_0027_tangtang"]["rdps"] == 150.0
+    assert "chr_0004_pelica" not in participants
 
     damage_events = [event for event in parsed["timeline_events"] if event["lane_type"] == "skill"]
-    assert damage_events[0]["rdps_contributions"] == [
-        {
-            "character_key": "chr_0004_pelica",
-            "character_name": "佩丽卡",
-            "value": 50.0,
-        },
-        {
-            "character_key": "chr_0027_tangtang",
-            "character_name": "汤汤",
-            "value": 100.0,
-        },
-    ]
+    assert damage_events[0]["rdps_contributions"] == [{"character_key": "chr_0027_tangtang", "character_name": "汤汤", "value": 150.0}]
 
 
 def test_parse_raw_battle_log_text_allocates_endmin_essence_collapse_attack_share() -> None:
@@ -1585,11 +1685,10 @@ def test_parse_raw_battle_log_text_reports_packet_grounded_rdps_basis() -> None:
     assert basis["total_packet_final_value"] == 99.5001
 
     participants = {entry["character_key"]: entry for entry in parsed["participants"]}
-    assert participants["chr_0027_tangtang"]["total_rd"] == 80.0
-    assert participants["chr_0004_pelica"]["total_rd"] == 20.0
+    assert participants["chr_0027_tangtang"]["total_rd"] == 100.0
+    assert "chr_0004_pelica" not in participants
     assert rdps_totals_from_raw_report(parsed) == {
-        "chr_0027_tangtang": 80.0,
-        "chr_0004_pelica": 20.0,
+        "chr_0027_tangtang": 100.0,
     }
 
     damage_event = next(event for event in parsed["timeline_events"] if event["lane_type"] == "skill")
@@ -1645,22 +1744,11 @@ def test_parse_raw_battle_log_text_uses_baseline_self_side_when_allocating_rdps(
     )
 
     participants = {entry["character_key"]: entry for entry in parsed["participants"]}
-    assert participants["chr_0027_tangtang"]["rdps"] == 125.0
-    assert participants["chr_0004_pelica"]["rdps"] == 25.0
+    assert participants["chr_0027_tangtang"]["rdps"] == 150.0
+    assert "chr_0004_pelica" not in participants
 
     damage_events = [event for event in parsed["timeline_events"] if event["lane_type"] == "skill"]
-    assert damage_events[0]["rdps_contributions"] == [
-        {
-            "character_key": "chr_0004_pelica",
-            "character_name": "佩丽卡",
-            "value": 25.0,
-        },
-        {
-            "character_key": "chr_0027_tangtang",
-            "character_name": "汤汤",
-            "value": 125.0,
-        },
-    ]
+    assert damage_events[0]["rdps_contributions"] == [{"character_key": "chr_0027_tangtang", "character_name": "汤汤", "value": 150.0}]
 
 
 def test_parse_raw_battle_log_text_calibrates_external_rdps_with_dpd_bucket() -> None:
@@ -1681,44 +1769,45 @@ def test_parse_raw_battle_log_text_calibrates_external_rdps_with_dpd_bucket() ->
     )
 
     participants = {entry["character_key"]: entry for entry in parsed["participants"]}
-    assert participants["chr_0027_tangtang"]["rdps"] == 125.0
-    assert participants["chr_0004_pelica"]["rdps"] == 25.0
+    assert participants["chr_0027_tangtang"]["rdps"] == 150.0
+    assert "chr_0004_pelica" not in participants
 
     damage_events = [event for event in parsed["timeline_events"] if event["lane_type"] == "skill"]
-    assert damage_events[0]["rdps_contributions"] == [
-        {
-            "character_key": "chr_0004_pelica",
-            "character_name": "佩丽卡",
-            "value": 25.0,
-        },
-        {
-            "character_key": "chr_0027_tangtang",
-            "character_name": "汤汤",
-            "value": 125.0,
-        },
-    ]
+    assert damage_events[0]["rdps_contributions"] == [{"character_key": "chr_0027_tangtang", "character_name": "汤汤", "value": 150.0}]
 
 
-def test_parse_raw_battle_log_text_caps_weapon_buff_stack_limit_for_rdps() -> None:
+def test_parse_raw_battle_log_text_rejects_unlisted_weapon_stack_credit() -> None:
     content = "\n".join(
         [
             '[10:00:00.000] ATTR_MOD buff="buff_wpn_sword_0018_atk_up" i=0 attrType=2 modType=0 formula=6 useKey=1 val=0.0000 bbKey="atk_up"',
-            '[10:00:00.000] BUFF_START #1 id="buff_wpn_sword_0018_atk_up" uid=1 owner=chr_0016_laevat src=chr_0019_karin dur=20.00 lifeT=20.00 passed=0.00 enh=1',
-            "[10:00:00.000]   BB[4]: atk_up=0.09 =0 duration=20 =0",
-            '[10:00:00.001] BUFF_START #101 id="buff_wpn_sword_0018_atk_up" uid=101 owner=chr_0019_karin src=chr_0019_karin dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            '[10:00:00.000] BUFF_START #1 id="buff_wpn_sword_0018_atk_up" uid=1 owner=chr_0016_laevat src=chr_0019_karin ownerId=1001 srcId=2001 dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            "[10:00:00.000]   BB[4]: atk_up=0.09 duration=20 max_stack=4",
+            '[10:00:00.001] BUFF_START #101 id="buff_wpn_sword_0018_atk_up" uid=101 owner=chr_0019_karin src=chr_0019_karin ownerId=2001 srcId=2001 dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            '[10:00:00.001] BB[101]: atk_up=0.09 duration=20 max_stack=4',
             '[10:00:00.100] ATTR_MOD buff="buff_wpn_sword_0018_atk_up" i=0 attrType=2 modType=0 formula=6 useKey=1 val=0.0000 bbKey="atk_up"',
-            '[10:00:00.100] BUFF_START #2 id="buff_wpn_sword_0018_atk_up" uid=2 owner=chr_0016_laevat src=chr_0019_karin dur=20.00 lifeT=20.00 passed=0.00 enh=1',
-            "[10:00:00.100]   BB[4]: atk_up=0.09 =0 duration=20 =0",
-            '[10:00:00.101] BUFF_START #102 id="buff_wpn_sword_0018_atk_up" uid=102 owner=chr_0019_karin src=chr_0019_karin dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            '[10:00:00.100] BUFF_START #2 id="buff_wpn_sword_0018_atk_up" uid=2 owner=chr_0016_laevat src=chr_0019_karin ownerId=1001 srcId=2001 dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            "[10:00:00.100]   BB[4]: atk_up=0.09 duration=20 max_stack=4",
+            '[10:00:00.101] BUFF_START #102 id="buff_wpn_sword_0018_atk_up" uid=102 owner=chr_0019_karin src=chr_0019_karin ownerId=2001 srcId=2001 dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            '[10:00:00.101] BB[102]: atk_up=0.09 duration=20 max_stack=4',
             '[10:00:00.200] ATTR_MOD buff="buff_wpn_sword_0018_atk_up" i=0 attrType=2 modType=0 formula=6 useKey=1 val=0.0000 bbKey="atk_up"',
-            '[10:00:00.200] BUFF_START #3 id="buff_wpn_sword_0018_atk_up" uid=3 owner=chr_0016_laevat src=chr_0019_karin dur=20.00 lifeT=20.00 passed=0.00 enh=1',
-            "[10:00:00.200]   BB[4]: atk_up=0.09 =0 duration=20 =0",
-            '[10:00:00.201] BUFF_START #103 id="buff_wpn_sword_0018_atk_up" uid=103 owner=chr_0019_karin src=chr_0019_karin dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            '[10:00:00.200] BUFF_START #3 id="buff_wpn_sword_0018_atk_up" uid=3 owner=chr_0016_laevat src=chr_0019_karin ownerId=1001 srcId=2001 dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            "[10:00:00.200]   BB[4]: atk_up=0.09 duration=20 max_stack=4",
+            '[10:00:00.201] BUFF_START #103 id="buff_wpn_sword_0018_atk_up" uid=103 owner=chr_0019_karin src=chr_0019_karin ownerId=2001 srcId=2001 dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            '[10:00:00.201] BB[103]: atk_up=0.09 duration=20 max_stack=4',
             '[10:00:00.300] ATTR_MOD buff="buff_wpn_sword_0018_atk_up" i=0 attrType=2 modType=0 formula=6 useKey=1 val=0.0000 bbKey="atk_up"',
-            '[10:00:00.300] BUFF_START #4 id="buff_wpn_sword_0018_atk_up" uid=4 owner=chr_0016_laevat src=chr_0019_karin dur=20.00 lifeT=20.00 passed=0.00 enh=1',
-            "[10:00:00.300]   BB[4]: atk_up=0.09 =0 duration=20 =0",
-            '[10:00:00.301] BUFF_START #104 id="buff_wpn_sword_0018_atk_up" uid=104 owner=chr_0019_karin src=chr_0019_karin dur=20.00 lifeT=20.00 passed=0.00 enh=1',
-            '[10:00:00.400] HP_V2 #10 hit=1180 cum=1180 raw=1180.00 pHP=100 eHP=10000 skill="chr_0016_laevat_attack1" hits=1 src=chr_0016_laevat tgt=eny_0051_rodin atk=chr_0016_laevat seg=0 shared=2 critFlag=0 critDmg=0.5000',
+            '[10:00:00.300] BUFF_START #4 id="buff_wpn_sword_0018_atk_up" uid=4 owner=chr_0016_laevat src=chr_0019_karin ownerId=1001 srcId=2001 dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            "[10:00:00.300]   BB[4]: atk_up=0.09 duration=20 max_stack=4",
+            '[10:00:00.301] BUFF_START #104 id="buff_wpn_sword_0018_atk_up" uid=104 owner=chr_0019_karin src=chr_0019_karin ownerId=2001 srcId=2001 dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            '[10:00:00.301] BB[104]: atk_up=0.09 duration=20 max_stack=4',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"1","ownerId":"1001","enabled":true,"operationSeq":1}',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"2","ownerId":"1001","enabled":true,"operationSeq":2}',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"3","ownerId":"1001","enabled":true,"operationSeq":3}',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"4","ownerId":"1001","enabled":true,"operationSeq":4}',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"101","ownerId":"2001","enabled":true,"operationSeq":5}',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"102","ownerId":"2001","enabled":true,"operationSeq":6}',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"103","ownerId":"2001","enabled":true,"operationSeq":7}',
+            '[10:00:00.350] BUFF_ENABLE {"schemaVersion":1,"buffUid":"104","ownerId":"2001","enabled":true,"operationSeq":8}',
+            '[10:00:00.400] HP_V2 #10 hit=1180 cum=1180 raw=1180.00 pHP=100 eHP=10000 skill="chr_0016_laevat_attack1" hits=1 src=chr_0016_laevat tgt=eny_0051_rodin atk=chr_0016_laevat atkId=1001 tgtId=3001 seg=0 shared=2 critFlag=0 critDmg=0.5000',
         ]
     )
 
@@ -1730,8 +1819,18 @@ def test_parse_raw_battle_log_text_caps_weapon_buff_stack_limit_for_rdps() -> No
     )
 
     participants = {entry["character_key"]: entry for entry in parsed["participants"]}
-    assert participants["chr_0016_laevat"]["rdps"] == 1000.0
-    assert participants["chr_0019_karin"]["rdps"] == 180.0
+    # This weapon effect is absent from the active whitelist. A decoded
+    # attribute and repeated instances cannot authorize external credit.
+    assert participants["chr_0016_laevat"]["rdps"] == 1180
+    assert participants.get("chr_0019_karin", {}).get("rdps", 0) == 0
+    assert parsed['rdps_damage_basis']['rdps_strict_ok'] is False
+    # This synthetic observation declares a complete four-stack cap; only
+    # whitelist rejection should block credit, not missing stack evidence.
+    assert not any(row['reason'] == 'unresolved_stack_evidence'
+                   for row in parsed['rdps_preflight']['blockers'])
+    assert any(row['reason'] == 'external_effect_not_whitelisted'
+               for row in parsed['rdps_preflight']['blockers'])
+    assert parsed["rdps_damage_basis"]["rdps_strict_ok"] is False
 
 
 def test_parse_raw_battle_log_text_does_not_map_enemy_phase_alias_to_dungeon() -> None:
@@ -1775,9 +1874,8 @@ def test_parse_raw_battle_log_text_maps_cryst_amp_attr_type_to_support_rdps() ->
 
     participants = {entry["character_key"]: entry for entry in parsed["participants"]}
     assert participants["chr_0026_lastrite"]["dps"] == 150.0
-    assert participants["chr_0026_lastrite"]["rdps"] == 100.0
-    assert participants["chr_0011_seraph"]["dps"] == 0.0
-    assert participants["chr_0011_seraph"]["rdps"] == 50.0
+    assert participants["chr_0026_lastrite"]["rdps"] == 150.0
+    assert "chr_0011_seraph" not in participants
 
 
 def test_parse_raw_battle_log_text_respects_physical_vulnerable_element_filter() -> None:
@@ -2042,15 +2140,15 @@ def test_parse_raw_battle_log_text_suppresses_legacy_false_fracture_for_all_elem
     )
 
     damage_events = [event for event in parsed["timeline_events"] if event["lane_type"] == "skill"]
-    natural_hit, physical_spell_hit = damage_events
+    natural_hit, fire_spell_hit = damage_events
     assert natural_hit["damage_element"] == "natural"
     assert natural_hit["damage_school"] == "physical"
     assert natural_hit["rdps_contributions"] == [
         {"character_key": "chr_0013_aglina", "character_name": "洁尔佩塔", "value": 120.0},
     ]
-    assert physical_spell_hit["damage_element"] == "physical"
-    assert physical_spell_hit["damage_school"] == "spell"
-    assert physical_spell_hit["rdps_contributions"] == [
+    assert fire_spell_hit["damage_element"] == "fire"
+    assert fire_spell_hit["damage_school"] == "spell"
+    assert fire_spell_hit["rdps_contributions"] == [
         {"character_key": "chr_0028_wulfa", "character_name": "洛茜", "value": 120.0},
     ]
     assert parsed["rdps_preflight"]["ok"] is True
@@ -2466,7 +2564,7 @@ def test_parse_raw_battle_log_text_uses_owner_for_self_attached_weapon_buffs() -
     assert participants.get("chr_0011_seraph") is None
 
 
-def test_parse_raw_battle_log_text_credits_replicated_weapon_team_buffs_to_source() -> None:
+def test_parse_raw_battle_log_text_does_not_credit_replicated_unlisted_weapon_effect() -> None:
     content = "\n".join(
         [
             '[10:00:00.000] ATTR_MOD buff="buff_wpn_sword_0018_atk_up" i=0 attrType=2 modType=0 formula=6 useKey=1 val=0.0000 bbKey="atk_up"',
@@ -2475,7 +2573,7 @@ def test_parse_raw_battle_log_text_credits_replicated_weapon_team_buffs_to_sourc
             '[10:00:00.001] ATTR_MOD buff="buff_wpn_sword_0018_atk_up" i=0 attrType=2 modType=0 formula=6 useKey=1 val=0.0000 bbKey="atk_up"',
             '[10:00:00.001] BUFF_START #2 id="buff_wpn_sword_0018_atk_up" uid=2 owner=chr_0027_tangtang src=chr_0019_karin dur=2.00 lifeT=2.00 passed=0.00 enh=1',
             '[10:00:00.001]   BB[2]: atk_up=0.09 =0 duration=2',
-            '[10:00:00.500] HP_V2 #3 hit=109 cum=109 raw=109.00 pHP=5000 eHP=900000 skill="chr_0027_tangtang_attack1" hits=1 src=chr_0027_tangtang tgt=eny_0051_rodin atk=chr_0027_tangtang seg=0 shared=2 critFlag=0 critDmg=0.5000',
+            '[10:00:00.500] HP_V2 #3 hit=109 cum=109 raw=109.00 pHP=5000 eHP=900000 skill="chr_0027_tangtang_attack1_projhit" actionId=0 damageUnitIndex=0 hits=1 src=chr_0027_tangtang tgt=eny_0051_rodin atk=chr_0027_tangtang seg=0 shared=2 critFlag=0 critDmg=0.5000',
         ]
     )
 
@@ -2488,9 +2586,10 @@ def test_parse_raw_battle_log_text_credits_replicated_weapon_team_buffs_to_sourc
 
     participants = {entry["character_key"]: entry for entry in parsed["participants"]}
     assert participants["chr_0027_tangtang"]["dps"] == 109.0
-    assert participants["chr_0027_tangtang"]["rdps"] == 100.0
-    assert participants["chr_0019_karin"]["dps"] == 0.0
-    assert participants["chr_0019_karin"]["rdps"] == 9.0
+    assert participants["chr_0027_tangtang"]["rdps"] == 109.0
+    assert participants.get("chr_0019_karin", {}).get("rdps", 0) == 0.0
+    assert any(row['reason'] == 'external_effect_not_whitelisted'
+               for row in parsed['rdps_preflight']['blockers'])
 
 
 def test_parse_raw_battle_log_text_credits_pograni_pd_up_weapon_team_buff() -> None:

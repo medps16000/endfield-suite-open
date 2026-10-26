@@ -1,7 +1,8 @@
 import type { ReactNode } from "react";
 
 import { AuthNav } from "../features/auth/auth-nav";
-import { SiteNavLinks } from "./site-nav-links";
+import { SiteNavLinks, SiteStatus } from "./site-nav-links";
+import { SiteBackground } from "./site-background";
 
 type AppShellProps = {
   children: ReactNode;
@@ -9,7 +10,8 @@ type AppShellProps = {
 
 export async function AppShell({ children }: AppShellProps) {
   return (
-    <div>
+    <div className="site-layout">
+      <SiteBackground />
       <header className="site-header">
         <div className="page-shell">
           <div className="site-header-inner">
@@ -22,10 +24,7 @@ export async function AppShell({ children }: AppShellProps) {
               <AuthNav />
             </nav>
           </div>
-          <div className="site-status-row">
-            <span className="pill pill-accent">测试环境</span>
-            <span>站点当前仍为测试入口，但公开榜单、竞速记录与整场战斗报告只展示真实上传数据。</span>
-          </div>
+          <SiteStatus />
         </div>
       </header>
       <main className="page-shell page-content">{children}</main>

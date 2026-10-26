@@ -20,21 +20,17 @@ from parser_core import battle_log_parser as blp
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[4]
+    return Path(__file__).resolve().parents[3]
 
 
 def test_unified_rdps_totals_match_between_viewer_and_uploader_logs() -> None:
-    for name in ("4.log", "5.log", "6.log"):
-        text = (_repo_root() / "logs" / name).read_text(encoding="utf-8", errors="ignore")
-
-        viewer_report = parse_hit_viewer_log_text(text, file_name=name)
-        upload_report = parse_upload_battle_log_text(text, file_name=name)
-
-        viewer_totals = rdps_totals_from_hit_debug(viewer_report)
-        upload_totals = rdps_totals_from_raw_report(upload_report)
-        assert set(viewer_totals) == set(upload_totals)
-        for character_key, viewer_total in viewer_totals.items():
-            assert abs(viewer_total - upload_totals[character_key]) < 0.2
+    # The former absolute-path historical logs are unavailable. This stored
+    # synthetic fixture exercises refresh, same-time ordering and toggles;
+    # it does not claim coverage of those missing historical battles.
+    text = Path(__file__).with_name('fixtures').joinpath('rdps_snapshot_contract.log').read_text(encoding='utf-8')
+    expected = {'chr_0004_pelica': 640, 'chr_0035_liino': 120}
+    assert rdps_totals_from_hit_debug(parse_hit_viewer_log_text(text)) == expected
+    assert rdps_totals_from_raw_report(parse_upload_battle_log_text(text)) == expected
 
 
 def test_hit_viewer_credits_usp02_damageup_alias() -> None:
@@ -128,14 +124,16 @@ def test_hit_viewer_keeps_attacker_buffs_when_packet_modifier_list_is_partial() 
 
 
 def test_weapon_buff_source_is_item_carrier_not_target() -> None:
+    # Synthetic item-source case includes explicit instance and enable evidence.
     text = "\n".join(
         [
             "[10:00:00.000] LOADOUT reason=SC_SELF_SCENE_INFO slotCount=2 memberCount=2 roster=[1 2]",
             "[10:00:00.000] LOADOUT slot=0 char=chr_0028_wulfa weaponTemplate=wpn_sword_0006 equipSuit={}",
             "[10:00:00.000] LOADOUT slot=1 char=chr_0013_aglina weaponTemplate=wpn_funnel_0005 equipSuit={}",
-            '[10:00:00.000] BUFF_START #1 id="buff_wpn_funnel_0005_atk_up" uid=1 owner=chr_0028_wulfa src=chr_0013_aglina dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            '[10:00:00.000] BUFF_START #1 id="buff_wpn_funnel_0005_atk_up" uid=1 owner=chr_0028_wulfa ownerId=1001 src=chr_0013_aglina srcId=1002 dur=20.00 lifeT=20.00 passed=0.00 enh=1',
             "[10:00:00.000] BB[1]: atk_up=0.224 duration=20",
-            '[10:00:01.000] HP_V2 #2 hit=1224 cum=1224 raw=1224.00 pHP=5000 eHP=898776 skill="chr_0028_wulfa_ultimate_skill" hits=1 skillLv=12 templateIntId=2397 actionId=177 origTemplateIntId=2397 damageUnitIndex=0 src=chr_0028_wulfa tgt=eny_0051_rodin atk=chr_0028_wulfa atkId=1001 tgtId=2000 seg=0 shared=2 critFlag=0 critDmg=-1.0000',
+            '[10:00:00.000] BUFF_ENABLE {"schemaVersion":1,"buffUid":"1","ownerId":"1001","enabled":true,"operationSeq":1}',
+            '[10:00:01.000] HP_V2 #2 hit=1224 cum=1224 raw=1224.00 pHP=5000 eHP=898776 skill="chr_0028_wulfa_ultimate_skill" hits=1 skillLv=12 templateIntId=2397 actionId=176 origTemplateIntId=2397 damageUnitIndex=0 src=chr_0028_wulfa tgt=eny_0051_rodin atk=chr_0028_wulfa atkId=1001 tgtId=2000 seg=0 shared=2 critFlag=0 critDmg=-1.0000',
         ]
     )
 
@@ -163,7 +161,7 @@ def test_weapon_buff_requires_source_active_weapon_not_target_weapon() -> None:
             "[10:00:00.000] LOADOUT slot=1 char=chr_0013_aglina weaponTemplate=wpn_sword_0006 equipSuit={}",
             '[10:00:00.000] BUFF_START #1 id="buff_wpn_funnel_0005_atk_up" uid=1 owner=chr_0028_wulfa src=chr_0013_aglina dur=20.00 lifeT=20.00 passed=0.00 enh=1',
             "[10:00:00.000] BB[1]: atk_up=0.224 duration=20",
-            '[10:00:01.000] HP_V2 #2 hit=1224 cum=1224 raw=1224.00 pHP=5000 eHP=898776 skill="chr_0028_wulfa_ultimate_skill" hits=1 skillLv=12 templateIntId=2397 actionId=177 origTemplateIntId=2397 damageUnitIndex=0 src=chr_0028_wulfa tgt=eny_0051_rodin atk=chr_0028_wulfa atkId=1001 tgtId=2000 seg=0 shared=2 critFlag=0 critDmg=-1.0000',
+            '[10:00:01.000] HP_V2 #2 hit=1224 cum=1224 raw=1224.00 pHP=5000 eHP=898776 skill="chr_0028_wulfa_ultimate_skill" hits=1 skillLv=12 templateIntId=2397 actionId=176 origTemplateIntId=2397 damageUnitIndex=0 src=chr_0028_wulfa tgt=eny_0051_rodin atk=chr_0028_wulfa atkId=1001 tgtId=2000 seg=0 shared=2 critFlag=0 critDmg=-1.0000',
         ]
     )
 
@@ -178,6 +176,7 @@ def test_weapon_buff_requires_source_active_weapon_not_target_weapon() -> None:
 
 
 def test_raw_parser_uses_mechanism_registry_when_packet_buff_map_lacks_item_effect(monkeypatch) -> None:
+    # Synthetic registry fallback keeps activation evidence independent of mapping.
     monkeypatch.setattr(blp, "_load_packet_numeric_buff_map", lambda: {})
     monkeypatch.setattr(blp, "_load_packet_canonical_buff_map", lambda: {})
 
@@ -186,9 +185,10 @@ def test_raw_parser_uses_mechanism_registry_when_packet_buff_map_lacks_item_effe
             "[10:00:00.000] LOADOUT reason=SC_SELF_SCENE_INFO slotCount=2 memberCount=2 roster=[1 2]",
             "[10:00:00.000] LOADOUT slot=0 char=chr_0028_wulfa weaponTemplate=wpn_sword_0006 equipSuit={}",
             "[10:00:00.000] LOADOUT slot=1 char=chr_0013_aglina weaponTemplate=wpn_funnel_0005 equipSuit={}",
-            '[10:00:00.000] BUFF_START #1 id="1645" uid=1 owner=chr_0028_wulfa src=chr_0013_aglina dur=20.00 lifeT=20.00 passed=0.00 enh=1',
+            '[10:00:00.000] BUFF_START #1 id="1645" uid=1 owner=chr_0028_wulfa ownerId=1001 src=chr_0013_aglina srcId=1002 dur=20.00 lifeT=20.00 passed=0.00 enh=1',
             "[10:00:00.000] BB[1]: atk_up=0.224 duration=20",
-            '[10:00:01.000] HP_V2 #2 hit=1224 cum=1224 raw=1224.00 pHP=5000 eHP=898776 skill="chr_0028_wulfa_ultimate_skill" hits=1 skillLv=12 templateIntId=2397 actionId=177 origTemplateIntId=2397 damageUnitIndex=0 src=chr_0028_wulfa tgt=eny_0051_rodin atk=chr_0028_wulfa atkId=1001 tgtId=2000 seg=0 shared=2 critFlag=0 critDmg=-1.0000',
+            '[10:00:00.000] BUFF_ENABLE {"schemaVersion":1,"buffUid":"1","ownerId":"1001","enabled":true,"operationSeq":1}',
+            '[10:00:01.000] HP_V2 #2 hit=1224 cum=1224 raw=1224.00 pHP=5000 eHP=898776 skill="chr_0028_wulfa_ultimate_skill" hits=1 skillLv=12 templateIntId=2397 actionId=176 origTemplateIntId=2397 damageUnitIndex=0 src=chr_0028_wulfa tgt=eny_0051_rodin atk=chr_0028_wulfa atkId=1001 tgtId=2000 seg=0 shared=2 critFlag=0 critDmg=-1.0000',
         ]
     )
 
@@ -219,7 +219,7 @@ def test_mechanism_registry_fallback_requires_source_item_guard(monkeypatch) -> 
             "[10:00:00.000] LOADOUT slot=1 char=chr_0013_aglina weaponTemplate=wpn_sword_0006 equipSuit={}",
             '[10:00:00.000] BUFF_START #1 id="1645" uid=1 owner=chr_0028_wulfa src=chr_0013_aglina dur=20.00 lifeT=20.00 passed=0.00 enh=1',
             "[10:00:00.000] BB[1]: atk_up=0.224 duration=20",
-            '[10:00:01.000] HP_V2 #2 hit=1224 cum=1224 raw=1224.00 pHP=5000 eHP=898776 skill="chr_0028_wulfa_ultimate_skill" hits=1 skillLv=12 templateIntId=2397 actionId=177 origTemplateIntId=2397 damageUnitIndex=0 src=chr_0028_wulfa tgt=eny_0051_rodin atk=chr_0028_wulfa atkId=1001 tgtId=2000 seg=0 shared=2 critFlag=0 critDmg=-1.0000',
+            '[10:00:01.000] HP_V2 #2 hit=1224 cum=1224 raw=1224.00 pHP=5000 eHP=898776 skill="chr_0028_wulfa_ultimate_skill" hits=1 skillLv=12 templateIntId=2397 actionId=176 origTemplateIntId=2397 damageUnitIndex=0 src=chr_0028_wulfa tgt=eny_0051_rodin atk=chr_0028_wulfa atkId=1001 tgtId=2000 seg=0 shared=2 critFlag=0 critDmg=-1.0000',
         ]
     )
 
@@ -302,7 +302,7 @@ def test_hit_viewer_does_not_merge_raw_debug_hits_by_index_when_seq_mismatch(mon
 
 
 def test_overlay_snapshot_uses_viewer_rdps_totals() -> None:
-    text = (_repo_root() / "logs" / "6.log").read_text(encoding="utf-8", errors="ignore")
+    text = Path(__file__).with_name('fixtures').joinpath('rdps_snapshot_contract.log').read_text(encoding='utf-8')
 
     upload_totals = rdps_totals_from_raw_report(parse_upload_battle_log_text(text, file_name="6.log"))
     overlay_report = parse_overlay_battle_snapshot_text(text, file_name="6.log")
@@ -312,12 +312,13 @@ def test_overlay_snapshot_uses_viewer_rdps_totals() -> None:
         for participant in overlay_report["participants"]
     }
     assert set(overlay_totals) == set(upload_totals)
+    assert overlay_totals == {'chr_0004_pelica': 640, 'chr_0035_liino': 120}
     for character_key, upload_total in upload_totals.items():
         assert abs(upload_total - overlay_totals[character_key]) < 0.001
 
 
 def test_live_overlay_parser_uses_unified_rdps_totals() -> None:
-    text = (_repo_root() / "logs" / "6.log").read_text(encoding="utf-8", errors="ignore")
+    text = Path(__file__).with_name('fixtures').joinpath('rdps_snapshot_contract.log').read_text(encoding='utf-8')
     expected = {
         participant["character_key"]: participant["total_rd"]
         for participant in parse_overlay_battle_snapshot_text(text, file_name="6.log")["participants"]
@@ -334,6 +335,7 @@ def test_live_overlay_parser_uses_unified_rdps_totals() -> None:
         for participant in snapshot["participants"]
     }
     assert set(actual) == set(expected)
+    assert actual == {'chr_0004_pelica': 640, 'chr_0035_liino': 120}
     for character_key, expected_total in expected.items():
         assert abs(actual[character_key] - expected_total) < 0.001
 
@@ -438,7 +440,7 @@ def test_live_overlay_parser_uses_first_party_action_window_for_synthetic_timer(
     assert snapshot["battle"]["duration_ms"] == 8000
 
 
-def test_parser_ignores_authoritative_timer_window_without_hits() -> None:
+def test_parser_rejects_authoritative_timer_window_without_hits() -> None:
     text = "\n".join(
         [
             '[10:00:00.000] SKILL_CAST_START seq=1 startMs=1 inst=1 owner=chr_0027_tangtang skill=chr_0027_tangtang_skill_2038',
@@ -450,8 +452,10 @@ def test_parser_ignores_authoritative_timer_window_without_hits() -> None:
 
     report = parse_upload_battle_log_text(text)
 
-    assert report["battle"]["time_source"] == "party_action_window"
+    assert report["battle"]["time_source"] == "invalid_timer_window"
     assert report["battle"]["duration_ms"] == 4000
+    assert report["battle"]["timer_window_valid"] is False
+    assert report["battle"]["clear_flag"] is False
     skill_offsets = [
         event["ts_ms_from_start"]
         for event in report["timeline_events"]
@@ -538,11 +542,13 @@ def test_live_overlay_parser_advances_official_timer_between_hits() -> None:
     first_snapshot = live.snapshot(now_ms=((10 * 60) * 60 + 5) * 1000)
     assert first_snapshot is not None
     assert first_snapshot["battle"]["duration_ms"] == 5000
+    assert first_snapshot["battle"]["official_timer_end_seen"] is False
     assert first_snapshot["participants"][0]["dps"] == 20.0
 
     later_snapshot = live.snapshot(now_ms=((10 * 60) * 60 + 15) * 1000)
     assert later_snapshot is not None
     assert later_snapshot["battle"]["duration_ms"] == 15000
+    assert later_snapshot["battle"]["official_timer_end_seen"] is False
     assert round(later_snapshot["participants"][0]["dps"], 2) == 6.67
 
 
@@ -689,7 +695,7 @@ def test_live_overlay_parser_keeps_two_phase_official_timer_open_between_game_ti
     mid_phase_snapshot = live.snapshot()
     assert mid_phase_snapshot is not None
     assert mid_phase_snapshot["battle"]["total_damage"] == 300
-    assert mid_phase_snapshot["battle"]["duration_ms"] == 50000
+    assert mid_phase_snapshot["battle"]["duration_ms"] == 60000
 
     live.feed_line(
         "[10:01:10.000] OFFICIAL_TIMER_END source=SC_GAME_MECHANICS_SYNC_CHALLENGE_COMPLETE gameId=dung02_bossrush02_03 isPass=1 passTime=70000"
@@ -874,7 +880,10 @@ def test_overlay_parser_exports_loadout_and_full_buff_events() -> None:
     assert buff_events[0]["event_key"] == "buff_chr_0023_antal_normal_fragile"
     assert buff_events[0]["start_time"] == "10:00:02.000"
     assert buff_events[0]["raw_end_time"] == "10:00:27.000"
-    assert any(segment["mode"] == "dynamic_after_delay" for segment in buff_events[0]["effect_segments"])
+    # Keep the inputs; a nominal delay does not establish its wall-clock
+    # boundary when the game timer can pause.
+    assert buff_events[0]["bb_values"]["delay_time"] == 20
+    assert buff_events[0]["effect_segments"] == []
 
 
 def test_audit_viewer_exports_loadout_and_buff_events() -> None:
@@ -968,26 +977,33 @@ def test_live_overlay_preserves_dungeon_context_across_timer_start() -> None:
     assert snapshot["battle"]["dungeon_key"] == "dung01_group_bossrush01"
 
 
-def test_damage_core_prefers_skill_element_over_dpd_bucket() -> None:
+def test_damage_core_uses_exact_unit_and_never_dpd_bucket() -> None:
     assert (
         infer_damage_element(
             "buff_chr_0028_wulfa_normal_bleed_crit_extra_damage",
             "chr_0028_wulfa",
+            action_id=4, damage_unit_index=0,
             dpd={"damageType": 2},
         )
-        == "physical"
+        == "fire"
     )
+    assert infer_damage_element('buff_chr_0028_wulfa_normal_bleed_crit_extra_damage',
+                                dpd={'damageType': 2}) is None
 
 
-def test_damage_core_maps_physical_crush_trigger_damage() -> None:
-    assert infer_damage_element("buff_common_cryst_triggered_physical_break", "chr_0003_endminf") == "physical"
-    assert infer_damage_school("buff_common_cryst_triggered_physical_break", "chr_0003_endminf") == "physical"
+def test_damage_core_requires_crush_action_and_unit_identity() -> None:
+    key = 'buff_common_cryst_triggered_physical_break'
+    assert infer_damage_element(key, action_id=0, damage_unit_index=0) == 'physical'
+    assert infer_damage_school(key, action_id=0, damage_unit_index=0) == 'physical'
+    assert infer_damage_element(key) is None
+    assert infer_damage_school(key) is None
 
 
-def test_damage_core_distinguishes_element_and_school() -> None:
-    assert infer_damage_element("chr_0025_ardelia_remain_loop_sheep", "chr_0025_ardelia") == "natural"
-    assert infer_damage_school("chr_0025_ardelia_remain_loop_sheep", "chr_0025_ardelia") == "physical"
-    assert infer_damage_school("chr_0016_laevat_normal_skill", "chr_0016_laevat") == "spell"
+def test_damage_core_school_requires_resolved_hp_unit() -> None:
+    assert infer_damage_element("chr_0025_ardelia_remain_loop_sheep", "chr_0025_ardelia") is None
+    assert infer_damage_school("chr_0025_ardelia_remain_loop_sheep", "chr_0025_ardelia") is None
+    assert infer_damage_school('chr_0016_laevat_normal_skill', action_id=36, damage_unit_index=0) == 'spell'
+    assert infer_damage_school('chr_0016_laevat_normal_skill', action_id=36, damage_unit_index=1) is None
 
 
 def test_damage_core_uses_school_for_physical_and_spell_effects() -> None:

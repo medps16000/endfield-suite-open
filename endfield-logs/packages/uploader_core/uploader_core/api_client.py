@@ -7,7 +7,7 @@ import httpx
 from uploader_core.battle_payload_builder import payload_builder_diagnostics
 
 UPLOADER_CLIENT_NAME = "EndfieldLogsUploader"
-UPLOADER_CLIENT_VERSION = "2026.08.02.1"
+UPLOADER_CLIENT_VERSION = "2026.10.15.1"
 SAFE_ACCEPT_ENCODING = "gzip, deflate"
 
 
@@ -185,6 +185,12 @@ class ApiClient:
 
     def auth_me(self) -> dict:
         return self._request("GET", "/api/auth/me", auth=True)
+
+    def get_rotations(self) -> dict:
+        return self._request("GET", "/api/rotations", auth=True)
+
+    def get_rotation_catalog(self) -> dict:
+        return self._request("GET", "/api/rotations/catalog")
 
     def logout(self) -> dict:
         return self._request("POST", "/api/auth/logout", auth=True)

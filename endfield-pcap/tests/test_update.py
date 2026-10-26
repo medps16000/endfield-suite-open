@@ -38,6 +38,10 @@ def test_remote_update_compares_version_before_build() -> None:
     assert not _is_remote_newer("2.10.1", "20260508", {"version": "2.10.0", "build": "20260509"})
     assert _is_remote_newer("2.10.0", "20260508", {"version": "2.10.0", "build": "20260509"})
     assert not _is_remote_newer("2.10.0", "20260508", {"version": "2.10.0", "build": "20260508"})
+    assert _is_remote_newer("2.10.90", "20260908", {"version": "3.0.1", "build": "20260914"})
+    assert _is_remote_newer("2.10.94-local", "20260914", {"version": "3.0.1", "build": "20260914"})
+    assert not _is_remote_newer("3.0.1", "20260914", {"version": "2.10.90", "build": "20260930"})
+    assert not _is_remote_newer("3.0.1", "20260914", {"version": "3.0.1", "build": "20260914"})
 
 
 def test_select_patch_manifest_uses_compatible_local_version_and_build() -> None:

@@ -20,6 +20,8 @@ export type HotBossRun = {
   characterName: string;
   characterProfession: string | null;
   characterAvatarUrl: string | null;
+  characterPotential?: number | null;
+  weaponRefine?: number | null;
   scorePercent?: number | null;
   contractTagScore?: number | null;
   contractTags?: ContractTag[];
@@ -42,6 +44,8 @@ export type BossRankingRow = {
   characterName: string;
   characterProfession: string;
   characterAvatarUrl: string | null;
+  characterPotential?: number | null;
+  weaponRefine?: number | null;
   accountId: string;
   accountDisplayName: string;
   dps: number;
@@ -53,6 +57,8 @@ export type BossRankingRow = {
     characterName: string;
     profession: string;
     avatarUrl: string | null;
+    characterPotential?: number | null;
+    weaponRefine?: number | null;
   }[];
   contractTagScore?: number | null;
   contractTags?: ContractTag[];
@@ -211,6 +217,10 @@ export type RoleSkillStat = {
   characterName: string;
   skillKey?: string | null;
   skillName: string;
+  displayGroupKey?: string | null;
+  displayGroupName?: string | null;
+  hitCount?: number | null;
+  maxHit?: number | null;
   castCount: number;
   totalDamage: number;
   avgDamage: number;
@@ -242,10 +252,15 @@ export type BattleDetailResponse = {
     timerEndSeen: boolean | null;
     officialTimerStartSeen: boolean | null;
     officialTimerEndSeen: boolean | null;
+    officialTimerObservedElapsedMs: number | null;
+    packetTimerElapsedMs: number | null;
+    timerIntegrityOk: boolean | null;
+    timerIntegrityReasons: string[];
     timerStartInferred: boolean | null;
     timerWindowValid: boolean | null;
     rdpsPreflightOk: boolean | null;
     rdpsStrictOk: boolean | null;
+    rdpsRankingEligible: boolean;
     rdpsPreflightBlockerCount: number | null;
     bossIdentitySource: string | null;
     dungeonContextId: string | null;
@@ -312,6 +327,7 @@ export type UserBattlesResponse = {
     totalDps: number;
     battleEndAt: string;
     rosterSummary: string[];
+    rosterEntries?: BossRankingRow["rosterEntries"];
     contractTagScore?: number | null;
     contractTags?: ContractTag[];
   }[];

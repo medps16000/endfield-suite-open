@@ -9,6 +9,7 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
     QMenu,
@@ -16,6 +17,8 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QStackedWidget,
     QSystemTrayIcon,
+    QVBoxLayout,
+    QWidget,
 )
 
 from app.auth.session_store import SessionStore
@@ -34,6 +37,7 @@ from app.services.updater import (
 )
 from app.state.store import AuthSession, BattleCandidate, UploaderStore
 from app.ui.assets import app_icon
+from app.ui.navigation_sidebar import NavigationSidebar
 from app.ui.theme import MAIN_WINDOW_STYLE
 from app.ui.views.battle_upload_view import BattleUploadView
 from app.ui.views.login_view import LoginView
@@ -137,10 +141,10 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setObjectName("mainWindow")
-        self.setWindowTitle("Endfield Logs 上传器")
+        self.setWindowTitle("Endfield Logs 客户端")
         self.setWindowIcon(app_icon())
-        self.resize(1080, 720)
-        self.setMinimumSize(980, 660)
+        self.resize(1260, 800)
+        self.setMinimumSize(1100, 700)
         self.setStyleSheet(MAIN_WINDOW_STYLE)
 
         self.session_store = SessionStore()
@@ -173,7 +177,25 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.login_view)
         self.stack.addWidget(self.trace_import_view)
         self.stack.addWidget(self.battle_upload_view)
-        self.setCentralWidget(self.stack)
+        self.page_stack = QStackedWidget()
+        self.page_stack.setObjectName("workspacePages")
+        self.page_stack.addWidget(self.stack)
+        self.overlay_settings_host = QWidget()
+        self.overlay_settings_host.setObjectName("overlaySettingsHost")
+        self._overlay_settings_layout = QVBoxLayout(self.overlay_settings_host)
+        self._overlay_settings_layout.setContentsMargins(0, 0, 0, 0)
+        self.overlay_settings_view: QWidget | None = None
+        self.page_stack.addWidget(self.overlay_settings_host)
+        shell = QWidget()
+        shell.setObjectName("desktopWorkspace")
+        shell_layout = QHBoxLayout(shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+        self.sidebar = NavigationSidebar()
+        self.sidebar.page_requested.connect(self.show_workspace_page)
+        shell_layout.addWidget(self.sidebar)
+        shell_layout.addWidget(self.page_stack, 1)
+        self.setCentralWidget(shell)
 
         self._status_user_label = QLabel("账号：未登录")
         self._status_file_label = QLabel("文件：未选择")
@@ -452,6 +474,28 @@ class MainWindow(QMainWindow):
         self._status_user_label.setText(f"账号：{nickname}")
         self._status_file_label.setText(f"文件：{file_name}")
         self._status_phase_label.setText(f"阶段：{phase}")
+        self.sidebar.set_monitoring(bool(self._managed_log_path))
+
+    def set_overlay_settings_view(self, page: QWidget) -> None:
+        """Install native settings without replacing the current battle workflow."""
+        if page is self.overlay_settings_view:
+            return
+        if self.overlay_settings_view is not None:
+            self._overlay_settings_layout.removeWidget(self.overlay_settings_view)
+            self.overlay_settings_view.hide()
+            self.overlay_settings_view.setParent(None)
+        self.overlay_settings_view = page
+        self._overlay_settings_layout.addWidget(page)
+
+    def show_workspace_page(self, page: str) -> None:
+        if page not in {"battle", "overlays"}:
+            raise ValueError("Unsupported workspace page")
+        self.page_stack.setCurrentWidget(self.stack if page == "battle" else self.overlay_settings_host)
+        self.sidebar.set_current_page(page)
+        if page == "overlays" and self.overlay_settings_view is not None:
+            activated = getattr(self.overlay_settings_view, "on_activated", None)
+            if callable(activated):
+                activated()
 
     def _set_server_status(self, message: str, *, error: bool = False) -> None:
         if error:

@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     session_cookie_secure: bool | None = None
     auth_debug_code_enabled: bool | None = None
     expose_api_docs: bool | None = None
+    rotations_enabled: bool = False
     smtp_host: str = ""
     smtp_port: int = 465
     smtp_username: str = ""

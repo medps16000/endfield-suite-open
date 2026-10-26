@@ -206,11 +206,11 @@ def test_trace_import_view_extracts_dropped_log_path() -> None:
     mime_data = QMimeData()
     mime_data.setUrls(
         [
-            QUrl.fromLocalFile("D:/newproject/logs/endfield_battle3.txt"),
-            QUrl.fromLocalFile("D:/newproject/logs/endfield_battle3.log"),
+            QUrl.fromLocalFile("C:/path/to/endfield-suite/logs/endfield_battle3.txt"),
+            QUrl.fromLocalFile("C:/path/to/endfield-suite/logs/endfield_battle3.log"),
         ]
     )
-    assert TraceImportView.extract_log_file_path(mime_data) == "D:/newproject/logs/endfield_battle3.log"
+    assert TraceImportView.extract_log_file_path(mime_data) == "C:/path/to/endfield-suite/logs/endfield_battle3.log"
 
 
 def test_trace_import_view_progress_roundtrip() -> None:
@@ -497,7 +497,7 @@ def test_settings_store_migrates_frozen_defaults_to_public_domain(tmp_path, monk
     assert loaded.api_base_url == "https://zmdlogs.com"
     assert loaded.web_base_url == "https://zmdlogs.com"
 
-    store.save_settings(UploaderSettings(api_base_url="http://zmdlogs.com", web_base_url="http://zmdlogs.com"))
+    store.save_settings(UploaderSettings(api_base_url="http://192.0.2.10", web_base_url="http://192.0.2.10"))
     migrated = store.load_settings()
     assert migrated.api_base_url == "https://zmdlogs.com"
     assert migrated.web_base_url == "https://zmdlogs.com"
@@ -567,7 +567,7 @@ def test_main_window_status_bar_boots(monkeypatch) -> None:
     monkeypatch.setattr("app.ui.main_window.ApiClient.healthcheck", lambda self: {"status": "ok"})
     app = QApplication.instance() or QApplication([])
     window = MainWindow()
-    assert window.windowTitle() == "Endfield Logs 上传器"
+    assert window.windowTitle() == "Endfield Logs 客户端"
     assert window.windowIcon().isNull() is False
     assert window._status_user_label.text().startswith("账号：")
     assert window._status_file_label.text().startswith("文件：")

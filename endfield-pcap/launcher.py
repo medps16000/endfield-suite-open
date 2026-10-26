@@ -14,6 +14,7 @@ def _bootstrap_paths() -> None:
         base_dir / "src",
         base_dir / "packages" / "parser_core",
         base_dir / "packages" / "uploader_core",
+        base_dir.parent / "endfield-logs" / "apps" / "uploader",
     ]
     for candidate in candidates:
         candidate_str = str(candidate)
@@ -146,6 +147,20 @@ def _prepare_default_launch() -> int | None:
 
 
 def run() -> int:
+    # All desktop roles share this frozen executable and one dependency tree.
+    # Dispatch before the default game/capture/update path: an offline verifier
+    # or uploader must never start capture as a side effect.
+    if len(sys.argv) > 1 and sys.argv[1] in {"--uploader", "--detector"}:
+        role = sys.argv.pop(1)
+        if role == "--uploader":
+            os.environ["ENDFIELD_UPLOADER_SKIP_UPDATE_CHECK"] = "1"
+            os.environ["ENDFIELD_LOGS_MANAGED_BY_CLIENT"] = "1"
+            from app.main import main as uploader_main
+
+            return int(uploader_main() or 0)
+        from endfield_pcap.diagnostic import run_detector_app
+
+        return int(run_detector_app() or 0)
     default_launch = len(sys.argv) == 1
     if default_launch:
         early_exit = _prepare_default_launch()

@@ -7,6 +7,8 @@ import {
   type BattleExportData,
 } from "../../../../lib/endaxis-project";
 import { EndaxisPreload } from "./endaxis-preload";
+import { RotationsUnavailable } from "../../../../components/rotations-unavailable";
+import { ROTATIONS_ENABLED } from "../../../../lib/feature-flags";
 
 type AxisEditorPageProps = {
   params: Promise<{ battleId: string }>;
@@ -15,6 +17,7 @@ type AxisEditorPageProps = {
 export const dynamic = "force-dynamic";
 
 export default async function BattleAxisEditorPage({ params }: AxisEditorPageProps) {
+  if (!ROTATIONS_ENABLED) return <RotationsUnavailable />;
   const { battleId } = await params;
 
   // 版本门禁先行：模拟器需要完整数据（施法序列 + 技力回复信号，v34+）。导出 422（无 casts）

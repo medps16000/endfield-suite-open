@@ -69,6 +69,7 @@ def parse_upload_battle_log_text(
     last_hit_hint: str | None = None,
     reference_date: date | None = None,
     loadout_override_by_char: dict[str, dict] | None = None,
+    critical_attributes_override_by_actor: dict[str, dict] | None = None,
 ) -> dict[str, Any]:
     return parse_raw_battle_log_text(
         text,
@@ -77,6 +78,7 @@ def parse_upload_battle_log_text(
         last_hit_hint=last_hit_hint,
         reference_date=reference_date,
         loadout_override_by_char=loadout_override_by_char,
+        critical_attributes_override_by_actor=critical_attributes_override_by_actor,
     )
 
 
@@ -85,56 +87,7 @@ def parse_hit_viewer_log_text(
     *,
     file_name: str | None = None,
 ) -> dict[str, Any]:
-    report = parse_hit_debug_log_text(text, file_name=file_name)
-    raw_report = parse_raw_battle_log_text(
-        text,
-        file_name=file_name,
-        include_rdps_debug=True,
-    )
-    debug_hits = raw_report.get("debug_hits") if isinstance(raw_report, dict) else None
-    if not isinstance(debug_hits, list):
-        return report
-
-    by_seq = {
-        int(hit.get("seq")): hit
-        for hit in debug_hits
-        if isinstance(hit, dict) and hit.get("seq") is not None
-    }
-    ordered_hits = [hit for hit in debug_hits if isinstance(hit, dict)]
-    for index, viewer_hit in enumerate(report.get("hits") or []):
-        if not isinstance(viewer_hit, dict):
-            continue
-        raw_hit = by_seq.get(int(viewer_hit.get("seq") or 0))
-        if raw_hit is None and not by_seq and index < len(ordered_hits):
-            raw_hit = ordered_hits[index]
-        if raw_hit is None:
-            continue
-        for key in (
-            "damage_school",
-            "value_source",
-            "damage_value_source",
-            "packet_hit_value",
-            "packet_raw_value",
-            "packet_final_value",
-            "overkill_damage",
-            "rdps_basis_value",
-            "rdps_basis_source",
-            "rdps_contributions",
-            "zones",
-            "ignored_effects",
-            "product_external_multiplier",
-            "attacker_share",
-            "external_pool",
-            "external_sources",
-            "zone_summary",
-            "buff_source_summary",
-            "packet_modifier_seen",
-            "packet_modifier_uids",
-            "packet_modifier_details",
-        ):
-            if key in raw_hit:
-                viewer_hit[key] = raw_hit.get(key)
-    return report
+    return parse_hit_debug_log_text(text, file_name=file_name)
 
 
 def parse_overlay_battle_snapshot_text(

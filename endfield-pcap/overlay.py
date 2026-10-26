@@ -5,7 +5,6 @@ Usage: python overlay.py
 
 import os, re, sys, time, threading, json, math
 import importlib.util
-import types
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from collections import OrderedDict
@@ -22,13 +21,15 @@ STATUS_FILE = os.environ.get("ENDFIELD_PCAP_STATUS_FILE", "")
 POLL_MS = 200          # UI refresh interval
 TAIL_INTERVAL = 0.15   # log tail poll (seconds)
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-OVERLAY_BUILD_LABEL = "CORE-rDPS 20260510-2000 live_bb_context_fix"
+OVERLAY_BUILD_LABEL = "CORE-rDPS 20260809-1320 official_character_catalog"
 OVERLAY_DEBUG = os.environ.get("ENDFIELD_OVERLAY_DEBUG") == "1"
 _OVERLAY_MUTEX = None
 
 
 def _acquire_single_instance_mutex() -> bool:
     global _OVERLAY_MUTEX
+    if os.environ.get("ENDFIELD_OVERLAY_ALLOW_MULTIPLE") == "1":
+        return True
     if os.name != "nt":
         return True
     kernel32 = ct.windll.kernel32
@@ -67,12 +68,17 @@ for _parser_core_path in _parser_core_paths:
         submodule_search_locations=[_pkg_dir],
     )
     if _spec:
-        _module = types.ModuleType("parser_core")
-        _module.__file__ = _pkg_init
-        _module.__path__ = [_pkg_dir]
-        _module.__package__ = "parser_core"
-        _module.__spec__ = _spec
+        # Execute the real package initializer. A hand-made empty ModuleType
+        # lets submodules import but drops package exports and can leave a
+        # partial parser package in sys.modules for later consumers.
+        _module = importlib.util.module_from_spec(_spec)
         sys.modules["parser_core"] = _module
+        try:
+            assert _spec.loader is not None
+            _spec.loader.exec_module(_module)
+        except Exception:
+            sys.modules.pop("parser_core", None)
+            raise
         break
 
 from parser_core.damage_core import (
@@ -84,6 +90,25 @@ from parser_core.damage_core import (
     infer_damage_element as core_infer_damage_element,
 )
 from parser_core.live import LiveOverlayBattleParser
+from pathlib import Path
+
+_capture_source = os.path.join(APP_DIR, "src")
+if os.path.isdir(_capture_source) and _capture_source not in sys.path:
+    sys.path.insert(0, _capture_source)
+_uploader_paths = (
+    os.path.join(APP_DIR, "packages", "uploader_core"),
+    os.path.join(os.path.dirname(APP_DIR), "endfield-logs", "packages", "uploader_core"),
+)
+for _uploader_path in _uploader_paths:
+    if os.path.isdir(_uploader_path) and _uploader_path not in sys.path:
+        sys.path.insert(0, _uploader_path)
+from endfield_pcap.rotation_client import RotationGuideController
+from endfield_pcap import rotation_client as _rotation_client
+from endfield_pcap.rotation_overlay import RotationOverlayModule
+from endfield_pcap.overlay_topics import get_overlay_broker
+from endfield_pcap.overlay_windows import OverlayWindowManager
+from endfield_pcap.overlay_control import OverlayConfigLease, attach_control_server
+from endfield_pcap.overlay_window_settings import OverlaySettingsDialog
 
 def _write_runtime_debug(extra=""):
     try:
@@ -201,6 +226,14 @@ CHAR_ELEMENTS = {
     "bounda": "natural", "meurs": "physical", "lifeng": "physical",
     "zhuangfy": "pulse", "yvonne": "cryst", "aglina": "natural",
     "mifu": "physical", "camille": "fire", "lizhiyan": "natural",
+}
+
+CHAR_TYPE_ELEMENTS = {
+    "Physical": "physical",
+    "Fire": "fire",
+    "Pulse": "pulse",
+    "Cryst": "cryst",
+    "Natural": "natural",
 }
 
 MIXED_ELEMENTS = {
@@ -338,6 +371,7 @@ RE_LOADOUT_SLOT = re.compile(
 )
 RE_LOADOUT_MAP_ENTRY = re.compile(r'\[(\d+)\]=')
 _LOADOUT_CATALOGS = None
+_CHARACTER_CATALOG_MAPS = None
 
 
 def _clean_catalog_text(value):
@@ -386,8 +420,10 @@ def _iter_json_entries(path):
     return [entry for entry in entries if isinstance(entry, dict)]
 
 
-def _load_character_name_map():
-    mapping = {}
+def _load_character_catalog_maps():
+    names = {}
+    names_by_short = {}
+    elements_by_short = {}
     for path in _data_path_candidates("local_tables", "character", "manifest.json"):
         payload = _load_json_file(path)
         if not isinstance(payload, dict):
@@ -398,10 +434,35 @@ def _load_character_name_map():
             char_id = str(entry.get("charId") or entry.get("id") or "")
             name = _clean_catalog_text(entry.get("name"))
             if char_id and name:
-                mapping[char_id] = name
-        if mapping:
+                names[char_id] = name
+                short = char_id.rsplit("_", 1)[-1].lower()
+                names_by_short[short] = name
+                element = CHAR_TYPE_ELEMENTS.get(str(entry.get("charTypeId") or ""))
+                if element:
+                    elements_by_short[short] = element
+        if names:
             break
-    return mapping
+    return names, names_by_short, elements_by_short
+
+
+def _get_character_catalog_maps():
+    global _CHARACTER_CATALOG_MAPS
+    if _CHARACTER_CATALOG_MAPS is None:
+        _CHARACTER_CATALOG_MAPS = _load_character_catalog_maps()
+    return _CHARACTER_CATALOG_MAPS
+
+
+def _load_character_name_map():
+    return _get_character_catalog_maps()[0]
+
+
+def _character_element(raw):
+    if not raw:
+        return None
+    char_key = extract_char_key(str(raw))
+    short = (char_key or str(raw)).rsplit("_", 1)[-1].lower()
+    dynamic = _get_character_catalog_maps()[2].get(short)
+    return dynamic or CHAR_ELEMENTS.get(short)
 
 
 def _load_weapon_name_map():
@@ -1187,6 +1248,59 @@ def format_elapsed(seconds):
     return f"{minutes:02d}:{sec_int:02d}.{millis:03d}"
 
 
+_BOSSRUSH_DIFFICULTY_RE = re.compile(r"^dung\d+_(?:mini)?bossrush\d+_(\d+)$")
+_BOSSRUSH_DIFFICULTY_LABELS = {
+    1: "一级",
+    2: "二级",
+    3: "三级",
+    4: "四级",
+}
+
+
+def format_overlay_dungeon_name(battle):
+    """Append a display-only difficulty label using the official stage id."""
+    dungeon_name = str((battle or {}).get("dungeon_name") or "未知场地")
+    dungeon_id = str(
+        (battle or {}).get("dungeon_context_id")
+        or (battle or {}).get("dungeon_key")
+        or ""
+    ).strip()
+    if dungeon_name in {"", "-", "未知场地", "未知副本"}:
+        return dungeon_name or "未知场地"
+
+    label = ""
+    if "takestwo" in dungeon_id:
+        label = "全功率" if dungeon_id.endswith("_hard") else "普通"
+    elif dungeon_id.startswith("indie_battletower"):
+        if dungeon_id.endswith("_ex"):
+            label = "残酷"
+        elif dungeon_id.endswith("_s"):
+            label = "困难"
+        else:
+            label = "普通"
+    elif dungeon_id.startswith("indie_hard"):
+        label = "苦难" if dungeon_id.endswith("_s") else "普通"
+    else:
+        bossrush_match = _BOSSRUSH_DIFFICULTY_RE.fullmatch(dungeon_id)
+        if bossrush_match:
+            label = _BOSSRUSH_DIFFICULTY_LABELS.get(int(bossrush_match.group(1)), "")
+
+    if not label:
+        for candidate in ("普通", "困难", "残酷", "苦难"):
+            if dungeon_name.endswith(f"·{candidate}"):
+                label = candidate
+                break
+    if not label or dungeon_name.endswith(f"[{label}]"):
+        return dungeon_name
+
+    display_name = dungeon_name
+    if label in {"普通", "困难", "残酷", "苦难"}:
+        display_name = display_name.removesuffix(f"·{label}")
+    elif label == "全功率":
+        display_name = display_name.removesuffix("全功率！")
+    return f"{display_name}[{label}]"
+
+
 SERVICE_STATE_LABELS = {
     "waiting_restart": "状态：请重启游戏",
     "waiting_game": "状态：等待游戏启动",
@@ -1268,7 +1382,7 @@ def get_damage_element(skill_name):
             if "normal_skill" in s:
                 return MIXED_ELEMENTS[char_name]["normal_skill"]
             return MIXED_ELEMENTS[char_name]["attack"]
-        elem = CHAR_ELEMENTS.get(char_name)
+        elem = _character_element(char_name)
         if elem is not None:
             return elem
     return infer_common_damage_element(skill_name)
@@ -2177,7 +2291,9 @@ def friendly_name(raw):
         return raw
     parts = raw.split("_")
     short = parts[-1] if parts else raw
-    label = CHAR_LABELS.get(short.lower())
+    char_key = extract_char_key(raw)
+    names, names_by_short, _elements_by_short = _get_character_catalog_maps()
+    label = names.get(char_key or "") or names_by_short.get(short.lower()) or CHAR_LABELS.get(short.lower())
     if label:
         return label
     return short
@@ -2444,18 +2560,21 @@ def _has_player_squad(members_blob):
     return False
 
 
-def read_latest_battle_log_slice(trace_path=None):
+def read_latest_battle_log_slice(trace_path=None, *, trace_bytes=None):
     """Return the latest battle's raw trace lines using the overlay's idle-reset
     boundary. Includes pre-hit lines after the idle gap and trims long post-hit
     idle tail (> IDLE_RESET_SEC) when present."""
     trace_path = trace_path or TRACE_FILE
-    if not os.path.exists(trace_path):
-        return [], None
-    try:
-        with open(trace_path, encoding="utf-8", errors="replace") as f:
-            lines = f.readlines()
-    except OSError:
-        return [], None
+    if trace_bytes is not None:
+        lines = trace_bytes.decode("utf-8", errors="replace").splitlines(keepends=True)
+    else:
+        if not os.path.exists(trace_path):
+            return [], None
+        try:
+            with open(trace_path, encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()
+        except OSError:
+            return [], None
     if not lines:
         return [], None
 
@@ -2657,7 +2776,10 @@ class LogTailer(threading.Thread):
         self._live_core = LiveOverlayBattleParser(
             idle_split_ms=int(IDLE_RESET_SEC * 1000),
             min_reparse_interval_ms=500,
+            align_to_data_watermark=True,
         )
+        self._tail_position = 0
+        self._tail_file_identity = None
         self._bootstrap_recent_battle()
 
     def _bootstrap_current_squad(self):
@@ -2708,7 +2830,7 @@ class LogTailer(threading.Thread):
             rs.rdps = rs.total_rd / elapsed if elapsed > 0.5 else 0.0
 
     def _live_core_rows(self):
-        report = self._live_core.snapshot()
+        report = self._live_core.snapshot(refresh=False)
         if not report:
             return None
         participants = report.get("participants") or []
@@ -2813,7 +2935,7 @@ class LogTailer(threading.Thread):
             _stats, _rdps, report = live_rows
             battle = report.get("battle") or {}
             elapsed = max(float(battle.get("duration_ms") or 0) / 1000.0, 0.0)
-            dungeon_name = str(battle.get("dungeon_name") or "未知场地")
+            dungeon_name = format_overlay_dungeon_name(battle)
             if battle.get("rdps_available") is False:
                 dungeon_name = f"{dungeon_name} / rDPS未确认"
             return {
@@ -2829,16 +2951,32 @@ class LogTailer(threading.Thread):
         """Replay the latest battle slice already present in dxg_trace.dat so
         a fresh overlay instance can immediately show the most recent fight
         even when no new lines have arrived yet."""
-        lines, _meta = read_latest_battle_log_slice()
+        try:
+            with open(TRACE_FILE, "rb") as source:
+                source_stat = os.fstat(source.fileno())
+                source_identity = (source_stat.st_dev, source_stat.st_ino)
+                raw = source.read()
+        except OSError:
+            return
+        # The cursor and the bootstrapped data must come from the same read.
+        # Rechecking EOF later would skip a restart appended during bootstrap.
+        complete_end = raw.rfind(b"\n") + 1
+        complete = raw[:complete_end]
+        lines, meta = read_latest_battle_log_slice(trace_bytes=complete)
         if not lines:
             return
+        # Retain explicit lifecycle/context lines after a completed battle too.
+        trailing = complete.decode("utf-8", errors="replace").splitlines(keepends=True)[meta["end_idx"]:]
         batch_gen = self._gen
-        for raw_line in lines:
+        for raw_line in [*lines, *trailing]:
             line = raw_line.rstrip("\r\n")
             if line:
                 self._parse(line, batch_gen)
-        self._finalize_pending_end()
-        self._flush_pending_hits(gen=batch_gen)
+        if complete_end == len(raw):
+            self._finalize_pending_end()
+            self._flush_pending_hits(gen=batch_gen)
+        self._tail_position = complete_end
+        self._tail_file_identity = source_identity
 
     def _line_time(self, line):
         m = RE_TS.search(line)
@@ -2933,45 +3071,88 @@ class LogTailer(threading.Thread):
         return list(buff.get("effects") or [])
 
     def run(self):
-        pos = 0
-        if os.path.exists(TRACE_FILE):
-            pos = os.path.getsize(TRACE_FILE)
+        pos = self._tail_position
+        partial = b""
+        snapshot_worker = None
 
-        while not self._stop.is_set():
-            try:
-                if not os.path.exists(TRACE_FILE):
-                    time.sleep(TAIL_INTERVAL)
-                    continue
-                sz = os.path.getsize(TRACE_FILE)
-                if sz < pos:
-                    pos = 0
-                if sz == pos:
-                    time.sleep(TAIL_INTERVAL)
-                    continue
-                with open(TRACE_FILE, "rb") as f:
-                    f.seek(pos)
-                    raw = f.read(sz - pos)
-                    pos = f.tell()
-                lines = raw.decode("utf-8", errors="replace").splitlines()
-                with self.lock:
-                    batch_gen = self._gen
-                for line in lines:
+        try:
+            while not self._stop.is_set():
+                try:
+                    with open(TRACE_FILE, "rb") as f:
+                        source_stat = os.fstat(f.fileno())
+                        identity = (source_stat.st_dev, source_stat.st_ino)
+                        if (self._tail_file_identity is not None and identity != self._tail_file_identity) or source_stat.st_size < pos:
+                            # A replacement/truncation is an explicit input boundary.
+                            # Never join a partial old line to the new capture.
+                            pos, partial = 0, b""
+                            self._live_core.reset()
+                            with self.lock:
+                                self._gen += 1
+                                for collection in (self.stats, self.rdps_stats, self.hit_events, self.active_buffs,
+                                        self.entity_owner, self.weapon_owner, self.current_squad, self.observed_roster,
+                                        self.enemy_damage, self.enemy_hits, self.enemy_last_t, self._pending_hits,
+                                        self._baseline_cache, self._karin_combo_uids, self._karin_combo_trigger_uids,
+                                        self._karin_combo_trigger_sources, self._last_chr_src_on_owner):
+                                    collection.clear()
+                                self.current_enemy_key = self._pending_buff = self._current_trace_t = None
+                                self._pending_buff_is_end = False
+                                self._battle_start_t = self._battle_last_t = self._trace_day_offset = 0.0
+                                self._last_trace_clock = None
+                                self._karin_combo_window_end = 0.0
+                                self._karin_combo_window_kind = self._karin_combo_window_attacker = self._karin_combo_window_source = None
+                                self._karin_combo_window_rate = 0.0
+                        self._tail_file_identity = identity
+                        f.seek(pos)
+                        raw = f.read(source_stat.st_size - pos)
+                        pos = f.tell()
+                    if not raw:
+                        if (self._live_core._dirty or self._live_core._snapshot_from_explicit_clock) and (snapshot_worker is None or not snapshot_worker.is_alive()):
+                            snapshot_worker = threading.Thread(target=self._live_core.snapshot, name="endfield-live-stats", daemon=True)
+                            snapshot_worker.start()
+                        time.sleep(TAIL_INTERVAL)
+                        continue
+                    joined = partial + raw
+                    complete_end = joined.rfind(b"\n") + 1
+                    partial = joined[complete_end:]
+                    lines = joined[:complete_end].decode("utf-8", errors="replace").splitlines()
                     with self.lock:
-                        if self._gen != batch_gen:
-                            break
-                    self._parse(line, batch_gen)
-                self._finalize_pending_end()
-                # Flush hits still waiting on a same-seq BASELINE line. This
-                # covers the first hit of a new attacker and old logs that
-                # never emitted baseline data.
-                self._flush_pending_hits(gen=batch_gen)
-            except Exception:
-                pass
-            time.sleep(TAIL_INTERVAL)
+                        batch_gen = self._gen
+                    for line in lines:
+                        with self.lock:
+                            if self._gen != batch_gen:
+                                break
+                        self._parse(line, batch_gen)
+                    if not partial:
+                        self._finalize_pending_end()
+                    # Flush hits still waiting on a same-seq BASELINE line. This
+                    # covers the first hit of a new attacker and old logs that
+                    # never emitted baseline data.
+                    if not partial:
+                        self._flush_pending_hits(gen=batch_gen)
+                    # One worker computes the shared report while the reader
+                    # keeps consuming official boundaries and new damage. No
+                    # old batch jobs are queued; snapshot's generation guard
+                    # rejects a completed report from before a reset/new start.
+                    if (self._live_core._dirty or self._live_core._snapshot_from_explicit_clock) and (snapshot_worker is None or not snapshot_worker.is_alive()):
+                        snapshot_worker = threading.Thread(target=self._live_core.snapshot, name="endfield-live-stats", daemon=True)
+                        snapshot_worker.start()
+                    if os.path.getsize(TRACE_FILE) > pos:
+                        continue
+                except Exception:
+                    pass
+                time.sleep(TAIL_INTERVAL)
+        finally:
+            # stop() only signals the reader; closing the UI never waits here.
+            # Direct run() callers/tests still leave no parser work behind.
+            if snapshot_worker is not None:
+                snapshot_worker.join()
 
     def _parse(self, line, gen):
-        if self._live_core is not None:
-            self._live_core.feed_line(line)
+        with self.lock:
+            if self._gen != gen:
+                return
+            if self._live_core is not None:
+                self._live_core.feed_line(line)
         self._current_trace_t = self._line_time(line)
         bb_match = RE_BB.search(line)
         baseline_match = RE_BASELINE.search(line)
@@ -3760,7 +3941,7 @@ class LogTailer(threading.Thread):
                 if pat.match(buff["buff_id"]):
                     for cand in roster:
                         short = cand.split("_")[-1].lower()
-                        if CHAR_ELEMENTS.get(short) == elem:
+                        if _character_element(short) == elem:
                             return cand
                     break
         return buff_src_key
@@ -4405,6 +4586,101 @@ class OverlayApp:
                                   cursor="hand2", padx=12, pady=2,
                                   command=lambda: self._set_mode("RDPS"))
         self.btn_rdps.pack(side="left")
+        self.rotation_controller = RotationGuideController(Path(TRACE_FILE))
+        self.rotation_module = RotationOverlayModule(
+            self.root, self.rotation_controller, on_meter_change=self._set_meter_enabled,
+        )
+        self.window_settings = None
+        self.web_overlays = None
+        self.overlay_control = None
+        self.overlay_host_lease = None
+        self._web_host_retry = None
+        self._web_host_closing = False
+        self._web_host_busy = False
+        self._web_overlay_error = None
+        self._start_web_overlay_host()
+        point = self.rotation_module.settings["positions"].get("meter")
+        if point:
+            x = min(point[0], max(self.root.winfo_screenwidth() - self.win_w, 0))
+            y = min(point[1], max(self.root.winfo_screenheight() - self.win_h, 0))
+            self.root.geometry(f"+{x}+{y}")
+        self.root.attributes("-alpha", self.rotation_module.settings.get("meterOpacity", self.rotation_module.settings["opacity"]))
+        self.root.bind("<ButtonRelease-1>", self._finish_meter_drag)
+        tk.Button(btn_frame, text="悬浮窗设置", font=("Microsoft YaHei", 8),
+                  fg=FG_HEAD, bg=BG, bd=0, cursor="hand2",
+                  activebackground="#333355", activeforeground="#ffffff",
+                  command=self._open_settings).pack(side="right")
+        if not self.rotation_module.settings["meterEnabled"]:
+            self.root.after(0, self._minimize)
+
+    def _start_web_overlay_host(self, attempt=0):
+        self._web_host_retry = None
+        if self._web_host_closing or self.web_overlays is not None:
+            return
+        window_root = Path(os.environ.get("ENDFIELD_OVERLAY_SETTINGS_ROOT") or
+                           (Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "EndfieldPCAP" / "web-overlays"))
+        lease = None
+        try:
+            lease = OverlayConfigLease(window_root)
+            if not lease.held:
+                self._web_host_busy = True
+                delays = (200, 600, 1400)
+                if attempt < len(delays):
+                    self._web_host_retry = self.root.after(delays[attempt], lambda: self._start_web_overlay_host(attempt + 1))
+                    return
+                raise RuntimeError("悬浮窗配置正由其他客户端使用，已暂停自定义窗口启动。")
+            # An offline settings save may have completed between loading the
+            # base DPS module and acquiring this lease. Read its atomic result.
+            self.rotation_module.settings = self.rotation_module.store.load()
+            self.web_overlays = OverlayWindowManager(
+                get_overlay_broker(), window_root / "windows.json", window_root / "profiles",
+            )
+            self.overlay_host_lease = lease
+            lease = None
+            self._web_host_busy = False
+            self._web_overlay_error = None
+            if attempt:
+                settings = self.rotation_module.settings
+                self.root.attributes("-alpha", settings.get("meterOpacity", settings["opacity"]))
+                self._set_meter_enabled(settings["meterEnabled"])
+            try:
+                self.overlay_control = attach_control_server(self.web_overlays, self.rotation_module,
+                                                             lease=self.overlay_host_lease)
+            except Exception as exc:
+                print(f"悬浮窗主页面控制暂不可用：{type(exc).__name__}", file=sys.stderr)
+        except Exception as exc:
+            self._web_overlay_error = str(exc)
+            print(f"自定义悬浮窗暂不可用：{type(exc).__name__}: {exc}", file=sys.stderr)
+        finally:
+            if lease is not None:
+                lease.close()
+
+    def _set_meter_enabled(self, enabled):
+        if enabled:
+            self._restore_from_minimized()
+        else:
+            self._minimize()
+
+    def _open_settings(self):
+        if self.overlay_control is not None and self.overlay_control.request_settings():
+            return
+        if self._web_host_busy:
+            messagebox.showinfo("悬浮窗设置", "悬浮窗配置正在其他客户端使用，请从该客户端进入设置。", parent=self.root)
+            return
+        if self.web_overlays is None:
+            if self._web_overlay_error:
+                messagebox.showwarning("自定义悬浮窗", "自定义窗口未启用：" + self._web_overlay_error, parent=self.root)
+            self.rotation_module.open_settings()
+            return
+        if self.window_settings is None:
+            self.window_settings = OverlaySettingsDialog(self.web_overlays, rotation_module=self.rotation_module)
+        self.window_settings.refresh_list()
+        self.window_settings.show()
+        self.window_settings.raise_()
+        self.window_settings.activateWindow()
+
+    def _finish_meter_drag(self, _event):
+        self.rotation_module.save_meter_position(self.root.winfo_x(), self.root.winfo_y())
 
     def _on_minimize_button_press(self, event):
         self._minimize()
@@ -4523,6 +4799,9 @@ class OverlayApp:
             self._restore_from_minimized()
 
     def _restore_from_minimized(self):
+        if not self.rotation_module.settings["meterEnabled"]:
+            self._open_settings()
+            return
         mini = self._mini_window
         if mini is not None and mini.winfo_exists():
             x = mini.winfo_x() + MINI_WINDOW_SIZE - self.win_w
@@ -4565,6 +4844,20 @@ class OverlayApp:
 
     def _quit(self):
         self.tailer.stop()
+        self.rotation_controller.stop()
+        self._web_host_closing = True
+        if self._web_host_retry is not None:
+            self.root.after_cancel(self._web_host_retry)
+            self._web_host_retry = None
+        if self.overlay_control is not None:
+            self.overlay_control.close()
+        if self.window_settings is not None:
+            self.window_settings.close()
+        if self.web_overlays is not None:
+            self.web_overlays.close()
+        if self.overlay_host_lease is not None:
+            self.overlay_host_lease.close()
+        self.rotation_module.close()
         self.root.destroy()
 
     def _export_battle_log(self):
@@ -4643,6 +4936,25 @@ class OverlayApp:
         service_state = str((service_status or {}).get("state") or "")
         fatal_error = (service_status or {}).get("fatal_error")
         has_fatal_error = isinstance(fatal_error, dict)
+        try:
+            self.rotation_module.update(
+                available=bool(STATUS_FILE and service_status is not None and service_state == "live" and not has_fatal_error),
+                game_exe=str((service_status or {}).get("game_exe") or "Endfield.exe"),
+            )
+        except Exception as exc:
+            # A guide rendering/geometry failure must never stop the meter's
+            # clock update or its next scheduled refresh. Capture remains live.
+            error = (type(exc).__name__, str(exc))
+            if getattr(self, "_rotation_update_error", None) != error:
+                print(f"排轴指导条更新失败，伤害统计继续：{error[0]}: {error[1]}", file=sys.stderr)
+            self._rotation_update_error = error
+            try:
+                self.rotation_module._shown = False
+                self.rotation_module.window.hide()
+            except Exception:
+                pass
+        else:
+            self._rotation_update_error = None
         if STATUS_FILE:
             self.tailer.set_live_clock_enabled(
                 service_status is not None and service_state == "live"
@@ -4651,7 +4963,7 @@ class OverlayApp:
         if live_rows is not None:
             live_stats, live_rdps, report = live_rows
             battle = report.get("battle") or {}
-            dungeon_name = str(battle.get("dungeon_name") or "未知场地")
+            dungeon_name = format_overlay_dungeon_name(battle)
             if battle.get("rdps_available") is False:
                 dungeon_name = f"{dungeon_name} / rDPS未确认"
             status = {
@@ -4701,7 +5013,7 @@ class OverlayApp:
             stage_text = f"当前场地：{status['dungeonName']}"
             if STATUS_FILE and service_state != "live":
                 if service_status is None:
-                    state_note = "采集已断开"
+                    state_note = "采集状态未更新"
                 else:
                     state_note = service_status_text(service_status).removeprefix("状态：")
                 stage_text = f"{stage_text} · {state_note}"
@@ -4766,6 +5078,8 @@ class OverlayApp:
 
     def run(self):
         self.tailer.start()
+        if _rotation_client.ROTATION_GUIDANCE_ENABLED:
+            self.rotation_controller.start()
         self.root.after(POLL_MS, self._update)
         self.root.mainloop()
 

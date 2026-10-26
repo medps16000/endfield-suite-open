@@ -25,6 +25,8 @@ class HotBossRun(BaseModel):
     characterName: str
     characterProfession: str | None = None
     characterAvatarUrl: str | None = None
+    characterPotential: int | None = None
+    weaponRefine: int | None = None
     scorePercent: int | None = None
     contractTagScore: int | None = None
     contractTags: list[ContractTagResponse] = Field(default_factory=list)
@@ -47,6 +49,8 @@ class BossRankingRow(BaseModel):
     characterName: str
     characterProfession: str
     characterAvatarUrl: str | None = None
+    characterPotential: int | None = None
+    weaponRefine: int | None = None
     accountId: str
     accountDisplayName: str
     dps: float
@@ -63,6 +67,8 @@ class BossRankingRosterEntry(BaseModel):
     characterName: str
     profession: str
     avatarUrl: str | None = None
+    characterPotential: int | None = None
+    weaponRefine: int | None = None
 
 
 class BossProfessionUsageEntry(BaseModel):
@@ -126,6 +132,42 @@ class BossCharacterStatisticsResponse(BaseModel):
     totalSampleCount: int
     totalOutlierCount: int
     rows: list[BossCharacterStatisticsRow]
+
+
+class CharacterBossStatisticsRow(BaseModel):
+    bossSlug: str
+    bossName: str
+    dungeonName: str
+    rank: int | None = None
+    rankedCharacterCount: int
+    sampleCount: int
+    normalSampleCount: int
+    outlierCount: int
+    insufficientSamples: bool
+    lowerWhisker: float | None = None
+    p10: float | None = None
+    p25: float | None = None
+    median: float | None = None
+    p75: float | None = None
+    p90: float | None = None
+    upperWhisker: float | None = None
+    maximum: float | None = None
+    outliers: list[BossCharacterStatisticsOutlier] = Field(default_factory=list)
+
+
+class CharacterBossStatisticsResponse(BaseModel):
+    characterKey: str
+    characterName: str
+    characterProfession: str
+    characterAvatarUrl: str | None = None
+    metric: Literal["dps", "rdps"]
+    range: Literal["7d", "14d", "30d", "all"]
+    potential: Literal["0", "1-5", "all"]
+    minimumSampleCount: int
+    includedBossCount: int
+    totalSampleCount: int
+    totalOutlierCount: int
+    rows: list[CharacterBossStatisticsRow]
 
 
 class BattleRosterEntryResponse(BaseModel):
@@ -241,6 +283,10 @@ class RoleSkillStatResponse(BaseModel):
     characterName: str
     skillKey: str | None = None
     skillName: str
+    displayGroupKey: str | None = None
+    displayGroupName: str | None = None
+    hitCount: int | None = None
+    maxHit: int | None = None
     castCount: int
     totalDamage: int
     avgDamage: float
@@ -271,10 +317,16 @@ class BattleResponse(BaseModel):
     timerEndSeen: bool | None = None
     officialTimerStartSeen: bool | None = None
     officialTimerEndSeen: bool | None = None
+    officialTimerObservedElapsedMs: int | None = None
+    packetTimerElapsedMs: int | None = None
+    timerIntegrityOk: bool | None = None
+    timerIntegrityReasons: list[str] = Field(default_factory=list)
     timerStartInferred: bool | None = None
     timerWindowValid: bool | None = None
     rdpsPreflightOk: bool | None = None
     rdpsStrictOk: bool | None = None
+    # Algorithm eligibility only; clear/timer/visibility and other ranking gates remain separate.
+    rdpsRankingEligible: bool = False
     rdpsPreflightBlockerCount: int | None = None
     bossIdentitySource: str | None = None
     dungeonContextId: str | None = None
@@ -348,6 +400,7 @@ class UserBossRankingResponse(BaseModel):
     totalDps: float
     battleEndAt: str
     rosterSummary: list[str]
+    rosterEntries: list[BossRankingRosterEntry] = Field(default_factory=list)
     contractTagScore: int | None = None
     contractTags: list[ContractTagResponse] = Field(default_factory=list)
 
@@ -361,6 +414,17 @@ class PublicUserRankingsResponse(BaseModel):
     accountId: str
     accountDisplayName: str
     rankings: list[UserBossRankingResponse] = Field(default_factory=list)
+
+
+class PublicAccountSearchEntryResponse(BaseModel):
+    accountId: str
+    accountDisplayName: str
+
+
+class PublicAccountSearchResponse(BaseModel):
+    query: str
+    hasMore: bool
+    accounts: list[PublicAccountSearchEntryResponse] = Field(default_factory=list)
 
 
 class DeleteBattleResponse(BaseModel):

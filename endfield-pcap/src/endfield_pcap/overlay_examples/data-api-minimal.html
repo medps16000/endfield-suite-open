@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>效果数据最小示例</title>
+<script>
+// 手工修改这里，再重新加载此 HTML；ID 始终使用字符串。
+const CONFIG = {
+  target: 'party',            // all / party / controlled / enemy / boss
+  effectIds: [],             // 例如 ['准确 canonicalId']；空数组表示不限制效果
+  onlyGameIcons: false,
+  definitionQuery: ''         // 可选：先检索官方定义，再订阅匹配的实际观测
+};
+</script>
+<style>
+:root{color-scheme:dark;font:13px/1.6 "Microsoft YaHei",sans-serif;color:#edf2f5}
+body{margin:0;padding:14px;background:rgba(17,25,32,.94)}h1{font-size:16px;margin:0 0 6px}
+#status,#note{color:#aebfca;margin:5px 0}ul{padding:0;margin:10px 0;list-style:none}
+li{display:flex;gap:9px;padding:8px 0;border-top:1px solid #34434d;overflow-wrap:anywhere}
+img{width:28px;height:28px;object-fit:contain}small{display:block;color:#aebfca}
+</style>
+<h1>效果观测</h1>
+<div id="status" role="status">等待只读接口</div>
+<div id="note">未观测到、未知与不支持均不表示零层。</div>
+<ul id="effects"></ul>
+<script>
+(() => {
+  'use strict';
+  const api = window.endfieldOverlay;
+  const status = document.getElementById('status');
+  const note = document.getElementById('note');
+  const list = document.getElementById('effects');
+  const MAX_ROWS = 60, MAX_MATCHES = 4096, MAX_REQUEST_CHARS = 32768;
+  let stopActual = null, stopDefinitions = null, alive = true, definitionNote = '';
+  const matched = new Map();
+  const clear = message => {
+    list.replaceChildren(); status.textContent = message;
+    note.textContent = definitionNote || '未观测到、未知与不支持均不表示零层。';
+  };
+  const fail = message => { if (stopActual) stopActual(); stopActual = null; clear(message); };
+  const finite = value => typeof value === 'number' && Number.isFinite(value);
+  const stateText = state => state === 'unsupported' ? '不支持' : '未知';
+  const safeIcon = value => typeof value === 'string' &&
+    /^data:image\/(?:webp|png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(value) && value.length <= 100000;
+
+  function subscribeRequestLength(spec) {
+    // Mirrors the public bridge's full request payload. The bridge generates
+    // s/r IDs itself; reserve 32 numeric characters for each before sending.
+    const reservedId = '9'.repeat(32);
+    return JSON.stringify({op: 'subscribe', subscriptionId: 's' + reservedId,
+      topic: spec.topic, options: {filter: spec.filter || {}}, requestId: 'r' + reservedId}).length;
+  }
+
+  function currentText(row) {
+    const values = row.runtimeValues || {}, availability = row.fieldAvailability || {};
+    const parts = [];
+    for (const [key, title, unit] of [['stackCount', '层数', ''], ['remainingMs', '剩余时间', ' ms']]) {
+      parts.push(title + '：' + (availability[key]?.state === 'known' && finite(values[key])
+        ? String(values[key]) + unit : stateText(availability[key]?.state)));
+    }
+    if (availability.enabled?.state === 'known' && typeof values.enabled === 'boolean') {
+      parts.push(values.enabled ? '已启用' : '已禁用');
+    }
+    if (availability.variables?.state === 'known' && values.variables && typeof values.variables === 'object') {
+      const entries = Object.entries(values.variables);
+      for (const [key, item] of entries.slice(0, 8)) {
+        const title = key === 'rate' ? '倍率参数 rate' : key;
+        parts.push(title + '：' + (finite(item?.value) ? String(item.value) : '未知'));
+      }
+      if (entries.length > 8) parts.push('变量仅显示前 8 项');
+    } else parts.push('当前变量：' + stateText(availability.variables?.state));
+    return parts.join(' · ');
+  }
+
+  function render(envelope) {
+    if (!alive) return;
+    if (envelope.state !== 'ready' || !envelope.data) {
+      clear('订阅不可用：' + (envelope.reason || '未提供原因') + '；旧观测已清空');
+      return;
+    }
+    const data = envelope.data;
+    if (data.selectionState === 'unavailable') {
+      clear('当前目标尚未得到确认；旧观测已清空');
+      return;
+    }
+    list.replaceChildren();
+    const rows = (Array.isArray(data.effects) ? data.effects : []).filter(
+      row => (row.lifecycle?.state || row.state) === 'observed-open');
+    for (const row of rows.slice(0, MAX_ROWS)) {
+      const li = document.createElement('li'), body = document.createElement('div');
+      if (safeIcon(row.icon)) {
+        const image = document.createElement('img'); image.src = row.icon; image.alt = ''; li.append(image);
+      }
+      const title = document.createElement('div');
+      title.textContent = (row.label || row.canonicalId || row.effectId || '名称未知') +
+        ' · 目标 ' + (row.targetId || '未知');
+      const value = document.createElement('small'); value.textContent = currentText(row);
+      const lifecycle = document.createElement('small');
+      lifecycle.textContent = '观测状态：' + (row.lifecycle?.state || row.state || '未知') +
+        ' · 实际来源：' + (row.fieldAvailability?.sourceId?.state === 'known' ? row.sourceId : '未知');
+      body.append(title, value, lifecycle); li.append(body); list.append(li);
+    }
+    status.textContent = rows.length ? '已收到效果观测' :
+      data.matchingEffectCount > 0 && (data.hasMore || data.projectionReason)
+        ? '当前页没有可展示的开放观测；结果不完整' : '当前没有匹配的开放观测；存在性与层数仍未知';
+    note.textContent = [definitionNote,
+      rows.length > MAX_ROWS ? `仅显示前 ${MAX_ROWS} / ${rows.length} 条，结果已截断。` : '',
+      data.hasMore ? '服务端仍有本页未交付的匹配观测；当前显示不完整。' : '',
+      data.projectionReason === 'payload_budget' ? '已达到服务端消息预算；请缩小 CONFIG 目标或效果范围。' : '',
+      (data.omittedOpenCount || data.omittedClosedCount || data.projectionOmittedOpenCount ||
+        data.projectionOmittedClosedCount || data.storageOmittedOpenCount || data.storageOmittedClosedCount)
+        ? '服务端还存在省略记录。' : '',
+      (data.omittedStackingGroupCount || data.omittedUnresolvedObservationCount) ? '效果分组或未解析观测也有省略。' : '',
+      '当前值只读取 runtimeValues；不从静态配置推算层数或倒计时。'].filter(Boolean).join(' ');
+  }
+
+  function subscribeActual(ids) {
+    if (!alive) return;
+    if (stopActual) stopActual();
+    clear('等待匹配效果的实际观测');
+    const spec = { topic: 'effects.actual.v1', filter: {
+      target: CONFIG.target, effectIds: ids, onlyGameIcons: CONFIG.onlyGameIcons
+    } };
+    if (subscribeRequestLength(spec) > MAX_REQUEST_CHARS) {
+      fail('订阅请求超过 32768 字符上限（含宿主包装预算），请缩小 CONFIG 查询或 ID 列表；未订阅实际数据');
+      return;
+    }
+    stopActual = api.subscribe(spec, render);
+  }
+
+  function lookup(offset) {
+    if (stopDefinitions) stopDefinitions();
+    clear('正在加载和检索官方静态定义…');
+    let handled = false;
+    stopDefinitions = api.subscribe({ topic: 'effects.definitions.v1', filter: {
+      query: CONFIG.definitionQuery.trim(), limit: 100, offset
+    } }, envelope => {
+      if (!alive || handled) return;
+      if (envelope.state !== 'ready') {
+        if (envelope.reason === 'definitions_loading') return;
+        handled = true; fail('官方定义订阅不可用：' + (envelope.reason || '未提供原因') + '；未订阅未确认的效果'); return;
+      }
+      handled = true;
+      const data = envelope.data || {};
+      for (const row of data.definitions || []) {
+        if (typeof row.canonicalId !== 'string') continue;
+        const aliases = [row.canonicalId, row.effectId, ...(row.numericIds || [])];
+        if (!CONFIG.effectIds.length || CONFIG.effectIds.some(id => aliases.includes(id))) matched.set(row.canonicalId, row);
+      }
+      queueMicrotask(() => {
+        if (!alive) return;
+        if (stopDefinitions) stopDefinitions(); stopDefinitions = null;
+        if (matched.size > MAX_MATCHES) { fail('匹配结果超过示例上限，请缩小 CONFIG 查询'); return; }
+        if (data.hasMore) {
+          if (!Number.isInteger(data.nextOffset) || data.nextOffset <= offset) {
+            fail('定义结果受消息预算限制，查询未完成；请缩小 CONFIG 查询'); return;
+          }
+          lookup(data.nextOffset); return;
+        }
+        definitionNote = `官方定义匹配 ${matched.size} 个效果；定义来源关系不代表本场实际施放者。`;
+        note.textContent = definitionNote;
+        if (!matched.size) { clear('未找到匹配定义；未观测到不等于零层'); return; }
+        subscribeActual([...matched.keys()]);
+      });
+    });
+  }
+
+  async function start() {
+    if (!api) { fail('请通过客户端 HTML 宿主打开此文件'); return; }
+    if (!['all', 'party', 'controlled', 'enemy', 'boss'].includes(CONFIG.target) ||
+        typeof CONFIG.onlyGameIcons !== 'boolean' ||
+        !Array.isArray(CONFIG.effectIds) || CONFIG.effectIds.some(id => typeof id !== 'string' || !id || id.length > 256) ||
+        CONFIG.effectIds.length > MAX_MATCHES || typeof CONFIG.definitionQuery !== 'string' ||
+        CONFIG.definitionQuery.length > 256) { fail('CONFIG 中的 ID 或查询格式无效'); return; }
+    try {
+      const topics = await api.getTopics();
+      if (!alive) return;
+      const required = ['effects.actual.v1', ...(CONFIG.definitionQuery.trim() ? ['effects.definitions.v1'] : [])];
+      if (required.some(topic => !topics.some(row => row.topic === topic))) throw new Error('宿主缺少所需数据主题');
+      if (CONFIG.definitionQuery.trim()) lookup(0); else subscribeActual(CONFIG.effectIds);
+    } catch (error) { fail('只读接口不可用：' + String(error.message || error)); }
+  }
+  window.addEventListener('pagehide', () => { alive = false; if (stopActual) stopActual(); if (stopDefinitions) stopDefinitions(); });
+  start();
+})();
+</script>
+</html>

@@ -221,6 +221,7 @@ export default async function BossRankingPage({ params, searchParams }: BossPage
                           <CharacterAvatar
                             avatarUrl={row.characterAvatarUrl}
                             name={row.characterName}
+                            progression={{ potential: row.characterPotential, refinement: row.weaponRefine }}
                           />
                           <div>
                             <strong className="character-inline">
@@ -268,7 +269,8 @@ export default async function BossRankingPage({ params, searchParams }: BossPage
                         <div className="ranking-roster-grid">
                           {row.rosterEntries.map((entry) => (
                             <span className="ranking-roster-chip" key={`${row.battleId}-${entry.characterName}`}>
-                              <CharacterAvatar avatarUrl={entry.avatarUrl} name={entry.characterName} size="sm" />
+                              <CharacterAvatar avatarUrl={entry.avatarUrl} name={entry.characterName} size="sm"
+                                progression={{ potential: entry.characterPotential, refinement: entry.weaponRefine }} />
                               <span>{entry.characterName}</span>
                               <span
                                 className="profession-badge"

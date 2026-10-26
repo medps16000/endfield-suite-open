@@ -237,6 +237,87 @@ QMainWindow#mainWindow {
     background: #eef6ff;
     font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI";
 }
+QWidget#desktopWorkspace,
+QStackedWidget#workspacePages,
+QWidget#overlaySettingsHost {
+    background: #eff6fd;
+}
+QFrame#appSidebar {
+    background: #f8fbfe;
+    border: 0;
+    border-right: 1px solid #dbe7f2;
+    font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI";
+}
+QLabel#sidebarMark {
+    background: #153e66;
+    border-radius: 11px;
+    color: #ffffff;
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 1px;
+}
+QLabel#sidebarBrand {
+    color: #7490aa;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 1.5px;
+}
+QLabel#sidebarTitle {
+    color: #173c60;
+    font-size: 20px;
+    font-weight: 700;
+}
+QLabel#sidebarCaption {
+    color: #7d91a6;
+    font-size: 11px;
+    line-height: 1.4;
+}
+QLabel#sidebarSection {
+    color: #8b9caf;
+    font-size: 11px;
+    font-weight: 600;
+    padding-left: 9px;
+}
+QPushButton#sidebarNav {
+    text-align: left;
+    padding: 0 12px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 12px;
+    color: #57728e;
+    font-size: 14px;
+    font-weight: 600;
+}
+QPushButton#sidebarNav:hover {
+    background: #edf4fc;
+    color: #173e65;
+}
+QPushButton#sidebarNav:checked {
+    background: #173f67;
+    color: #ffffff;
+    border: 1px solid #173f67;
+}
+QPushButton#sidebarNav:focus {
+    border: 1px solid #7eafdc;
+}
+QFrame#sidebarStatusCard {
+    background: #edf5fc;
+    border: 1px solid #e0ebf6;
+    border-radius: 13px;
+}
+QLabel#sidebarStatus {
+    color: #356188;
+    font-size: 12px;
+    font-weight: 600;
+}
+QLabel#sidebarStatusHint,
+QLabel#sidebarVersion {
+    color: #8b9daf;
+    font-size: 10px;
+}
+QLabel#sidebarVersion {
+    padding-left: 9px;
+}
 QStatusBar {
     background: #f8fbfe;
     border-top: 1px solid #dbe7f2;

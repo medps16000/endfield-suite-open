@@ -33,25 +33,53 @@ body {
   margin: 0;
   padding: 0;
   min-height: 100%;
-  background:
-    radial-gradient(circle at top, rgba(209, 165, 76, 0.12), transparent 28%),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.02), transparent 220px),
-    linear-gradient(180deg, #11161d 0%, var(--bg) 240px);
+  background: var(--bg);
   color: var(--text);
   font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
   line-height: 1.5;
 }
 
-body::before {
-  content: "";
+.site-layout {
+  position: relative;
+  isolation: isolate;
+  min-height: 100dvh;
+}
+
+.site-background {
   position: fixed;
   inset: 0;
+  z-index: -1;
   pointer-events: none;
+  overflow: hidden;
+  background: #15232c;
+}
+
+.site-background > img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: center;
+  opacity: 0;
+  transition: opacity 450ms ease;
+}
+
+.site-background[data-loaded="true"] > img {
+  opacity: 1;
+}
+
+.site-background::after {
+  content: "";
+  position: absolute;
+  inset: 0;
   background:
-    linear-gradient(rgba(255, 255, 255, 0.02) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(255, 255, 255, 0.02) 1px, transparent 1px);
-  background-size: 100% 44px, 44px 100%;
-  opacity: 0.18;
+    linear-gradient(90deg, rgba(7, 15, 22, .24), rgba(7, 15, 22, .12) 50%, rgba(7, 15, 22, .24)),
+    linear-gradient(180deg, rgba(7, 15, 22, .38), rgba(7, 15, 22, .24) 45%, rgba(7, 15, 22, .58));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .site-background > img { transition: none; }
 }
 
 a {
@@ -81,7 +109,10 @@ button:disabled {
 
 .site-filing-footer {
   display: flex;
+  align-items: center;
   justify-content: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
   padding: 10px 0 2px;
   color: var(--muted);
   font-size: 13px;
@@ -99,6 +130,41 @@ button:disabled {
 .page-stack {
   display: grid;
   gap: 18px;
+}
+
+.binding-code-panel {
+  width: 100%;
+  max-width: 720px;
+  margin: 0 auto;
+}
+
+.binding-code-display {
+  display: grid;
+  gap: 12px;
+  margin: 24px 0 16px;
+}
+
+.binding-code-value {
+  width: 100%;
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--accent-strong);
+  font-family: monospace;
+  font-size: clamp(20px, 4.5vw, 30px);
+  letter-spacing: 0.05em;
+}
+
+.binding-code-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.binding-code-error {
+  color: var(--tech-red);
 }
 
 .panel {
@@ -217,7 +283,7 @@ button:disabled {
   top: 0;
   z-index: 20;
   backdrop-filter: blur(14px);
-  background: rgba(9, 11, 15, 0.86);
+  background: rgba(9, 17, 24, 0.76);
   border-bottom: 1px solid rgba(255, 255, 255, 0.05);
 }
 
@@ -807,7 +873,7 @@ button:disabled {
 .grid-cards {
   display: grid;
   gap: 16px;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 560px), 1fr));
 }
 
 .home-grid {
@@ -835,7 +901,8 @@ button:disabled {
   content: "";
   background-image: var(--boss-card-bg);
   background-position: var(--boss-card-position, center center);
-  background-size: cover;
+  background-size: var(--boss-card-size, cover);
+  background-repeat: no-repeat;
   opacity: 1;
   transform: scale(1.02);
 }
@@ -948,6 +1015,41 @@ button:disabled {
   font-weight: 800;
   line-height: 1;
 }
+
+.character-avatar-with-progression {
+  display: inline-flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  vertical-align: middle;
+}
+
+.character-progression {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  min-width: 30px;
+  padding: 1px 4px;
+  border: 1px solid rgba(222, 193, 130, 0.16);
+  border-radius: 5px;
+  background: rgba(10, 15, 21, 0.65);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.character-avatar-with-progression-md .character-progression {
+  font-size: 11px;
+}
+
+.character-progression-potential { color: #e7cc84; }
+.character-progression-refinement { color: #c7d7e8; }
+.character-progression-separator,
+.character-progression [data-unknown="true"] { color: #8493a5; }
 
 .character-inline,
 .character-link {
@@ -1685,6 +1787,11 @@ button:disabled {
 .ranking-character-cell strong,
 .ranking-metric-cell strong {
   display: block;
+}
+
+.ranking-character-cell strong.character-inline {
+  display: inline-flex;
+  white-space: nowrap;
 }
 
 .ranking-character-cell small,
@@ -3725,3 +3832,29 @@ button:disabled {
     padding-top: 0;
   }
 }
+/* Critical expectation follows the report's character filter. */
+.critical-luck-panel { min-width: 0; }
+.critical-luck-empty { padding: 24px 0 14px; }
+.critical-luck-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 20px; margin: 24px 0; }
+.critical-luck-metrics > div { display: grid; gap: 7px; }
+.critical-luck-metrics span { color: #9eaab8; font-size: 13px; }
+.critical-luck-metrics strong { font-size: clamp(18px, 2vw, 25px); font-variant-numeric: tabular-nums; }
+.critical-luck-positive { color: #68dca7; }
+.critical-luck-negative { color: #e9a88b; }
+.critical-luck-description { color: #cbd5e1; font-size: 14px; line-height: 1.7; }
+.critical-luck-percentile { color: #8cbeff; }
+.critical-luck-coverage { color: #d7bd80; font-size: 13px; }
+.critical-luck-chart { width: 100%; height: auto; display: block; margin-top: 10px; overflow: visible; }
+.critical-luck-axis { stroke: #526071; stroke-width: 1; }
+.critical-luck-area { fill: #688ad8; fill-opacity: .22; }
+.critical-luck-curve { fill: none; stroke: #799ef1; stroke-width: 2.5; stroke-linejoin: round; }
+.critical-luck-expected { stroke: #a9b2c2; stroke-width: 1.5; stroke-dasharray: 6 5; }
+.critical-luck-actual { stroke: #5be0aa; stroke-width: 2; }
+.critical-luck-tick { fill: #99a6b8; font-size: 12px; }
+.critical-luck-legend { display: flex; justify-content: center; gap: 24px; color: #becbd8; font-size: 12px; }
+.critical-luck-legend span { display: inline-flex; align-items: center; gap: 7px; }
+.critical-luck-legend i { display: inline-block; width: 18px; border-top: 2px solid; }
+.critical-luck-legend-expected { color: #a9b2c2; border-top-style: dashed !important; }
+.critical-luck-legend-actual { color: #5be0aa; }
+.critical-luck-note { font-size: 12px; line-height: 1.8; margin: 18px 0 0; }
+@media (max-width: 640px) { .critical-luck-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; } .critical-luck-chart { min-height: 150px; } .critical-luck-tick { font-size: 20px; } }

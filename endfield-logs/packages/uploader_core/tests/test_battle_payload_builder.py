@@ -50,7 +50,7 @@ def test_split_trace_post_timer_tail_does_not_cross_next_start() -> None:
     assert "10:00:07.000" not in segments[0]["content"]
 
 
-def test_split_trace_keeps_game_timer_starts_after_official_timer_stops_reporting() -> None:
+def test_split_trace_keeps_phases_together_until_explicit_boundary() -> None:
     raw = "\n".join(
         [
             "[10:00:00.000] OFFICIAL_TIMER_START source=SC_GAME_MECHANICS_SYNC_CHALLENGE_START gameId=indie_hard011_s challengeStartTs=0",
@@ -69,9 +69,14 @@ def test_split_trace_keeps_game_timer_starts_after_official_timer_stops_reportin
 
     segments = _split_trace_into_battles(raw)
 
-    assert len(segments) == 3
+    assert len(segments) == 2
     assert "HP_V2 #1" in segments[0]["content"]
     assert "HP_V2 #2" in segments[1]["content"]
+    assert "HP_V2 #3" in segments[1]["content"]
+    reset = '[10:00:16.000] GAME_INST_LEAVE source=SC_GAME_MECHANICS_SYNC_LEAVE_GAME_INST gameId=indie_hard012_s\n'
+    ended = raw.replace('[10:01:00.000]', reset + '[10:01:00.000]')
+    segments = _split_trace_into_battles(ended)
+    assert len(segments) == 3
     assert "HP_V2 #3" in segments[2]["content"]
     assert "HP_V2 #3" not in segments[1]["content"]
 

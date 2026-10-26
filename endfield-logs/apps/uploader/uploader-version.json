@@ -1,0 +1,11 @@
+{
+  "version": "2026.05.08.2",
+  "packageUrl": "/downloads/EndfieldLogsUploader-20260508-auto-updater.zip",
+  "sha256": "fc9687d0d2216e03569294b2815aca6ae8866c4ab3f91644223da6dd4c19fb47",
+  "size": 78496231,
+  "required": false,
+  "notes": [
+    "Add standalone online updater",
+    "Keep loadout equipment fill and weapon refine display fixes"
+  ]
+}

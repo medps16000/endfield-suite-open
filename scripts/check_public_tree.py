@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -72,6 +73,13 @@ def iter_files() -> list[Path]:
 
 def main() -> int:
     issues: list[str] = []
+    # Ignored local tooling may exist during development, but force-added files
+    # must not bypass the public boundary simply because traversal skips caches.
+    tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT).decode("utf-8").split("\0")
+    for name in filter(None, tracked):
+        relative = Path(name)
+        if any(part in FORBIDDEN_PATH_PARTS for part in relative.parts):
+            issues.append(f"tracked private or generated directory: {relative}")
     for path in iter_files():
         relative = path.relative_to(ROOT)
         lower_name = path.name.lower()
@@ -80,7 +88,7 @@ def main() -> int:
         if lower_name == ".env" or (lower_name.startswith(".env.") and lower_name != ".env.example"):
             issues.append(f"forbidden environment file: {relative}")
         for resource_root in RESOURCE_ROOTS:
-            if relative.parent == resource_root and relative not in ALLOWED_RESOURCE_FILES:
+            if resource_root in relative.parents and relative not in ALLOWED_RESOURCE_FILES:
                 issues.append(f"unexpected runtime resource: {relative}")
         if path.suffix.lower() in {".ico", ".png", ".webp", ".jpg", ".jpeg"}:
             continue

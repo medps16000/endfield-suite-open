@@ -30,7 +30,7 @@ import TALENT_pb2 as TALENT__pb2
 import TRIAL_CHAR_DATA_pb2 as TRIAL__CHAR__DATA__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0f\x43HAR_INFO.proto\x1a\x11\x42\x41TTLE_INFO.proto\x1a\x15\x42\x41TTLE_MGR_INFO.proto\x1a\x0f\x43HAR_TYPE.proto\x1a\x10SKILL_INFO.proto\x1a\x0cTALENT.proto\x1a\x15TRIAL_CHAR_DATA.proto\"\xbd\x05\n\tCHAR_INFO\x12\r\n\x05objid\x18\x01 \x01(\x04\x12\x12\n\ntemplateid\x18\x02 \x01(\t\x12\r\n\x05level\x18\x03 \x01(\x05\x12\x0b\n\x03\x65xp\x18\x04 \x01(\x05\x12+\n\tequip_col\x18\x05 \x03(\x0b\x32\x18.CHAR_INFO.EquipColEntry\x12\x14\n\x0cnormal_skill\x18\x07 \x01(\t\x12\x0f\n\x07is_dead\x18\x08 \x01(\x08\x12!\n\x0b\x62\x61ttle_info\x18\t \x01(\x0b\x32\x0c.BATTLE_INFO\x12\x1f\n\nskill_info\x18\n \x01(\x0b\x32\x0b.SKILL_INFO\x12-\n\nequip_suit\x18\x0b \x03(\x0b\x32\x19.CHAR_INFO.EquipSuitEntry\x12\x11\n\tweapon_id\x18\x0c \x01(\x04\x12\x10\n\x08own_time\x18\r \x01(\x03\x12\x19\n\x11\x65quip_medicine_id\x18\x0e \x01(\x05\x12\x17\n\x0fpotential_level\x18\x0f \x01(\r\x12\x17\n\x06talent\x18\x10 \x01(\x0b\x32\x07.TALENT\x12)\n\x0f\x62\x61ttle_mgr_info\x18\x11 \x01(\x0b\x32\x10.BATTLE_MGR_INFO\x12\x1d\n\tchar_type\x18\x12 \x01(\x0e\x32\n.CHAR_TYPE\x12$\n\ntrial_data\x18\x13 \x01(\x0b\x32\x10.TRIAL_CHAR_DATA\x12\x31\n\x0cpotential_cg\x18\x14 \x03(\x0b\x32\x1b.CHAR_INFO.PotentialCgEntry\x1a/\n\rEquipColEntry\x12\x0b\n\x03key\x18\x01 \x01(\x05\x12\r\n\x05value\x18\x02 \x01(\x04:\x02\x38\x01\x1a\x30\n\x0e\x45quipSuitEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x05:\x02\x38\x01\x1a\x32\n\x10PotentialCgEntry\x12\x0b\n\x03key\x18\x01 \x01(\x05\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0f\x43HAR_INFO.proto\x1a\x11\x42\x41TTLE_INFO.proto\x1a\x15\x42\x41TTLE_MGR_INFO.proto\x1a\x0f\x43HAR_TYPE.proto\x1a\x10SKILL_INFO.proto\x1a\x0cTALENT.proto\x1a\x15TRIAL_CHAR_DATA.proto\"\xbd\x06\n\tCHAR_INFO\x12\r\n\x05objid\x18\x01 \x01(\x04\x12\x12\n\ntemplateid\x18\x02 \x01(\t\x12\r\n\x05level\x18\x03 \x01(\x05\x12\x0b\n\x03\x65xp\x18\x04 \x01(\x05\x12+\n\tequip_col\x18\x06 \x03(\x0b\x32\x18.CHAR_INFO.EquipColEntry\x12\x14\n\x0cnormal_skill\x18\x07 \x01(\t\x12\x0f\n\x07is_dead\x18\x08 \x01(\x08\x12!\n\x0b\x62\x61ttle_info\x18\t \x01(\x0b\x32\x0c.BATTLE_INFO\x12\x1f\n\nskill_info\x18\n \x01(\x0b\x32\x0b.SKILL_INFO\x12-\n\nequip_suit\x18\x0b \x03(\x0b\x32\x19.CHAR_INFO.EquipSuitEntry\x12\x11\n\tweapon_id\x18\x0c \x01(\x04\x12\x10\n\x08own_time\x18\r \x01(\x03\x12\x19\n\x11\x65quip_medicine_id\x18\x0e \x01(\x05\x12\x17\n\x0fpotential_level\x18\x0f \x01(\r\x12\x17\n\x06talent\x18\x10 \x01(\x0b\x32\x07.TALENT\x12)\n\x0f\x62\x61ttle_mgr_info\x18\x11 \x01(\x0b\x32\x10.BATTLE_MGR_INFO\x12\x1d\n\tchar_type\x18\x12 \x01(\x0e\x32\n.CHAR_TYPE\x12$\n\ntrial_data\x18\x13 \x01(\x0b\x32\x10.TRIAL_CHAR_DATA\x12\x31\n\x0cpotential_cg\x18\x14 \x03(\x0b\x32\x1b.CHAR_INFO.PotentialCgEntry\x12>\n\x13potential_unlock_ts\x18\x15 \x03(\x0b\x32!.CHAR_INFO.PotentialUnlockTsEntry\x1a/\n\rEquipColEntry\x12\x0b\n\x03key\x18\x01 \x01(\x05\x12\r\n\x05value\x18\x02 \x01(\x04:\x02\x38\x01\x1a\x30\n\x0e\x45quipSuitEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x05:\x02\x38\x01\x1a\x32\n\x10PotentialCgEntry\x12\x0b\n\x03key\x18\x01 \x01(\x05\x12\r\n\x05value\x18\x02 \x01(\t:\x02\x38\x01\x1a\x38\n\x16PotentialUnlockTsEntry\x12\x0b\n\x03key\x18\x01 \x01(\x05\x12\r\n\x05value\x18\x02 \x01(\x03:\x02\x38\x01J\x04\x08\x05\x10\x06\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -43,13 +43,16 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_CHAR_INFO_EQUIPSUITENTRY']._serialized_options = b'8\001'
   _globals['_CHAR_INFO_POTENTIALCGENTRY']._loaded_options = None
   _globals['_CHAR_INFO_POTENTIALCGENTRY']._serialized_options = b'8\001'
+  _globals['_CHAR_INFO_POTENTIALUNLOCKTSENTRY']._loaded_options = None
+  _globals['_CHAR_INFO_POTENTIALUNLOCKTSENTRY']._serialized_options = b'8\001'
   _globals['_CHAR_INFO']._serialized_start=134
-  _globals['_CHAR_INFO']._serialized_end=835
-  _globals['_CHAR_INFO_EQUIPCOLENTRY']._serialized_start=686
-  _globals['_CHAR_INFO_EQUIPCOLENTRY']._serialized_end=733
-  _globals['_CHAR_INFO_EQUIPSUITENTRY']._serialized_start=735
-  _globals['_CHAR_INFO_EQUIPSUITENTRY']._serialized_end=783
-  _globals['_CHAR_INFO_POTENTIALCGENTRY']._serialized_start=785
-  _globals['_CHAR_INFO_POTENTIALCGENTRY']._serialized_end=835
+  _globals['_CHAR_INFO']._serialized_end=963
+  _globals['_CHAR_INFO_EQUIPCOLENTRY']._serialized_start=750
+  _globals['_CHAR_INFO_EQUIPCOLENTRY']._serialized_end=797
+  _globals['_CHAR_INFO_EQUIPSUITENTRY']._serialized_start=799
+  _globals['_CHAR_INFO_EQUIPSUITENTRY']._serialized_end=847
+  _globals['_CHAR_INFO_POTENTIALCGENTRY']._serialized_start=849
+  _globals['_CHAR_INFO_POTENTIALCGENTRY']._serialized_end=899
+  _globals['_CHAR_INFO_POTENTIALUNLOCKTSENTRY']._serialized_start=901
+  _globals['_CHAR_INFO_POTENTIALUNLOCKTSENTRY']._serialized_end=957
 # @@protoc_insertion_point(module_scope)
-

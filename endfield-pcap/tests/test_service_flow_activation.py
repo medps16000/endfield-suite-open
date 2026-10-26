@@ -1,7 +1,8 @@
+import asyncio
 from collections import defaultdict, deque
 
 from endfield_pcap.flow import TcpStreamReassembler
-from endfield_pcap.models import CapturedPacket, Endpoint, FlowKey, RuntimeMetrics
+from endfield_pcap.models import CapturedPacket, Endpoint, FlowKey, RuntimeMetrics, ServiceState
 from endfield_pcap.service import DamageLogService, SessionPipeline
 
 
@@ -11,11 +12,40 @@ def _service_shell() -> DamageLogService:
     return service
 
 
+def test_packet_backlog_yields_to_status_tasks_without_reordering():
+    async def exercise():
+        service = _service_shell()
+        flow = FlowKey(client=Endpoint('127.0.0.1', 50000), server=Endpoint('127.0.0.2', 30000))
+        service.state = ServiceState.LIVE
+        service.active_flow = flow
+        processed = []
+        service.active_session = type('Session', (), {
+            'is_live': False,
+            'process_packet': lambda self, packet: processed.append(packet.seq),
+        })()
+        service.packet_queue = asyncio.Queue()
+        for number in range(100):
+            service.packet_queue.put_nowait(CapturedPacket(
+                timestamp_ms=number, src=flow.client, dst=flow.server,
+                seq=number, payload=b'x', device_name='fixture'))
+        task = asyncio.create_task(service._packet_loop())
+        try:
+            await asyncio.sleep(0)
+            assert 0 < len(processed) < 100
+            while len(processed) < 100:
+                await asyncio.sleep(0)
+            assert processed == list(range(100))
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    asyncio.run(exercise())
+
+
 def test_flow_activation_falls_back_to_process_connection_without_buffered_packets() -> None:
     service = _service_shell()
     flow = FlowKey(
         client=Endpoint("192.168.0.105", 57874),
-        server=Endpoint("198.51.100.224", 30000),
+        server=Endpoint("47.123.190.224", 30000),
     )
 
     assert service._ready_to_activate_flow(flow) is False
@@ -26,7 +56,7 @@ def test_flow_activation_keeps_buffered_bidirectional_reason_when_available() ->
     service = _service_shell()
     flow = FlowKey(
         client=Endpoint("192.168.0.105", 57874),
-        server=Endpoint("198.51.100.224", 30000),
+        server=Endpoint("47.123.190.224", 30000),
     )
     service.pending_packets[flow].append(
         CapturedPacket(
@@ -67,7 +97,7 @@ def test_live_flow_keeps_existing_capture_handles_to_preserve_tcp_stream() -> No
     service = _service_shell()
     service.active_flow = FlowKey(
         client=Endpoint("192.168.0.105", 57874),
-        server=Endpoint("198.51.100.224", 30000),
+        server=Endpoint("47.123.190.224", 30000),
     )
     service.active_session = SessionSpy()
     service.capture_manager = CaptureManagerSpy()
@@ -82,7 +112,7 @@ def test_live_flow_keeps_existing_capture_handles_to_preserve_tcp_stream() -> No
 def test_tcp_gap_is_reported_without_debug_capture_enabled() -> None:
     flow = FlowKey(
         client=Endpoint("192.168.0.105", 57874),
-        server=Endpoint("198.51.100.224", 30000),
+        server=Endpoint("47.123.190.224", 30000),
     )
     pipeline = SessionPipeline.__new__(SessionPipeline)
     pipeline.flow = flow

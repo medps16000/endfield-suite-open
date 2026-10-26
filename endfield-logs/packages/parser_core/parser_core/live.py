@@ -81,6 +81,7 @@ class LiveOverlayBattleParser:
         idle_split_ms: int = 30_000,
         max_lines: int = 30_000,
         min_reparse_interval_ms: int = 0,
+        align_to_data_watermark: bool = False,
     ) -> None:
         self.idle_split_ms = idle_split_ms
         self.max_lines = max_lines
@@ -88,6 +89,9 @@ class LiveOverlayBattleParser:
         # this so at most one re-parse runs per interval. 0 keeps every
         # snapshot() call exact for batch/test callers.
         self.min_reparse_interval_ms = min_reparse_interval_ms
+        # DPS consumers can publish elapsed time at the same processed log
+        # watermark as damage, even when their consumer is behind wall time.
+        self._align_to_data_watermark = bool(align_to_data_watermark)
         self._last_parse_monotonic: float | None = None
         self._force_reparse = False
         self._lines: list[str] = []
@@ -99,7 +103,10 @@ class LiveOverlayBattleParser:
         self._official_timer_game_id = ""
         self._hit_count = 0
         self._snapshot: dict[str, Any] | None = None
+        self._snapshot_from_explicit_clock = False
         self._dirty = False
+        self._revision = 0
+        self._generation = 0
         self._closed_by_timer_end = False
         self._closed_by_official_timer_end = False
         self._live_clock_enabled = True
@@ -107,6 +114,8 @@ class LiveOverlayBattleParser:
 
     def reset(self) -> None:
         with self._lock:
+            self._revision += 1
+            self._generation += 1
             self._lines.clear()
             self._last_clock_ms = None
             self._day_offset_ms = 0
@@ -116,6 +125,7 @@ class LiveOverlayBattleParser:
             self._official_timer_game_id = ""
             self._hit_count = 0
             self._snapshot = None
+            self._snapshot_from_explicit_clock = False
             self._dirty = False
             self._closed_by_timer_end = False
             self._closed_by_official_timer_end = False
@@ -123,12 +133,13 @@ class LiveOverlayBattleParser:
             self._force_reparse = False
 
     def set_live_clock_enabled(self, enabled: bool) -> None:
-        """Choose whether an open battle may advance from the local wall clock."""
+        """Allow wall-clock advancement; data-watermark alignment still wins."""
         with self._lock:
             enabled = bool(enabled)
             if self._live_clock_enabled == enabled:
                 return
             self._live_clock_enabled = enabled
+            self._revision += 1
             self._dirty = True
             self._force_reparse = True
 
@@ -156,6 +167,7 @@ class LiveOverlayBattleParser:
         is_timer_end = bool(_OFFICIAL_TIMER_END_RE.search(raw_line)) or bool(_TIMER_END_RE.search(raw_line))
 
         with self._lock:
+            self._revision += 1
             if clock_ms is not None:
                 if self._last_clock_ms is not None and clock_ms + 300_000 < self._last_clock_ms:
                     self._day_offset_ms += _DAY_MS
@@ -170,11 +182,13 @@ class LiveOverlayBattleParser:
                     and abs_ms - self._last_hit_abs_ms > self.idle_split_ms
                 ):
                     self._lines = _preserved_context_lines(self._lines)
+                    self._generation += 1
                     self._last_hit_abs_ms = None
                     self._hit_count = 0
 
             if is_timer_start:
                 self._lines = _preserved_context_lines(self._lines)
+                self._generation += 1
                 self._last_hit_abs_ms = None
                 self._official_timer_active = is_official_timer_start
                 self._official_timer_start_abs_ms = abs_ms if is_official_timer_start and abs_ms is not None else None
@@ -191,6 +205,7 @@ class LiveOverlayBattleParser:
             if is_hit and abs_ms is not None:
                 if self._closed_by_timer_end and not self._closed_by_official_timer_end:
                     self._lines = _preserved_context_lines(self._lines)
+                    self._generation += 1
                     self._last_hit_abs_ms = None
                     self._official_timer_active = False
                     self._hit_count = 0
@@ -204,6 +219,7 @@ class LiveOverlayBattleParser:
                         and abs_ms - self._last_hit_abs_ms > self.idle_split_ms
                     ):
                         self._lines = _preserved_context_lines(self._lines)
+                        self._generation += 1
                         self._official_timer_active = False
                         self._hit_count = 0
                         self._snapshot = None
@@ -243,7 +259,7 @@ class LiveOverlayBattleParser:
             or self._closed_by_timer_end
         ):
             return None
-        if now_ms is None and not self._live_clock_enabled:
+        if now_ms is None and (self._align_to_data_watermark or not self._live_clock_enabled):
             if self._last_clock_ms is None:
                 return None
             now_clock_ms = self._last_clock_ms
@@ -273,20 +289,36 @@ class LiveOverlayBattleParser:
         parts.append(f"elapsedMs={elapsed_ms}")
         return " ".join(parts) + "\n"
 
-    def snapshot(self, now_ms: int | None = None) -> dict[str, Any] | None:
+    def snapshot(self, now_ms: int | None = None, *, refresh: bool = True) -> dict[str, Any] | None:
+        """Return the shared report; explicit ``now_ms`` is an observer clock.
+
+        In data-watermark mode, normal calls use only the last processed log
+        timestamp. An explicit observer parameter retains its existing clock
+        semantics and must not become the cached time for later normal calls.
+        """
         with self._lock:
+            # UI readers use the latest completed shared-parser result. The
+            # log consumer refreshes it; rendering must not run a full replay.
+            if not refresh:
+                return self._snapshot
+            if (self._align_to_data_watermark and now_ms is None
+                    and not self._dirty and not self._snapshot_from_explicit_clock):
+                return self._snapshot
             live_timer_line = self._live_timer_snapshot_line(now_ms)
             if not self._dirty and live_timer_line is None:
                 return self._snapshot
             if (
                 self.min_reparse_interval_ms > 0
                 and not self._force_reparse
+                and not (self._align_to_data_watermark and now_ms is None
+                         and self._snapshot_from_explicit_clock)
                 and self._snapshot is not None
                 and self._last_parse_monotonic is not None
                 and (time.monotonic() - self._last_parse_monotonic) * 1000.0 < self.min_reparse_interval_ms
             ):
                 return self._snapshot
             text = "".join(self._lines)
+            revision, generation = self._revision, self._generation
             if live_timer_line is not None:
                 text += live_timer_line
         try:
@@ -294,17 +326,25 @@ class LiveOverlayBattleParser:
         except Exception:
             LOGGER.exception("live overlay parser failed; dropping stale snapshot")
             with self._lock:
+                if generation != self._generation:
+                    return self._snapshot
                 self._snapshot = None
+                self._snapshot_from_explicit_clock = False
                 # The same unchanged input must not be reparsed on every UI
                 # read. A later trace line marks the parser dirty again and
                 # preserves the original failure in logs without flooding it.
-                self._dirty = False
-                self._force_reparse = False
+                if revision == self._revision:
+                    self._dirty = False
+                    self._force_reparse = False
                 self._last_parse_monotonic = time.monotonic()
                 return None
         with self._lock:
+            if generation != self._generation:
+                return self._snapshot
             self._snapshot = snapshot
-            self._dirty = False
-            self._force_reparse = False
+            self._snapshot_from_explicit_clock = now_ms is not None
+            if revision == self._revision:
+                self._dirty = False
+                self._force_reparse = False
             self._last_parse_monotonic = time.monotonic()
             return self._snapshot

@@ -143,6 +143,13 @@ export function AuthNav({ currentUser: initialCurrentUser = null }: AuthNavProps
           >
             管理
           </Link>
+          <Link
+            className={`auth-menu-item${pathname === "/account/binding" ? " is-active" : ""}`}
+            href="/account/binding"
+            onClick={() => setMenuOpen(false)}
+          >
+            机器人绑定
+          </Link>
           {currentUser.isAdmin ? (
             <Link
               className={`auth-menu-item${pathname === "/admin" ? " is-active" : ""}`}

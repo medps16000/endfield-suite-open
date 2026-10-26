@@ -4,12 +4,23 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { AboutDialog } from "./about-dialog";
+import { rankingGroups } from "../features/records/ranking-groups.generated";
+import { ROTATIONS_ENABLED } from "../lib/feature-flags";
 
 const NAV_ITEMS = [
   { href: "/", label: "首页", match: (pathname: string) => pathname === "/" },
+  ...(ROTATIONS_ENABLED ? [
+    { href: "/rotations", label: "排轴", match: (pathname: string) => pathname === "/rotations" },
+  ] : []),
 ];
 
-const CLIENT_DOWNLOAD_URL = "/downloads/EndfieldLogsClient_2.10.81_20260802.zip";
+const CLIENT_DOWNLOAD_URL = "/downloads/EndfieldLogsClient_3.0.12_20261016.zip";
+
+export function SiteStatus() {
+  const pathname = usePathname();
+  if (pathname === "/" || pathname.startsWith("/character/")) return null;
+  return <div className="site-status-row"><span className="pill pill-accent">测试环境</span><span>站点当前仍为测试入口，但公开榜单、竞速记录与整场战斗报告只展示真实上传数据。</span></div>;
+}
 
 const RANKING_MENU_ITEMS = [
   {
@@ -36,28 +47,16 @@ const RANKING_MENU_ITEMS = [
   {
     href: "/boss/indie_battletower001_ex",
     label: "战争回响",
-    match: (pathname: string) => /^\/boss\/indie_battletower00[1-8]_ex$/.test(pathname),
+    match: (pathname: string) => /^\/boss\/indie_battletower0(?:0[1-9]|1[0-4])_ex$/.test(pathname),
   },
-  {
-    href: "/boss/indie_hard007_s",
-    label: "影拓丰碑1期",
-    match: (pathname: string) => /^\/boss\/indie_hard00[1-9]_s$/.test(pathname),
-  },
-  {
-    href: "/boss/indie_hard013_s",
-    label: "影拓丰碑2期",
-    match: (pathname: string) => /^\/boss\/indie_hard01[0-5]_s$/.test(pathname),
-  },
-  {
-    href: "/boss/indie_hard016_s",
-    label: "影拓丰碑3期",
-    match: (pathname: string) => /^\/boss\/indie_hard0(?:1[6-9]|2[0-1])_s$/.test(pathname),
-  },
-  {
-    href: "/boss/indie_hard022_s",
-    label: "影拓丰碑4期",
-    match: (pathname: string) => /^\/boss\/indie_hard02[2-5]_s$/.test(pathname),
-  },
+  ...rankingGroups
+    .filter((group) => group.key.startsWith("shadowPhase") && group.bosses.length > 0)
+    .map((group) => ({
+      href: `/boss/${group.bosses[0].slug}`,
+      label: group.label,
+      match: (pathname: string) => group.bosses.some((boss) =>
+        pathname === `/boss/${boss.slug}` || pathname === `/boss/${boss.slug}/statistics`),
+    })),
 ];
 
 export function SiteNavLinks() {
@@ -102,7 +101,7 @@ export function SiteNavLinks() {
           {item.label}
         </Link>
       ))}
-      <a className="nav-link" href={CLIENT_DOWNLOAD_URL}>
+      <a className="nav-link" href={CLIENT_DOWNLOAD_URL} download>
         下载客户端
       </a>
       <div className="ranking-menu" ref={rankingMenuRef}>

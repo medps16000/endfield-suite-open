@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+import copy
 from functools import lru_cache
 import json
 import os
@@ -12,6 +13,10 @@ from typing import Any
 try:
     from parser_core import parse_upload_battle_log_text
     from parser_core.battle_log_parser import (
+        _SQUAD_MEMBER_RE,
+        _extract_fields,
+        _parse_char_skills_line,
+        _parse_entity_stats_snapshot,
         _load_num_id_str_skill_map,
         _merge_loadout_snapshot as _parser_merge_loadout_snapshot,
         _merge_tracked_loadout_state as _parser_merge_tracked_loadout_state,
@@ -28,6 +33,10 @@ except ModuleNotFoundError:
             break
     from parser_core import parse_upload_battle_log_text
     from parser_core.battle_log_parser import (
+        _SQUAD_MEMBER_RE,
+        _extract_fields,
+        _parse_char_skills_line,
+        _parse_entity_stats_snapshot,
         _load_num_id_str_skill_map,
         _merge_loadout_snapshot as _parser_merge_loadout_snapshot,
         _merge_tracked_loadout_state as _parser_merge_tracked_loadout_state,
@@ -38,6 +47,7 @@ except ModuleNotFoundError:
     )
 
 from uploader_core.log_integrity import load_raw_log_integrity
+from parser_core.critical_context import update_critical_observation
 
 _TIMESTAMP_RE = re.compile(r"^\[(\d{2}):(\d{2}):(\d{2})\.(\d{3})\]")
 _GAME_TIMER_END_ELAPSED_RE = re.compile(r"\bGAME_TIMER_END\b.*?\belapsedMs=(\d+).*?\bsane=(\d+)")
@@ -45,8 +55,7 @@ _OFFICIAL_TIMER_END_ELAPSED_RE = re.compile(r"\bOFFICIAL_TIMER_END\b.*?\bpassTim
 _DAY_MS = 24 * 60 * 60 * 1000
 _IDLE_SPLIT_MS = 30_000
 _POST_TIMER_TAIL_MS = 10_000
-_TIMER_START_COALESCE_MS = 3_000
-PAYLOAD_BUILDER_VERSION = "payload-builder-2026.07.21.1"
+PAYLOAD_BUILDER_VERSION = "payload-builder-2026.10.15.1"
 _ADMIN_CANONICAL_KEY = "chr_9000_endmin"
 _ENDMIN_VARIANTS = {"chr_0002_endminm", "chr_0003_endminf"}
 _MANAGED_INCREMENTAL_TAIL_BYTES = 8 * 1024 * 1024
@@ -243,7 +252,11 @@ def _raw_text_loadout_state(raw_content: str) -> tuple[list[dict], dict[str, dic
     groups: list[dict] = []
     entries_by_key: dict[str, dict] = {}
     current_group: dict | None = None
+    squad_actor_keys: dict[str, str] = {}
     for line_index, raw_line in enumerate(raw_content.splitlines()):
+        if " SQUAD " in raw_line:
+            members = [(match.group(2), match.group(1)) for match in _SQUAD_MEMBER_RE.finditer(raw_line)]
+            squad_actor_keys = dict(members) if len({pair[0] for pair in members}) == len(members) else {}
         reason_match = re.search(r"\bLOADOUT reason=([^\s]+)", raw_line)
         if reason_match:
             current_group = {
@@ -259,9 +272,25 @@ def _raw_text_loadout_state(raw_content: str) -> tuple[list[dict], dict[str, dic
 
         snapshot: dict[str, Any] | None = None
         if " LOADOUT_STATS " in raw_line or "LOADOUT_STATS " in raw_line:
-            snapshot = _parse_loadout_stats_snapshot(raw_line)
+            snapshot = _parse_loadout_stats_snapshot(raw_line,
+                allow_bound_gem=bool(current_group and current_group.get("timestamp") == raw_line[:13]
+                    and current_group.get("reason") in {"SC_SYNC_CHAR_BAG_INFO", "SC_SELF_SCENE_INFO"}))
         elif " LOADOUT slot=" in raw_line or "LOADOUT slot=" in raw_line:
             snapshot = _parse_loadout_slot_snapshot(raw_line)
+        elif " CHAR_SKILLS " in raw_line:
+            parsed_skills = _parse_char_skills_line(raw_line)
+            if parsed_skills is not None:
+                snapshot = _parse_loadout_stats_snapshot(
+                    raw_line, loadout_context=entries_by_key.get(parsed_skills[0]),
+                    squad_actor_keys=squad_actor_keys,
+                )
+            if snapshot is not None:
+                current_group = {
+                    "ts_ms": line_index, "line_index": line_index, "timestamp": raw_line[:13],
+                    "reason": "CHAR_SKILLS", "index": len(groups),
+                    "rows": {key: dict(entries_by_key[key]) for key in set(squad_actor_keys.values()) if key in entries_by_key},
+                }
+                groups.append(current_group)
         if snapshot is None:
             continue
         char_key = str(snapshot.get("character_key") or snapshot.get("char_key") or "")
@@ -283,7 +312,7 @@ def _raw_text_loadout_state(raw_content: str) -> tuple[list[dict], dict[str, dic
             group_rows.get(char_key, {"character_key": char_key}),
             snapshot,
         )
-        entries_by_key[char_key] = _parser_merge_loadout_snapshot(
+        entries_by_key[char_key] = _parser_merge_tracked_loadout_state(
             entries_by_key.get(char_key, {}),
             snapshot,
         )
@@ -882,67 +911,38 @@ def _extend_timer_tail_end_line(
 
 
 def _merged_timer_start_records(records: list[dict]) -> list[dict]:
-    timer_start_records = [
-        record
-        for record in records
-        if record["is_official_timer_start"] or record["is_game_timer_start"]
-    ]
-    if not timer_start_records:
-        return []
-
-    official_start_records = [
-        record for record in timer_start_records if record["is_official_timer_start"]
-    ]
-
-    merged: list[dict] = []
-    for record in timer_start_records:
-        if record["is_official_timer_start"]:
+    # Packet battle-state cycles are phases while an explicit official
+    # challenge remains open. Never merge starts by elapsed-time proximity.
+    merged = []
+    active_official = None
+    active_packet = None
+    for record in records:
+        if record.get('is_boundary') and (
+                active_official is None or record.get('game_id') in (None, '', active_official[0])):
+            active_official = None
+            active_packet = None
+        if record['is_official_timer_start']:
+            identity = (record.get('game_id'), record.get('challenge_start_ts'))
+            if (active_official is not None and identity[1] not in (None, '', '0')
+                    and identity == active_official):
+                continue
+            active_official = identity
+            active_packet = None
             merged.append(record)
-            continue
-
-        marker_start_line = int(record["line_index"])
-        marker_start_ms = int(record["abs_ts_ms"])
-        previous_official = next(
-            (
-                official
-                for official in reversed(official_start_records)
-                if int(official["line_index"]) <= marker_start_line
-            ),
-            None,
-        )
-        if previous_official is not None:
-            previous_official_line = int(previous_official["line_index"])
-            next_official_line = next(
-                (
-                    int(official["line_index"])
-                    for official in official_start_records
-                    if int(official["line_index"]) > previous_official_line
-                ),
-                sys.maxsize,
-            )
-            official_end = next(
-                (
-                    timer_end
-                    for timer_end in records
-                    if timer_end["is_official_timer_end"]
-                    and previous_official_line <= int(timer_end["line_index"]) < next_official_line
-                ),
-                None,
-            )
-            if official_end is not None and marker_start_line <= int(official_end["line_index"]):
+        elif record['is_official_timer_end']:
+            if active_official is not None and record.get('game_id') == active_official[0]:
+                active_official = None
+                active_packet = None
+        elif record['is_game_timer_start']:
+            if active_official is not None:
                 continue
-            if marker_start_ms - int(previous_official["abs_ts_ms"]) <= _TIMER_START_COALESCE_MS:
+            identity = (record.get('timer_source'), record.get('timer_start_tick'))
+            if identity[1] is not None and identity == active_packet:
                 continue
-
-        previous_merged = merged[-1] if merged else None
-        if (
-            previous_merged is not None
-            and previous_merged["is_game_timer_start"]
-            and marker_start_ms - int(previous_merged["abs_ts_ms"]) <= _TIMER_START_COALESCE_MS
-        ):
-            continue
-        merged.append(record)
-
+            active_packet = identity
+            merged.append(record)
+        elif record['is_game_timer_end']:
+            active_packet = None
     return merged
 
 
@@ -950,20 +950,26 @@ def _split_trace_into_battles(raw_content: str, *, idle_split_ms: int = _IDLE_SP
     lines = raw_content.splitlines(keepends=True)
     timestamped_records: list[dict] = []
     hit_records: list[dict] = []
-    day_offset_ms = 0
-    previous_relative_ms: int | None = None
+    clock_origin_ms: int | None = None
 
     for index, line in enumerate(lines):
         parsed = _parse_line_timestamp_ms(line)
         if parsed is None:
             continue
         relative_ms, hint = parsed
-        if previous_relative_ms is not None and relative_ms < previous_relative_ms:
-            day_offset_ms += _DAY_MS
-        previous_relative_ms = relative_ms
-        absolute_ms = relative_ms + day_offset_ms
+        # Fixed time-of-day coordinates; a late observation is not a new day.
+        # Official challenge segmentation below uses explicit event order.
+        if clock_origin_ms is None:
+            clock_origin_ms = relative_ms
+        absolute_ms = clock_origin_ms + (relative_ms - clock_origin_ms) % _DAY_MS
+        timer_fields = _extract_fields(line) if any(token in line for token in ("TIMER", "GAME_INST_")) else {}
         record = {
             "line_index": index,
+            "game_id": timer_fields.get("gameId"),
+            "challenge_start_ts": timer_fields.get("challengeStartTs"),
+            "timer_source": timer_fields.get("source"),
+            "timer_start_tick": timer_fields.get("startMs"),
+            "is_boundary": any(token in line for token in ("GAME_TIMER_RESET ", "GAME_INST_RESTART ", "GAME_INST_LEAVE ")),
             "abs_ts_ms": absolute_ms,
             "hint": hint,
             "is_hit": " HP_V2 " in line,
@@ -1018,18 +1024,17 @@ def _split_trace_into_battles(raw_content: str, *, idle_split_ms: int = _IDLE_SP
                         record
                         for record in timestamped_records
                         if record["is_official_timer_end"]
+                        and record.get("game_id") == start_record.get("game_id")
                         and marker_start_line <= int(record["line_index"]) < next_start_line
                     ),
                     None,
                 )
                 if timer_end_record is None:
                     timer_end_record = next(
-                        (
-                            record
-                            for record in timestamped_records
-                            if record["is_timer_end"]
-                            and marker_start_line <= int(record["line_index"]) < next_start_line
-                        ),
+                        (record for record in timestamped_records
+                         if record.get('is_boundary')
+                         and record.get('game_id') in (None, '', start_record.get('game_id'))
+                         and marker_start_line < int(record['line_index']) < next_start_line),
                         None,
                     )
             else:
@@ -1065,6 +1070,7 @@ def _split_trace_into_battles(raw_content: str, *, idle_split_ms: int = _IDLE_SP
             segments.append(
                 {
                     "battle_index": len(segments) + 1,
+                    "start_line_index": start_line,
                     "content": content,
                     "first_hit_hint": str(battle_hits[0]["hint"]),
                     "last_hit_hint": str(battle_hits[-1]["hint"]),
@@ -1116,6 +1122,7 @@ def _split_trace_into_battles(raw_content: str, *, idle_split_ms: int = _IDLE_SP
             segments.append(
                 {
                     "battle_index": len(segments) + 1,
+                    "start_line_index": start_line,
                     "content": content,
                     "first_hit_hint": str(battle_hits[0]["hint"]),
                     "last_hit_hint": str(battle_hits[-1]["hint"]),
@@ -1155,6 +1162,7 @@ def _split_trace_into_battles(raw_content: str, *, idle_split_ms: int = _IDLE_SP
         segments.append(
             {
                 "battle_index": segment_index + 1,
+                "start_line_index": start_line,
                 "content": content,
                 "first_hit_hint": str(first_hit["hint"]),
                 "last_hit_hint": str(last_hit["hint"]),
@@ -1247,6 +1255,7 @@ def _build_payload_from_segment(
     proof: dict | None,
     raw_loadout_entries: list[dict] | None = None,
     raw_char_skill_levels: dict[str, dict[str, int]] | None = None,
+    critical_attributes_override_by_actor: dict[str, dict] | None = None,
 ) -> dict:
     loadout_override_by_char = {
         str(entry.get("char_key") or entry.get("character_key") or ""): entry
@@ -1261,6 +1270,7 @@ def _build_payload_from_segment(
         last_hit_hint=segment.get("last_hit_hint"),
         reference_date=reference_date,
         loadout_override_by_char=loadout_override_by_char,
+        critical_attributes_override_by_actor=critical_attributes_override_by_actor,
     )
     loadout_entries = _loadout_entries_with_fallback(
         proof,
@@ -1442,6 +1452,13 @@ def _build_payload_from_segment(
             "timerEndSeen": parsed["battle"].get("timer_end_seen"),
             "officialTimerStartSeen": parsed["battle"].get("official_timer_start_seen"),
             "officialTimerEndSeen": parsed["battle"].get("official_timer_end_seen"),
+            "officialTimerObservedElapsedMs": parsed["battle"].get(
+                "official_timer_observed_elapsed_ms"
+            ),
+            "packetTimerElapsedMs": parsed["battle"].get("packet_timer_elapsed_ms"),
+            "timerIntegrityOk": parsed["battle"].get("timer_integrity_ok"),
+            "timerIntegrityReasons": list(parsed["battle"].get("timer_integrity_reasons") or []),
+            "timerEvidence": parsed["battle"].get("timer_evidence"),
             "timerStartInferred": parsed["battle"].get("timer_start_inferred"),
             "timerWindowValid": parsed["battle"].get("timer_window_valid"),
             "rdpsPreflightOk": rdps_damage_basis.get("rdps_preflight_ok"),
@@ -1558,6 +1575,25 @@ def build_battle_upload_payloads_from_log(
         return []
     raw_loadout_groups, raw_loadout_fallback = _raw_text_loadout_state(raw_content)
     raw_char_skill_levels = extract_char_skill_levels_from_text(raw_content)
+    critical_overrides: dict[int, dict] = {}
+    critical_states: dict[str, dict] = {}
+    segment_starts: dict[int, list[int]] = {}
+    for segment in segments:
+        segment_starts.setdefault(int(segment["start_line_index"]), []).append(int(segment["battle_index"]))
+    for line_index, raw_line in enumerate(raw_content.splitlines()):
+        if line_index in segment_starts:
+            snapshot = copy.deepcopy(critical_states)
+            for observation in snapshot.values():
+                observation["lines"] = {attr: line - line_index for attr, line in observation["lines"].items()}
+            for index in segment_starts[line_index]:
+                critical_overrides[index] = snapshot
+        if "GAME_TIMER_RESET source=CAPTURE_SESSION_START" in raw_line:
+            critical_states.clear()
+        partial = " ENTITY_ATTR_UPDATE " in raw_line
+        parsed = _parse_entity_stats_snapshot(raw_line.replace(" ENTITY_ATTR_UPDATE ", " ENTITY_STATS ", 1) if partial else raw_line)
+        if parsed is not None and parsed[1].get("ts_ms") is not None:
+            entity_id, observation = parsed
+            update_critical_observation(critical_states, entity_id, observation, line_index + 1, partial=partial)
 
     payloads: list[dict] = []
     reverse_until_known = bool(known) and (known_battle_index is None or use_incremental_tail)
@@ -1576,6 +1612,7 @@ def build_battle_upload_payloads_from_log(
                 proof=proof,
                 raw_loadout_entries=raw_loadout_entries,
                 raw_char_skill_levels=raw_char_skill_levels,
+                critical_attributes_override_by_actor=critical_overrides.get(int(segment["battle_index"])),
             )
         except ValueError as exc:
             if "HP_V2" in str(exc):

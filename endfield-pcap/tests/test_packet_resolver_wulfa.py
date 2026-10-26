@@ -3,18 +3,18 @@ from pathlib import Path
 from endfield_pcap.packet_resolver import PacketResolveContext, PacketResolver
 
 
-def test_wulfa_runtime_fingerprint_ids_do_not_resolve_as_antal() -> None:
+def test_numeric_namespace_does_not_use_wulfa_fingerprints() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     resolver = PacketResolver(root=repo_root)
 
-    expected_owner = "chr_0028_wulfa"
-    for runtime_id in ("633", "2017", "2257", "2258"):
-        assert resolver.strong_skill_owner_by_numeric.get(runtime_id) == expected_owner
-
     assert resolver.resolve_skill(int_id=2257) == "chr_0028_wulfa_combo_2_skill"
     assert resolver.resolve_skill(int_id=2258) == "chr_0028_wulfa_combo_3_skill"
-    assert resolver.resolve_skill(int_id=2017) == "chr_0028_wulfa_skill_2017"
-    assert resolver.resolve_skill(int_id=633) == "chr_0028_wulfa_skill_633"
+    # These numbers exist in both namespaces. The packet's template type,
+    # not a character fingerprint, selects which table to read.
+    assert resolver.resolve_skill(int_id=2017) == "chr_0030_zhuangfy_plunging_attack_end"
+    assert resolver.resolve_buff(int_id=2017) == "buff_chr_0028_wulfa_combo_2_damage"
+    assert resolver.resolve_skill(int_id=633) == "chr_0011_seraph_dodge"
+    assert resolver.resolve_buff(int_id=633) == "buff_physical_airborne"
 
 
 def test_current_static_buff_table_overlays_stale_resolver_bundle() -> None:

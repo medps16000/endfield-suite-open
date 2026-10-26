@@ -47,7 +47,7 @@ def test_auto_select_still_skips_irrelevant_devices_without_ipv4() -> None:
 def test_parse_ipv4_prefers_ethernet_when_destination_mac_looks_like_ipv4() -> None:
     tcp = dpkt.tcp.TCP(sport=30000, dport=51529, seq=1, data=b"hello")
     ip = dpkt.ip.IP(
-        src=socket.inet_aton("203.0.113.47"),
+        src=socket.inet_aton("106.14.187.47"),
         dst=socket.inet_aton("192.168.0.105"),
         p=dpkt.ip.IP_PROTO_TCP,
         data=tcp,
@@ -63,6 +63,6 @@ def test_parse_ipv4_prefers_ethernet_when_destination_mac_looks_like_ipv4() -> N
     parsed = _parse_ipv4_from_capture(bytes(eth))
 
     assert parsed is not None
-    assert socket.inet_ntoa(parsed.src) == "203.0.113.47"
+    assert socket.inet_ntoa(parsed.src) == "106.14.187.47"
     assert isinstance(parsed.data, dpkt.tcp.TCP)
     assert parsed.data.data == b"hello"

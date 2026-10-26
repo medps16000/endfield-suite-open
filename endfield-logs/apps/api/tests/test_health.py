@@ -1,4 +1,6 @@
+from timer_samples import official_timer_evidence
 from copy import deepcopy
+import pytest
 from fastapi.testclient import TestClient
 from uuid import uuid4
 
@@ -12,9 +14,9 @@ from app.services.auth import DatabaseAuthService
 
 UPLOADER_CLIENT_HEADERS = {
     "X-Endfield-Uploader-Name": "EndfieldLogsUploader",
-    "X-Endfield-Uploader-Version": "2026.08.02.1",
-    "X-Endfield-Parser-Version": "raw-log-parser-v43",
-    "X-Endfield-Rules-Version": "raw-log-parser-v37",
+    "X-Endfield-Uploader-Version": "2026.10.15.1",
+    "X-Endfield-Parser-Version": "raw-log-parser-v59",
+    "X-Endfield-Rules-Version": "raw-log-parser-v44",
 }
 
 
@@ -80,8 +82,8 @@ def _upload_real_battle(
     total_damage: int = 4000000,
     contract_tag_score: int | None = None,
     contract_tags: list[dict] | None = None,
-    parser_version: str = "raw-log-parser-v43",
-    rules_version: str = "raw-log-parser-v37",
+    parser_version: str = "raw-log-parser-v59",
+    rules_version: str = "raw-log-parser-v44",
     official_timer_end_seen: bool = True,
     expected_status: int = 200,
 ) -> str:
@@ -124,7 +126,13 @@ def _upload_real_battle(
             "parserVersion": parser_version,
             "rulesVersion": rules_version,
             "timeSource": "game_timer",
+            "officialTimerStartSeen": True,
             "officialTimerEndSeen": official_timer_end_seen,
+            "officialTimerObservedElapsedMs": duration_ms + 2_000,
+            "packetTimerElapsedMs": max(duration_ms - 2_000, 1),
+            "timerIntegrityOk": True,
+            "timerIntegrityReasons": [],
+            "timerEvidence": official_timer_evidence(duration_ms, boss_slug),
             "timerWindowValid": True,
             "rdpsPreflightOk": True,
             "rdpsStrictOk": True,
@@ -175,7 +183,7 @@ def test_old_uploader_client_version_is_rejected_for_duplicate_check_and_upload(
     old_headers = {
         "Authorization": f"Bearer {session_token}",
         "X-Endfield-Uploader-Name": "EndfieldLogsUploader",
-        "X-Endfield-Uploader-Version": "2026.07.23.1",
+        "X-Endfield-Uploader-Version": "2026.09.02.1",
     }
     duplicate_response = client.post(
         "/api/uploader/battles/check-duplicate",
@@ -253,16 +261,16 @@ def test_old_or_mismatched_parser_rules_are_rejected_for_duplicate_check_and_upl
 
     old_headers = {
         **_uploader_auth_headers(session_token),
-        "X-Endfield-Parser-Version": "raw-log-parser-v41",
-        "X-Endfield-Rules-Version": "raw-log-parser-v35",
+        "X-Endfield-Parser-Version": "raw-log-parser-v48",
+        "X-Endfield-Rules-Version": "raw-log-parser-v42",
     }
     duplicate_response = client.post(
         "/api/uploader/battles/check-duplicate",
         json={
             "battleFingerprint": f"fp-old-semantics-{uuid4().hex}",
             "bossKey": "eny_0051_rodin",
-            "parserVersion": "raw-log-parser-v41",
-            "rulesVersion": "raw-log-parser-v35",
+            "parserVersion": "raw-log-parser-v48",
+            "rulesVersion": "raw-log-parser-v42",
         },
         headers=old_headers,
     )
@@ -290,8 +298,8 @@ def test_old_or_mismatched_parser_rules_are_rejected_for_duplicate_check_and_upl
                 }
             ],
             "battleFingerprint": f"fp-old-semantics-upload-{uuid4().hex}",
-            "parserVersion": "raw-log-parser-v41",
-            "rulesVersion": "raw-log-parser-v35",
+            "parserVersion": "raw-log-parser-v48",
+            "rulesVersion": "raw-log-parser-v42",
         },
         "participants": [
             {
@@ -318,15 +326,15 @@ def test_old_or_mismatched_parser_rules_are_rejected_for_duplicate_check_and_upl
 
     mismatched_headers = {
         **_uploader_auth_headers(session_token),
-        "X-Endfield-Rules-Version": "raw-log-parser-v43",
+        "X-Endfield-Rules-Version": "raw-log-parser-v46",
     }
     mismatch_response = client.post(
         "/api/uploader/battles/check-duplicate",
         json={
             "battleFingerprint": f"fp-mismatched-semantics-{uuid4().hex}",
             "bossKey": "eny_0051_rodin",
-            "parserVersion": "raw-log-parser-v43",
-            "rulesVersion": "raw-log-parser-v37",
+            "parserVersion": "raw-log-parser-v59",
+            "rulesVersion": "raw-log-parser-v44",
         },
         headers=mismatched_headers,
     )
@@ -339,6 +347,37 @@ def test_healthcheck() -> None:
     response = client.get("/healthz")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+@pytest.mark.parametrize("header_version,body_version", [("raw-log-parser-v58", "raw-log-parser-v58"),
+    ("raw-log-parser-v59", "raw-log-parser-v58"), ("raw-log-parser-v58", "raw-log-parser-v59")])
+def test_v58_parser_cannot_submit_new_duplicate_checks(header_version: str, body_version: str) -> None:
+    client = TestClient(app)
+    session_token = _register_password_user(client, email=_unique_email("parser-boundary"),
+        nickname=_unique_nickname("ParserBoundary"), password="parser-boundary-pass-123")
+    headers = {**_uploader_auth_headers(session_token), "X-Endfield-Parser-Version": header_version}
+    response = client.post("/api/uploader/battles/check-duplicate", headers=headers, json={
+        "battleFingerprint": f"fp-parser-boundary-{uuid4().hex}", "bossKey": "eny_0051_rodin",
+        "parserVersion": body_version, "rulesVersion": "raw-log-parser-v44"})
+    assert response.status_code == 426
+    assert response.json()["error"]["code"] == "upload_semantics_outdated"
+
+
+def test_saved_v58_battle_keeps_existing_dps_and_rdps_ranking_eligibility() -> None:
+    client = TestClient(app)
+    battle_id = _upload_real_battle(client)
+    with SessionLocal() as session:
+        record = session.get(UploadedBattleRecord, battle_id)
+        assert record is not None
+        record.parser_version = "raw-log-parser-v58"
+        session.commit()
+    detail = client.get(f"/api/battles/{battle_id}")
+    assert detail.status_code == 200
+    assert detail.json()["battle"]["parserVersion"] == "raw-log-parser-v58"
+    for metric in ("dps", "rdps"):
+        response = client.get(f"/api/bosses/dung01_group_bossrush01/rankings?metric={metric}")
+        assert response.status_code == 200
+        assert battle_id in {row["battleId"] for row in response.json()["rows"]}
 
 
 def test_upload_filters_roster_entries_without_participants() -> None:
@@ -381,9 +420,16 @@ def test_upload_filters_roster_entries_without_participants() -> None:
                 },
             ],
             "battleFingerprint": f"fp-roster-filter-{uuid4().hex}",
-            "parserVersion": "raw-log-parser-v43",
-            "rulesVersion": "raw-log-parser-v37",
+            "parserVersion": "raw-log-parser-v59",
+            "rulesVersion": "raw-log-parser-v44",
             "timeSource": "game_timer",
+            "officialTimerStartSeen": True,
+            "officialTimerEndSeen": True,
+            "officialTimerObservedElapsedMs": 22_000,
+            "packetTimerElapsedMs": 18_000,
+            "timerIntegrityOk": True,
+            "timerIntegrityReasons": [],
+            "timerEvidence": official_timer_evidence(20000, "dung01_group_bossrush01"),
             "timerEndSeen": True,
             "timerWindowValid": True,
             "rdpsPreflightOk": True,
@@ -831,7 +877,7 @@ def test_password_account_persists_across_auth_service_instances() -> None:
 
 def test_public_home_and_boss_endpoints() -> None:
     client = TestClient(app)
-    battle_id = _upload_real_battle(client, duration_ms=1000, total_damage=9000000)
+    battle_id = _upload_real_battle(client, duration_ms=6000, total_damage=9000000)
 
     home_response = client.get("/api/home/hot-bosses")
     assert home_response.status_code == 200
@@ -978,32 +1024,45 @@ def test_war_echo_highest_stages_have_separate_rankings_and_lower_difficulty_is_
     assert legacy_group_response.status_code == 404
 
 
-def test_high_difficulty_upload_uses_explicit_hard_stage_slug() -> None:
+@pytest.mark.parametrize("stage,name,group", [
+    ("indie_hard008_s", "怨憎雾海·苦难", "影拓丰碑1期 · 灼痛疤痕"),
+    ("indie_hard026_s", "兽影生杀·苦难", "影拓丰碑5期 · 幽影刻形"),
+    ("indie_hard027_s", "暗曜白霆·苦难", "影拓丰碑5期 · 幽影刻形"),
+    ("indie_hard028_s", "沛然轰鸣·苦难", "影拓丰碑5期 · 幽影刻形"),
+    ("indie_hard029_s", "三角定位·苦难", "影拓丰碑5期 · 幽影刻形"),
+    ("indie_hard030_s", "受缚之影·苦难", "影拓丰碑6期 · 深林呓语"),
+    ("indie_hard031_s", "相引之骸·苦难", "影拓丰碑6期 · 深林呓语"),
+    ("indie_hard032_s", "怨怒延展·苦难", "影拓丰碑6期 · 深林呓语"),
+    ("indie_hard033_s", "虫傀呼应·苦难", "影拓丰碑6期 · 深林呓语"),
+])
+def test_high_difficulty_upload_uses_explicit_hard_stage_slug(stage: str, name: str, group: str) -> None:
     client = TestClient(app)
     battle_id = _upload_real_battle(
         client,
-        boss_slug="indie_hard008_s",
+        boss_slug=stage,
         boss_key="eny_0085_hsrogue_hard",
         boss_name="断云叟",
-        dungeon_name="怨憎雾海·苦难",
+        dungeon_name=name,
         duration_ms=300000,
         total_damage=733731,
     )
 
-    boss_response = client.get("/api/bosses/indie_hard008_s/rankings?metric=dps")
+    boss_response = client.get(f"/api/bosses/{stage}/rankings?metric=dps")
     assert boss_response.status_code == 200
     boss_payload = boss_response.json()
-    assert boss_payload["bossSlug"] == "indie_hard008_s"
-    assert boss_payload["bossName"] == "怨憎雾海·苦难"
-    assert boss_payload["dungeonName"] == "影拓丰碑1期 · 灼痛疤痕"
+    assert boss_payload["bossSlug"] == stage
+    assert boss_payload["bossName"] == name
+    assert boss_payload["dungeonName"] == group
     assert any(row["battleId"] == battle_id for row in boss_payload["rows"])
 
 
-def test_high_difficulty_plain_stage_slug_does_not_enter_hard_ranking() -> None:
+@pytest.mark.parametrize("stage", ["indie_hard013", "indie_hard026", "indie_hard027", "indie_hard028", "indie_hard029",
+                                    "indie_hard030", "indie_hard031", "indie_hard032", "indie_hard033"])
+def test_high_difficulty_plain_stage_slug_does_not_enter_hard_ranking(stage: str) -> None:
     client = TestClient(app)
     battle_id = _upload_real_battle(
         client,
-        boss_slug="indie_hard013",
+        boss_slug=stage,
         boss_key="eny_0059_erhound",
         boss_name="雾火牙兽",
         dungeon_name="沉寂视界",
@@ -1011,9 +1070,65 @@ def test_high_difficulty_plain_stage_slug_does_not_enter_hard_ranking() -> None:
         total_damage=733731,
     )
 
-    boss_response = client.get("/api/bosses/indie_hard013_s/rankings?metric=dps")
+    boss_response = client.get(f"/api/bosses/{stage}_s/rankings?metric=dps")
     assert boss_response.status_code == 200
     assert not any(row["battleId"] == battle_id for row in boss_response.json()["rows"])
+
+
+@pytest.mark.parametrize("stage,name", [
+    ("dung01_group_gambling", "百趣演武"),
+    ("dungeon_gamblingdungeon01", "百趣演武"),
+])
+def test_reviewed_gambling_upload_keeps_detail_without_opening_rankings(stage: str, name: str) -> None:
+    client = TestClient(app)
+    battle_id = _upload_real_battle(client, boss_slug=stage, boss_key="eny_0051_rodin", boss_name=name,
+                                  dungeon_name=name, total_damage=733731)
+    detail = client.get(f"/api/battles/{battle_id}")
+    assert detail.status_code == 200
+    assert detail.json()["battle"]["dungeonName"] == name
+    assert detail.json()["battle"]["rdpsRankingEligible"] is False
+    assert client.get(f"/api/bosses/{stage}/rankings?metric=dps").status_code == 404
+    assert client.get(f"/api/bosses/{stage}/rankings?metric=rdps").status_code == 404
+    hot = client.get("/api/home/hot-bosses")
+    assert hot.status_code == 200
+    assert stage not in {row["bossSlug"] for row in hot.json()}
+
+
+def test_new_si_bossrush_upload_uses_the_official_series_ranking() -> None:
+    client = TestClient(app)
+    battle_id = _upload_real_battle(client, boss_slug="dung02_bossrush04_03", boss_key="eny_0134_jsspsi",
+                                  boss_name="祀", dungeon_name="危境祸影·祀", total_damage=733731)
+    response = client.get("/api/bosses/dung02_group_bossrush04/rankings?metric=dps")
+    assert response.status_code == 200
+    assert response.json()["bossName"] == "危境再现·祀"
+    assert battle_id in {row["battleId"] for row in response.json()["rows"]}
+
+
+@pytest.mark.parametrize("stage,name", [
+    ("indie_battletower015_ex", "蚀影记录：雷声·残酷"),
+    ("indie_battletower016_ex", "长刃记录：应龙·残酷"),
+    ("indie_battletower017_ex", "复仇记录：碾骨·残酷"),
+    ("indie_battletower018_ex", "兽群记录：清波寨·残酷"),
+    ("indie_battletower019_ex", "造物记录：傀·残酷"),
+    ("indie_battletower020_ex", "防卫记录：盾片·残酷"),
+])
+def test_new_war_echo_rankings_have_official_names(stage: str, name: str) -> None:
+    response = TestClient(app).get(f"/api/bosses/{stage}/rankings?metric=dps")
+    assert response.status_code == 200
+    assert response.json()["bossName"] == name
+
+
+def test_new_war_echo_uploads_keep_hard_and_cruel_separate() -> None:
+    client = TestClient(app)
+    cruel = _upload_real_battle(client, boss_slug="indie_battletower015_ex", boss_key="eny_0120_klbear_tower015",
+                               boss_name="蚀影记录：雷声·残酷", dungeon_name="战争回响", total_damage=733731)
+    hard = _upload_real_battle(client, boss_slug="indie_battletower015_s", boss_key="eny_0120_klbear_tower015",
+                              boss_name="蚀影记录：雷声·困难", dungeon_name="战争回响", total_damage=733731)
+    response = client.get("/api/bosses/indie_battletower015_ex/rankings?metric=dps")
+    assert response.status_code == 200
+    ids = {row["battleId"] for row in response.json()["rows"]}
+    assert cruel in ids and hard not in ids
+    assert client.get(f"/api/battles/{hard}").status_code == 200
 
 
 def test_high_difficulty_legacy_enemy_key_without_stage_is_rejected() -> None:
@@ -1116,7 +1231,7 @@ def test_high_difficulty_legacy_raw_enemy_name_without_stage_is_rejected() -> No
 
 def test_public_battle_detail_and_share_summary() -> None:
     client = TestClient(app)
-    battle_id = _upload_real_battle(client, duration_ms=1100, total_damage=8500000)
+    battle_id = _upload_real_battle(client, duration_ms=7000, total_damage=8500000)
 
     detail_response = client.get(f"/api/battles/{battle_id}")
     assert detail_response.status_code == 200
@@ -1335,29 +1450,38 @@ def test_local_game_catalog_endpoints() -> None:
     binary_probe = local_undecoded_buff_payload["binaryProbe"]
     assert isinstance(binary_probe["firstByte"], int)
     assert binary_probe["formatHeaderHex"].startswith(f"{binary_probe['firstByte']:02x}")
-    assert "duration" in local_undecoded_buff_payload["binaryProbe"]["rdpsKeyHints"]
+    assert binary_probe["source"] == "official_typed_memorypack_fields"
+    assert binary_probe["schemaVersion"] == 3
+    assert binary_probe["auditEvidenceRef"]["assetId"] == "buff_common_cryst_fire_triggered"
+    assert "typedSemanticFields" not in binary_probe
+    assert binary_probe["rdpsKeyHints"] == []
+    native_fields = client.get("/api/game-semantics/buff/buff_common_cryst_fire_triggered").json()["detail"]["blackboard"]
     assert any(
-        item["key"] == "duration" and item["value"] == 5.0
-        for item in local_undecoded_buff_payload["binaryProbe"]["blackboardDoubleHints"]
+        item["key"] == "duration" and item["defaultDouble"] == 5.0 and item["isDynamic"] is True
+        for item in native_fields
     )
     assert any(
         item["key"] == "phy_dmg_up" and item["value"] == 0.2
         for item in local_undecoded_buff_payload["binaryProbe"]["blackboardDoubleHints"]
     )
-    assert local_undecoded_buff_payload["binaryProbe"]["createdBuffIds"] == []
+    assert local_undecoded_buff_payload["binaryProbe"]["createdBuffIds"] == [
+        "buff_common_cryst_triggered_fx",
+        "buff_common_cryst_triggered_start",
+        "buff_common_frozen",
+    ]
     assert any(
         item["value"] == "buff_common_frozen"
-        and item["role"] in {"id_reference", "action_reference"}
+        and item["source"] == "official_typed_memorypack_fields" and item["field"] == "buffId"
         for item in local_undecoded_buff_payload["binaryProbe"]["actionReferenceContexts"]
     )
 
     local_direct_assign_buff_response = client.get("/api/game-data/buff/buff_common_cryst_triggered")
     assert local_direct_assign_buff_response.status_code == 200
     local_direct_assign_buff_payload = local_direct_assign_buff_response.json()
-    assert local_direct_assign_buff_payload["binaryProbe"]["createdBuffIds"] == []
+    assert local_direct_assign_buff_payload["binaryProbe"]["createdBuffIds"] == ["buff_common_frozen"]
     assert any(
         item["value"] == "buff_common_frozen"
-        and item["role"] in {"id_reference", "action_reference"}
+        and item["source"] == "official_typed_memorypack_fields" and item["field"] == "buffId"
         for item in local_direct_assign_buff_payload["binaryProbe"]["actionReferenceContexts"]
     )
 
@@ -1383,22 +1507,27 @@ def test_local_game_catalog_endpoints() -> None:
     skill_binary_probe = local_undecoded_skill_payload["binaryProbe"]
     assert isinstance(skill_binary_probe["firstByte"], int)
     assert skill_binary_probe["formatHeaderHex"].startswith(f"{skill_binary_probe['firstByte']:02x}")
-    assert "damage_scale" in local_undecoded_skill_payload["binaryProbe"]["rdpsKeyHints"]
+    assert skill_binary_probe["source"] == "official_typed_memorypack_fields"
+    assert skill_binary_probe["rdpsKeyHints"] == []
     assert any(
         item["key"] == "damage_scale" and item["value"] == 3.1
         for item in local_undecoded_skill_payload["binaryProbe"]["blackboardDoubleHints"]
     )
-    assert local_undecoded_skill_payload["binaryProbe"]["createdBuffIds"] == []
+    assert local_undecoded_skill_payload["binaryProbe"]["createdBuffIds"] == [
+        "buff_eny_0092_slbomb_damage_bomb"
+    ]
     assert any(
         item["value"] == "buff_eny_0092_slbomb_damage_bomb"
-        and item["role"] in {"id_reference", "action_reference"}
+        and item["source"] == "official_typed_memorypack_fields" and item["field"] == "buffId"
         for item in local_undecoded_skill_payload["binaryProbe"]["actionReferenceContexts"]
     )
 
     local_weapon_skill_response = client.get("/api/game-data/skill/sk_wpn_pistol_0009")
     assert local_weapon_skill_response.status_code == 200
     local_weapon_skill_payload = local_weapon_skill_response.json()
-    assert "damage_taken_up_fire" in local_weapon_skill_payload["binaryProbe"]["rdpsKeyHints"]
+    assert local_weapon_skill_payload["binaryProbe"]["rdpsKeyHints"] == []
+    assert local_weapon_skill_payload["binaryProbe"]["auditEvidenceRef"]["assetId"] == "sk_wpn_pistol_0009"
+    assert "typedSemanticFields" not in local_weapon_skill_payload["binaryProbe"]
     assert any(
         item["value"] == "buff_wpn_pistol_0009_dmg_taken_up_f"
         for item in local_weapon_skill_payload["binaryProbe"]["actionReferenceContexts"]
@@ -1433,19 +1562,33 @@ def test_local_game_semantic_endpoints() -> None:
     binary_buff_detail_response = client.get("/api/game-semantics/buff/buff_common_cryst_fire_triggered")
     assert binary_buff_detail_response.status_code == 200
     binary_buff_detail_payload = binary_buff_detail_response.json()
-    assert binary_buff_detail_payload["detail"]["semanticFlags"]["decodedDetailMissing"] is True
+    assert binary_buff_detail_payload["detail"]["semanticFlags"]["decodedDetailMissing"] is False
     assert any(
         item["key"] == "phy_dmg_up" and item["value"] == 0.2
         for item in binary_buff_detail_payload["detail"]["binaryProbe"]["blackboardDoubleHints"]
     )
-    assert binary_buff_detail_payload["detail"]["createdBuffSource"] == "binary_action_context"
-    assert binary_buff_detail_payload["detail"]["createdBuffIds"] == []
+    assert binary_buff_detail_payload["detail"]["createdBuffSource"] == "official_typed_memorypack_fields"
+    assert binary_buff_detail_payload["detail"]["createdBuffIds"] == [
+        "buff_common_cryst_triggered_fx",
+        "buff_common_cryst_triggered_start",
+        "buff_common_frozen",
+    ]
     assert "buff_common_frozen" in binary_buff_detail_payload["detail"]["referencedBuffIds"]
 
     direct_assign_buff_detail_response = client.get("/api/game-semantics/buff/buff_common_cryst_triggered")
     assert direct_assign_buff_detail_response.status_code == 200
     direct_assign_buff_detail_payload = direct_assign_buff_detail_response.json()
-    assert direct_assign_buff_detail_payload["detail"]["createdBuffDirectAssignValues"] == []
+    assert direct_assign_buff_detail_payload["detail"]["createdBuffDirectAssignValues"] == [
+        {
+            "serverActionIndex": 0,
+            "buffId": "buff_common_frozen",
+            "targetKey": "duration",
+            "inputValueKey": "",
+            "numericValue": 5.0,
+            "encoding": None,
+            "source": "official_typed_memorypack_fields",
+        }
+    ]
     assert "buff_common_frozen" in direct_assign_buff_detail_payload["detail"]["referencedBuffIds"]
 
     skill_detail_response = client.get("/api/game-semantics/skill/chr_0011_seraph_ultimate_skill")
@@ -1458,12 +1601,20 @@ def test_local_game_semantic_endpoints() -> None:
     binary_skill_detail_response = client.get("/api/game-semantics/skill/sk_wpn_pistol_0009")
     assert binary_skill_detail_response.status_code == 200
     binary_skill_detail_payload = binary_skill_detail_response.json()
-    assert binary_skill_detail_payload["detail"]["createdBuffSource"] == "binary_action_context"
-    assert binary_skill_detail_payload["detail"]["createdBuffIds"] == []
+    assert binary_skill_detail_payload["detail"]["createdBuffSource"] == "official_typed_memorypack_fields"
+    assert binary_skill_detail_payload["detail"]["createdBuffIds"] == [
+        "buff_wpn_passive_spirit_01",
+        "buff_wpn_pistol_0009_cd",
+        "buff_wpn_pistol_0009_dmg_taken_up_c",
+        "buff_wpn_pistol_0009_dmg_taken_up_f",
+        "buff_wpn_pistol_0009_dmg_taken_up_n",
+        "buff_wpn_pistol_0009_dmg_taken_up_p",
+    ]
     assert "buff_wpn_pistol_0009_cd" in binary_skill_detail_payload["detail"]["referencedBuffIds"]
     assert "buff_wpn_passive_spirit_01" in binary_skill_detail_payload["detail"]["referencedBuffIds"]
-    assert "buff_wpn_passive_spirit_01" not in binary_skill_detail_payload["detail"]["createdBuffIds"]
-    assert "damage_taken_up_fire" in binary_skill_detail_payload["detail"]["binaryProbe"]["stringHints"]
+    assert any(item["buffId"] == "buff_wpn_passive_spirit_01" and item["path"] == "$.toggleBuffs[0].buffs[0].buffId"
+               for item in binary_skill_detail_payload["detail"]["createdBuffActions"])
+    assert binary_skill_detail_payload["detail"]["binaryProbe"]["source"] == "official_typed_memorypack_fields"
 
     attribute_detail_response = client.get("/api/game-semantics/attribute_type/67")
     assert attribute_detail_response.status_code == 200
@@ -1473,59 +1624,24 @@ def test_local_game_semantic_endpoints() -> None:
 
 def test_local_game_semantic_hint_endpoints() -> None:
     client = TestClient(app)
-
-    summary_response = client.get("/api/game-semantics/hints/catalog")
-    assert summary_response.status_code == 200
-    summary_payload = summary_response.json()
-    assert summary_payload["modules"]["buff"]["count"] > 0
-    assert summary_payload["modules"]["skill"]["count"] > 0
-    assert summary_payload["modules"]["attribute_type"]["count"] > 0
-
-    buff_hint_response = client.get("/api/game-semantics/hints/buff/buff_common_affixes_enhance_crystal")
-    assert buff_hint_response.status_code == 200
-    buff_hint_payload = buff_hint_response.json()
-    assert buff_hint_payload["detail"]["classification"] == "effect_buff"
-    assert any(
-        hint["zone"] == "AMP" and hint["element"] == "cryst"
-        for hint in buff_hint_payload["detail"]["effectHints"]
-    )
-    assert any(
-        hint["zone"] == "AMP" and hint["element"] == "cryst"
-        for hint in buff_hint_payload["detail"]["resolvedEffectHints"]
-    )
-
-    binary_buff_hint_response = client.get("/api/game-semantics/hints/buff/buff_common_cryst_fire_triggered")
-    assert binary_buff_hint_response.status_code == 200
-    binary_buff_hint_payload = binary_buff_hint_response.json()
-    assert binary_buff_hint_payload["detail"]["classification"] == "effect_buff"
-    assert any(
-        hint["source"] == "binary_blackboard"
-        and hint["zone"] == "DMG_INC"
-        and hint["element"] == "physical"
-        and hint["key"] == "phy_dmg_up"
-        and hint["value"] == 0.2
-        for hint in binary_buff_hint_payload["detail"]["effectHints"]
-    )
-
-    attr_hint_response = client.get("/api/game-semantics/hints/attribute_type/67")
-    assert attr_hint_response.status_code == 200
-    attr_hint_payload = attr_hint_response.json()
-    assert attr_hint_payload["detail"]["classificationHint"]["zone"] == "AMP"
-    assert attr_hint_payload["detail"]["classificationHint"]["element"] == "cryst"
-
-    skill_hint_response = client.get("/api/game-semantics/hints/skill/chr_0011_seraph_ultimate_skill")
-    assert skill_hint_response.status_code == 200
-    skill_hint_payload = skill_hint_response.json()
-    assert skill_hint_payload["detail"]["castType"] == "Active"
-    assert skill_hint_payload["detail"]["timelineActionCount"] > 0
-
-    binary_skill_hint_response = client.get("/api/game-semantics/hints/skill/sk_wpn_pistol_0009")
-    assert binary_skill_hint_response.status_code == 200
-    binary_skill_hint_payload = binary_skill_hint_response.json()
-    assert binary_skill_hint_payload["detail"]["createdBuffSource"] == "binary_action_context"
-    assert "buff_wpn_pistol_0009_cd" in binary_skill_hint_payload["detail"]["createdBuffIds"]
-    assert "buff_wpn_passive_spirit_01" in binary_skill_hint_payload["detail"]["createdBuffIds"]
-    assert binary_skill_hint_payload["detail"]["createdBuffAssignKeys"] == []
+    response = client.get("/api/game-semantics/hints/catalog")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["modules"]["buff"]["count"] > 0
+    assert payload["modules"]["skill"]["count"] > 0
+    assert payload["modules"]["attribute_type"]["count"] == 0
+    for identity in ("buff_common_affixes_enhance_crystal", "buff_common_cryst_fire_triggered"):
+        response = client.get(f"/api/game-semantics/hints/buff/{identity}")
+        assert response.status_code == 200
+        detail = response.json()["detail"]
+        assert detail["source"] == "official_typed_memorypack_fields"
+        assert "classification" not in detail
+        assert detail["effectHints"] == detail["resolvedEffectHints"] == []
+        assert detail["referenceSource"] == "official_typed_memorypack_fields"
+    assert client.get("/api/game-semantics/hints/attribute_type/67").status_code == 404
+    response = client.get("/api/game-semantics/hints/skill/chr_0011_seraph_ultimate_skill")
+    assert response.status_code == 200
+    assert response.json()["detail"]["source"] == "official_typed_memorypack_fields"
 
 
 def test_verify_raw_log_integrity_endpoint() -> None:
@@ -1650,14 +1766,19 @@ def test_uploader_battle_upload_endpoints() -> None:
                 },
             ],
             "battleFingerprint": fingerprint,
-            "parserVersion": "raw-log-parser-v43",
-            "rulesVersion": "raw-log-parser-v37",
+            "parserVersion": "raw-log-parser-v59",
+            "rulesVersion": "raw-log-parser-v44",
             "timeSource": "game_timer",
             "timelineZeroSource": "official_timer_start",
             "timerStartSeen": True,
             "timerEndSeen": True,
             "officialTimerStartSeen": True,
             "officialTimerEndSeen": True,
+            "officialTimerObservedElapsedMs": 79_000,
+            "packetTimerElapsedMs": 70_000,
+            "timerIntegrityOk": True,
+            "timerIntegrityReasons": [],
+            "timerEvidence": official_timer_evidence(77000, "dung01_group_bossrush01"),
             "timerStartInferred": False,
             "timerWindowValid": True,
             "rdpsPreflightOk": True,
@@ -1787,9 +1908,23 @@ def test_uploader_battle_upload_endpoints() -> None:
     battle_id = upload_response.json()["battleId"]
     assert upload_response.json()["battleUrl"] == f"/battle/{battle_id}"
 
+    with SessionLocal() as session:
+        saved = session.get(UploadedBattleRecord, battle_id)
+        import json
+        assert json.loads(saved.timer_evidence_json) == payload['battle']['timerEvidence']
+
+    changed_clock_payload = deepcopy(payload)
+    changed_clock_payload['battle']['battleFingerprint'] = f'fp-changed-clock-{uuid4().hex}'
+    changed_clock_payload['battle']['durationMs'] = 1000
+    changed_clock_payload['battle']['timerIntegrityOk'] = True
+    changed_clock_response = client.post('/api/uploader/battles', json=changed_clock_payload, headers=headers)
+    assert changed_clock_response.status_code == 422
+    assert changed_clock_response.json()['error']['code'] == 'timer_integrity_failed'
+
     lower_rank_payload = deepcopy(payload)
     lower_rank_payload["battle"]["battleFingerprint"] = f"fp-lower-rank-{uuid4().hex}"
     lower_rank_payload["battle"]["durationMs"] = 99000
+    lower_rank_payload["battle"]["timerEvidence"] = official_timer_evidence(99000, lower_rank_payload["battle"]["dungeonContextId"])
     lower_rank_payload["battle"]["totalDamage"] = 2100000
     lower_rank_payload["battle"]["totalDps"] = 21212.12
     lower_rank_payload["participants"][0]["totalDamage"] = 1400000
@@ -1978,8 +2113,8 @@ def test_admin_dashboard_and_cross_account_battle_management(monkeypatch) -> Non
                     }
                 ],
                 "battleFingerprint": fingerprint,
-                "parserVersion": "raw-log-parser-v43",
-                "rulesVersion": "raw-log-parser-v37",
+                "parserVersion": "raw-log-parser-v59",
+                "rulesVersion": "raw-log-parser-v44",
             },
             "participants": [
                 {

@@ -193,12 +193,15 @@ def test_generated_review_catalog_has_unique_stable_ids_and_expected_proposals()
     }
     assert by_member["buff_chr_0031_mifu_vulnerablephysic_comboskill"]["status"] == "proposed_addition"
     assert "buff_equipsuit_atk_02_addcombodamage_buff" not in by_member
-    assert by_member["buff_wpn_sword_0022_layer"]["status"] == "proposed_removal"
+    assert "buff_wpn_sword_0022_layer" not in by_member
     assert by_runtime_field[("buff_chr_0029_pograni_talent1", "physpell_up")]["zone"] == "arts_strength"
     assert by_runtime_field[("buff_wpn_sword_0026_celebration", "phy_spell_up")]["zone"] == "arts_strength"
+    assert by_runtime_field[("buff_chr_0035_liino_atkup", "atk_up")]["rdps_effect_id"] == "RDPS-0080"
+    assert by_runtime_field[("buff_chr_0035_liino_spellenhance", "spellenhance_rate")]["status"] == "proposed_addition"
+    assert by_runtime_field[("buff_wpn_lance_0014_damageup", "atk_up")]["rdps_effect_id"] == "RDPS-0083"
     assert payload["text_source"]["provider"] == "AKEData Wiki"
     assert "@" in payload["text_source"]["version_id"]
-    assert payload["summary"]["effects_overlapping_known_non_rdps"] >= 4
+    assert payload["summary"]["effects_overlapping_known_non_rdps"] >= 3
     suit_candidate = next(row for row in payload["text_candidates"] if row["source_group_id"] == "suit_atk02")
     assert suit_candidate["match_status"] == "excluded_by_review"
 
@@ -220,6 +223,22 @@ def test_active_registry_contains_approved_rescreen_and_suppresses_removed_fallb
     assert verified["buff_chr_0031_mifu_vulnerablephysic_comboskill"]["effects"][0]["zone"] == "fragile"
     assert verified["buff_chr_0029_pograni_talent1"]["effects"][1]["zone"] == "arts_strength"
     assert verified["buff_wpn_sword_0026_celebration"]["effects"][1]["zone"] == "arts_strength"
+    assert verified["buff_chr_0035_liino_atkup"]["effects"] == [
+        {"zone": "atk", "element": "all", "bb_key": "atk_up"}
+    ]
+    assert "buff_chr_0035_liino_spellenhance" not in verified
+    for element in ("pulse", "natural"):
+        assert verified[f"buff_common_affixes_enhance_{element}"]["effects"] == [
+            {"zone": "amp", "element": element, "bb_key": "rate"}]
+    assert verified["buff_wpn_lance_0014_damageup"]["stack_limit"] == 4
+    assert "buff_chr_0035_liino_ultskill_spellvulnerable" not in verified
+    for key in (
+        "buff_chr_0035_liino_normalskill_buff_atkup",
+        "buff_chr_0035_liino_ultskill_buff_atkup",
+        "buff_wpn_lance_0014_sign",
+    ):
+        assert known_non[key]["suppress_zone_effects"] is True
+    assert "buff_chr_0035_liino_ultskill_spellvulnerable" not in known_non
 
     for key in (
         "buff_common_enemy_spell_status_do_frozen",

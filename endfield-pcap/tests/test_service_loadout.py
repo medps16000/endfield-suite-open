@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from types import SimpleNamespace
+import pytest
 
 from endfield_pcap.models import RuntimeMetrics
 from endfield_pcap.proto_generated.SC_OBJECT_ENTER_VIEW_pb2 import SC_OBJECT_ENTER_VIEW
@@ -23,6 +24,77 @@ def _pipeline_shell() -> SessionPipeline:
     pipeline.metrics = RuntimeMetrics()
     pipeline.on_event = lambda event: None
     return pipeline
+
+
+def test_template_only_refinement_requires_exact_third_skill():
+    pipeline = _pipeline_shell()
+    pipeline.char_bag_by_objid[1] = _char(1, 'chr_0004_pelica')
+    pipeline.char_bag_by_objid[1]['weapon_id'] = 10
+    pipeline.current_team_char_ids = [1]
+    pipeline.weapon_by_inst_id[10] = {
+        'template_string': 'wpn_funnel_0005', 'sync_source': 'template_only', 'refine_lv': 0,
+    }
+    assert pipeline._loadout_rows()[0]['refine'] is None
+    pipeline.char_bag_by_objid[1]['weapon_source_skills'] = [{'skill_int_id': 2217, 'level': 9}]
+    assert pipeline._loadout_rows()[0]['refine'] == 5
+    pipeline.weapon_by_inst_id[10]['sync_source'] = 'WEAPON_DATA'
+    assert pipeline._loadout_rows()[0]['refine'] == 0
+
+
+def test_scene_weapon_skill_refresh_repopulates_equipped_weapon(monkeypatch):
+    pipeline = _pipeline_shell()
+    pipeline.skill_levels_by_battle_inst = {}
+    pipeline.global_skill_levels = {}
+    pipeline.squad_index = {110058: SimpleNamespace(obj_id=1, templateid='chr_0011_seraph')}
+    pipeline.char_bag_by_objid[1] = _char(1, 'chr_0011_seraph')
+    pipeline.char_bag_by_objid[1]['weapon_id'] = 91
+    pipeline.current_team_char_ids = [1]
+    pipeline.weapon_by_inst_id[91] = {'template_string': 'wpn_funnel_0010', 'sync_source': 'template_only'}
+    source = [{'skill_int_id': 2230, 'skill_str_id': 'sk_wpn_funnel_0010', 'level': 9, 'potential_lv': 5}]
+    monkeypatch.setattr(pipeline, '_weapon_source_skills', lambda info: source)
+    monkeypatch.setattr(pipeline, '_template_id_payload', lambda item: ('Skill', 2230, 'sk_wpn_funnel_0010'))
+    info = SimpleNamespace(skill_list=[SimpleNamespace(skill_id=None, level=9)])
+    assert pipeline._loadout_rows()[0]['refine'] is None
+    pipeline._cache_scene_skill_levels(999, info)
+    assert pipeline._loadout_rows()[0]['refine'] is None
+    pipeline._cache_scene_skill_levels(110058, info)
+    assert pipeline._loadout_rows()[0]['refine'] == 5
+    assert pipeline.char_bag_by_objid[1]['weapon_source_skills'][0]['potential_lv'] == 0
+    assert source[0]['potential_lv'] == 5
+    pipeline.char_bag_by_objid[1]['weapon_source_skills'][0]['blackboard'] = {'atk_up': 0.1}
+    pipeline._cache_scene_skill_levels(110058, info)
+    assert pipeline.char_bag_by_objid[1]['weapon_source_skills'][0]['blackboard'] == {'atk_up': 0.1}
+    pipeline.char_bag_by_objid[1]['weapon_id'] = 92
+    pipeline.char_bag_by_objid[1]['weapon_source_skills'] = []
+    pipeline.weapon_by_inst_id[92] = {'template_string': 'wpn_funnel_0005', 'sync_source': 'template_only'}
+    pipeline._cache_scene_skill_levels(110058, info)
+    assert pipeline._loadout_rows()[0]['refine'] is None
+
+
+def test_scene_weapon_refine_refresh_accepts_real_server_skill_message():
+    from endfield_pcap.proto_generated.SC_SELF_SCENE_INFO_pb2 import SC_SELF_SCENE_INFO
+    pipeline = _pipeline_shell()
+    pipeline.skill_levels_by_battle_inst = {}
+    pipeline.global_skill_levels = {}
+    pipeline.squad_index = {110058: SimpleNamespace(obj_id=1, templateid='chr_0011_seraph')}
+    pipeline.char_bag_by_objid[1] = _char(1, 'chr_0011_seraph')
+    pipeline.char_bag_by_objid[1]['weapon_id'] = 91
+    pipeline.current_team_char_ids = [1]
+    pipeline.weapon_by_inst_id[91] = {'template_string': 'wpn_funnel_0010', 'sync_source': 'template_only'}
+    info = SC_SELF_SCENE_INFO().detail.char_list.add().battle_info
+    skill = info.skill_list.add()
+    skill.skill_id.type = 2
+    skill.skill_id.int_id = 2230
+    skill.skill_id.str_id = 'sk_wpn_funnel_0010'
+    skill.source = 2
+    skill.level = 9
+    skill.inst_id = 110077
+    for field in ('str_id', 'int_id'):
+        pipeline.char_bag_by_objid[1]['weapon_source_skills'] = []
+        if field == 'str_id': skill.skill_id.str_id = 'sk_wpn_funnel_0010'
+        else: skill.skill_id.int_id = 2230
+        pipeline._cache_scene_skill_levels(110058, info)
+        assert pipeline._loadout_rows()[0]['refine'] == 5
 
 
 def _char(char_id: int, template: str, *, equip_col: dict[int, int] | None = None) -> dict[str, object]:
@@ -197,7 +269,7 @@ def test_enter_dungeon_treats_empty_team_as_no_party_override() -> None:
     ]
 
 
-def test_loadout_rows_merge_partial_equip_col_with_equipped_items() -> None:
+def test_loadout_slots_require_unambiguous_type_or_explicit_equip_col() -> None:
     pipeline = _pipeline_shell()
     pipeline.char_bag_by_objid = {
         1: _char(
@@ -216,11 +288,20 @@ def test_loadout_rows_merge_partial_equip_col_with_equipped_items() -> None:
 
     row = pipeline._loadout_rows()[0]
 
-    assert _map_count(row["equip_inst_ids"]) == 4
+    assert _map_count(row["equip_inst_ids"]) == 2
     assert "[0]=100" in row["equip_inst_ids"]
     assert "[1]=101" in row["equip_inst_ids"]
-    assert "[2]=102" in row["equip_inst_ids"]
-    assert "[3]=103" in row["equip_inst_ids"]
+    assert '[2]=' not in row['equip_inst_ids']
+    assert '[3]=' not in row['equip_inst_ids']
+    assert row['unresolved_equip_inst_ids'] == [102, 103]
+    # Both accessory slots accept both items. Only the packet resolves which
+    # instance occupies each slot; no iteration order is a valid assignment.
+    pipeline.char_bag_by_objid[1]['equip_col'].update({2: 103, 3: 102})
+    row = pipeline._loadout_rows()[0]
+    assert _map_count(row['equip_inst_ids']) == 4
+    assert '[2]=103' in row['equip_inst_ids']
+    assert '[3]=102' in row['equip_inst_ids']
+    assert row['unresolved_equip_inst_ids'] == []
 
 
 def test_equip_puton_clears_replaced_and_previous_owner_equips() -> None:
@@ -253,7 +334,7 @@ def test_equip_puton_clears_replaced_and_previous_owner_equips() -> None:
     assert "101" not in rows[0]["equip_inst_ids"]
 
 
-def test_equip_puton_preserves_existing_edc_when_suit_count_stays_active() -> None:
+def test_equip_puton_does_not_move_replaced_item_to_a_slot_from_suit_counts() -> None:
     pipeline = _pipeline_shell()
     pipeline.char_bag_by_objid = {
         1: _char(
@@ -284,8 +365,49 @@ def test_equip_puton_preserves_existing_edc_when_suit_count_stays_active() -> No
     assert "[0]=100" in row["equip_inst_ids"]
     assert "[1]=101" in row["equip_inst_ids"]
     assert "[2]=200" in row["equip_inst_ids"]
-    assert "[3]=102" in row["equip_inst_ids"]
-    assert pipeline.equip_by_inst_id[102]["equip_char_id"] == 1
+    assert '[3]=' not in row['equip_inst_ids']
+    assert pipeline.equip_by_inst_id[102]['equip_char_id'] == 0
+
+
+def test_moving_same_equipment_instance_within_character_clears_old_slot():
+    pipeline = _pipeline_shell()
+    pipeline.char_bag_by_objid = {1: _char(1, 'chr_0004_pelica', equip_col={2: 100})}
+    pipeline.current_team_char_ids = [1]
+    pipeline.equip_by_inst_id = {100: _equip(100, 'item_equip_t4_suit_attri01_edc_07', 1)}
+    pipeline._update_equip_puton(SimpleNamespace(charid=1, slotid=3, equipid=100,
+        suitinfo={}, put_off_charid=0, old_owner_suitinfo={}), 1234)
+    assert pipeline.char_bag_by_objid[1]['equip_col'] == {3: 100}
+    assert pipeline._loadout_rows()[0]['equip_inst_ids'] == '{[3]=100}'
+
+
+def test_equipment_slot_does_not_come_from_name_or_last_empty_accessory_slot():
+    assert SessionPipeline._equip_slot_candidates('fake_item_hand_01') == []
+    assert SessionPipeline._infer_equip_slot('item_equip_t4_suit_attri01_edc_07', {0, 1, 2}) is None
+
+
+def test_complete_character_bag_equipment_snapshot_overrides_stale_item_owner():
+    from endfield_pcap.proto_generated.SC_SYNC_CHAR_BAG_INFO_pb2 import SC_SYNC_CHAR_BAG_INFO
+    pipeline = _pipeline_shell()
+    pipeline.char_potential_levels = {}
+    message = SC_SYNC_CHAR_BAG_INFO()
+    message.char_info.add(objid=1, templateid='chr_0004_pelica', level=90)
+    pipeline._update_char_bag_info(message)
+    pipeline.current_team_char_ids = [1]
+    pipeline.equip_by_inst_id = {100: _equip(100, 'item_equip_t4_suit_attri01_body_05', 1)}
+    row = pipeline._loadout_rows()[0]
+    assert row['equipment_snapshot_complete'] is True
+    assert row['equips'] == '{}' and row['equip_inst_ids'] == '{}'
+    assert row['unresolved_equip_inst_ids'] == []
+
+
+def test_invalid_current_team_index_is_not_replaced_by_first_team():
+    from endfield_pcap.proto_generated.SC_SYNC_CHAR_BAG_INFO_pb2 import SC_SYNC_CHAR_BAG_INFO
+    pipeline = _pipeline_shell()
+    pipeline.char_potential_levels = {}
+    message = SC_SYNC_CHAR_BAG_INFO(curr_team_index=9)
+    message.team_info.add().char_team.append(1)
+    pipeline._update_char_bag_info(message)
+    assert pipeline.current_team_char_ids == []
 
 
 def test_weapon_puton_swaps_weapon_state_between_current_and_previous_owner() -> None:
@@ -360,3 +482,38 @@ def test_weapon_puton_from_bag_invalidates_stale_weapon_source_skills() -> None:
     assert pelica["skill_int_ids"] == [98]
     assert pipeline.weapon_by_inst_id[1014]["equip_char_id"] == 4
     assert pipeline.weapon_by_inst_id[1005]["equip_char_id"] == 0
+
+
+def test_loadout_refinement_uses_gem_bound_to_current_weapon():
+    pipeline = _pipeline_shell()
+    char = _char(3, 'chr_9000_endmin')
+    char['weapon_id'] = 91
+    char['weapon_source_skills'] = [_weapon_source(3759, 'sk_wpn_sword_0026', potential=3)]
+    char['weapon_source_skills'][0]['level'] = 4
+    pipeline.char_bag_by_objid = {3: char}
+    pipeline.current_team_char_ids = [3]
+    pipeline.weapon_by_inst_id = {91: {'template_string': 'wpn_sword_0026', 'sync_source': 'template_only', 'attach_gem_id': 42}}
+    pipeline.gem_by_inst_id = {42: {'gem_id': 42, 'weapon_id': 91, 'terms': [{'term_num_id': 66, 'cost': 3}]}}
+    assert pipeline._loadout_rows()[0]['refine'] == 0
+    pipeline.gem_by_inst_id[42]['weapon_id'] = 92
+    assert pipeline._loadout_rows()[0]['refine'] is None
+
+
+@pytest.mark.parametrize('kind', ['SC_WEAPON_ATTACH_GEM', 'SC_WEAPON_DETACH_GEM', 'term_update'])
+def test_gem_change_invalidates_previous_weapon_skill_totals(kind):
+    pipeline = _pipeline_shell()
+    char = _char(3, 'chr_9000_endmin')
+    char['weapon_id'] = 91
+    char['weapon_source_skills'] = [_weapon_source(3759, 'sk_wpn_sword_0026', potential=3)]
+    char['weapon_source_skills'][0]['level'] = 4
+    pipeline.char_bag_by_objid = {3: char}
+    pipeline.current_team_char_ids = [3]
+    pipeline.weapon_by_inst_id = {91: {'template_string': 'wpn_sword_0026', 'sync_source': 'template_only', 'attach_gem_id': 42}}
+    pipeline.gem_by_inst_id = {42: {'gem_id': 42, 'weapon_id': 91, 'terms': [{'term_num_id': 66, 'cost': 3}]},
+                              43: {'gem_id': 43, 'weapon_id': 0, 'terms': [{'term_num_id': 66, 'cost': 2}]}}
+    if kind == 'term_update':
+        pipeline._index_gem_payload({'gem_id': 42, 'weapon_id': 91, 'terms': [{'term_num_id': 66, 'cost': 2}]})
+    else:
+        pipeline._update_weapon_delta(kind, SimpleNamespace(weaponid=91, gemid=43, detach_gemid=42), 100)
+    assert char['weapon_source_skills'] == []
+    assert pipeline._loadout_rows()[0]['refine'] is None

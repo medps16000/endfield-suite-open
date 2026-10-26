@@ -170,6 +170,11 @@ class UploadBattlePayloadRequest(BaseModel):
     timerEndSeen: bool | None = None
     officialTimerStartSeen: bool | None = None
     officialTimerEndSeen: bool | None = None
+    officialTimerObservedElapsedMs: int | None = None
+    packetTimerElapsedMs: int | None = None
+    timerIntegrityOk: bool | None = None
+    timerIntegrityReasons: list[str] = Field(default_factory=list)
+    timerEvidence: dict[str, Any] | None = None
     timerStartInferred: bool | None = None
     timerWindowValid: bool | None = None
     rdpsPreflightOk: bool | None = None

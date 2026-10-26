@@ -1,3 +1,6 @@
+from pathlib import Path
+
+import pytest
 import json
 
 from app.services.battle_payload_builder import (
@@ -124,7 +127,7 @@ def test_build_raw_log_upload_document_strips_embedded_loadout_summary(tmp_path)
     assert document["integrity_gate"]["tamper_suspected"] is False
 
 
-def test_build_battle_upload_payload_corrects_source_skill_refine_hint(tmp_path) -> None:
+def test_build_battle_upload_payload_keeps_explicit_refine_when_third_level_is_ambiguous(tmp_path) -> None:
     log_path = tmp_path / "sample_weapon_refine.log"
     content = "\n".join(
         [
@@ -157,7 +160,7 @@ def test_build_battle_upload_payload_corrects_source_skill_refine_hint(tmp_path)
     payload = build_battle_upload_payload_from_log(str(log_path))
 
     seraph = next(entry for entry in payload["battle"]["roster"] if entry["characterKey"] == "chr_0011_seraph")
-    assert seraph["weapon"]["weaponRefine"] == 0
+    assert seraph["weapon"]["weaponRefine"] == 5
 
 
 def test_build_battle_upload_payload_from_embedded_log(tmp_path) -> None:
@@ -422,6 +425,10 @@ def test_build_battle_upload_payload_normalizes_one_based_equip_slots(tmp_path) 
     assert [equip["slot"] for equip in payload["battle"]["roster"][0]["equips"]] == [0, 1, 2, 3]
 
 
+@pytest.mark.skipif(
+    not (Path(__file__).resolve().parents[3] / "data/local_semantics/buff/details.json").is_file(),
+    reason="buff timeline classification requires externally supplied game semantics",
+)
 def test_build_battle_upload_payloads_split_multi_battle_log(tmp_path) -> None:
     log_path = tmp_path / "sample_multi.log"
     content = "\n".join(

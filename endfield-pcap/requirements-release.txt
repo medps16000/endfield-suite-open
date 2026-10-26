@@ -14,7 +14,7 @@ iniconfig==2.3.0
 packaging==26.3
 pefile==2024.8.26
 pluggy==1.6.0
-protobuf==6.33.6
+protobuf==7.36.2
 psutil==7.2.2
 pycryptodome==3.23.0
 pydantic==2.13.3
